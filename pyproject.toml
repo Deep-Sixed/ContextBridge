@@ -9,5 +9,8 @@ description = "Read-only authenticated MCP gateway for approved project context"
 requires-python = ">=3.11"
 dependencies = ["fastmcp", "mcp", "anyio", "pyyaml", "starlette"]
 
+[project.optional-dependencies]
+docs = ["reportlab>=4.0"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
