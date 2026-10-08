@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .audit import mark_started
 from .policy import ComputerPolicy, PolicyViolation
 
 _BINARY_SNIFF_BYTES = 8192
@@ -84,6 +85,7 @@ def list_directory(policy: ComputerPolicy, path: str, *, depth: int = 1) -> dict
     if not root.is_dir():
         raise FileOperationError(f"Not a directory: {path}")
     depth = max(1, min(int(depth), _MAX_DEPTH))
+    mark_started(path=str(root))
     entries: list[dict[str, Any]] = []
     truncated = False
 
@@ -126,6 +128,7 @@ def read_file(
     """Read text lines. ``offset`` is 0-based; a negative offset reads the last N lines."""
     resolved = policy.resolve(path)
     _require_file(resolved, path)
+    mark_started(path=str(resolved))
     size = resolved.stat().st_size
     if _is_binary(resolved):
         raise FileOperationError(
@@ -181,6 +184,7 @@ def get_file_info(policy: ComputerPolicy, path: str) -> dict[str, Any]:
     resolved = policy.resolve(path)
     if not resolved.exists():
         raise FileNotFoundError(f"No such file or directory: {path}")
+    mark_started(path=str(resolved))
     st = resolved.stat()
     info: dict[str, Any] = {
         "path": str(resolved),
@@ -238,6 +242,7 @@ def search_files(
     needle = pattern.casefold()
     is_glob = any(ch in pattern for ch in "*?[")
     deadline = time.monotonic() + policy.max_search_seconds
+    mark_started(path=str(root))
     matches: list[dict[str, Any]] = []
     truncated = False
     for candidate, is_dir in _walk_files(policy, root, deadline):
@@ -282,6 +287,7 @@ def search_code(
         candidates = _walk_files(policy, root, deadline)
     else:
         raise FileNotFoundError(f"No such file or directory: {path}")
+    mark_started(path=str(root))
 
     matches: list[dict[str, Any]] = []
     files_scanned = 0
@@ -351,6 +357,7 @@ def write_file(policy: ComputerPolicy, path: str, content: str, *, mode: str = "
     _require_parent(resolved, path)
     data = _encode_for_write(policy, content)
     created = not resolved.exists()
+    mark_started(path=str(resolved), bytes=len(data))
     if mode == "append":
         with resolved.open("ab") as fh:
             fh.write(data)
@@ -388,7 +395,9 @@ def edit_block(
             f"Expected {expected_replacements} occurrence(s) of old_string in {path}, found {found}.{hint}"
         )
     updated = original.replace(old_string, new_string)
-    _atomic_write(resolved, _encode_for_write(policy, updated))
+    data = _encode_for_write(policy, updated)
+    mark_started(path=str(resolved), replacements=found)
+    _atomic_write(resolved, data)
     return {"path": str(resolved), "replacements": found}
 
 
@@ -397,6 +406,7 @@ def create_directory(policy: ComputerPolicy, path: str) -> dict[str, Any]:
     if resolved.exists() and not resolved.is_dir():
         raise FileOperationError(f"{path} exists and is not a directory.")
     created = not resolved.exists()
+    mark_started(path=str(resolved))
     resolved.mkdir(parents=True, exist_ok=True)
     return {"path": str(resolved), "created": created}
 
@@ -412,5 +422,6 @@ def move_file(policy: ComputerPolicy, source: str, destination: str) -> dict[str
     _require_parent(dst, destination)
     if src.is_dir() and not src.is_symlink() and dst.is_relative_to(src):
         raise FileOperationError("Cannot move a directory into itself.")
+    mark_started(source=str(src), destination=str(dst))
     shutil.move(str(src), str(dst))
     return {"source": str(src), "destination": str(dst)}

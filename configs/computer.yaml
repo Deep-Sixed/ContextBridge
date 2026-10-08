@@ -4,10 +4,13 @@
 name: ContextBridge Computer
 
 serve:
-  transport: http          # http (needs CONTEXTBRIDGE_COMPUTER_TOKEN) or stdio (local clients)
-  host: 127.0.0.1          # non-loopback binds are refused unless allow_non_loopback: true
-  port: 8791
-  audit_log: ../audit/computer.audit.jsonl   # relative to this file; always write-protected
+  host: 127.0.0.1          # loopback only; any other address is refused at startup
+  port: 8791               # HTTP, bearer token from CONTEXTBRIDGE_COMPUTER_TOKEN (32+ chars)
+  audit_log: ../audit/computer.audit.jsonl   # required; relative to this file; write-protected
+
+auth:
+  # Scopes granted to the token, checked on every tool call. Remove one to withhold it.
+  scopes: [computer:read, computer:write, computer:execute, computer:process]
 
 filesystem:
   roots:                   # readable; relative paths resolve against the first entry

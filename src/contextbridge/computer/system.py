@@ -13,10 +13,12 @@ from typing import Any
 
 import psutil
 
+from .audit import mark_started
 from .policy import ComputerPolicy
 
 
 def system_info(policy: ComputerPolicy) -> dict[str, Any]:
+    mark_started()
     memory = psutil.virtual_memory()
     disks = []
     for root in policy.roots:

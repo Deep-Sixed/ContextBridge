@@ -12,13 +12,16 @@ import itertools
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import IO, Any
 
 import psutil
 
+from .audit import mark_started
 from .policy import ComputerPolicy, PolicyViolation
 
 _READ_CHUNK = 65536
@@ -124,12 +127,14 @@ def run_command(
     timeout = policy.clamp_timeout(timeout_seconds)
     stdout = BoundedCapture(policy.max_output_bytes)
     stderr = BoundedCapture(policy.max_output_bytes)
+    env = policy.child_env()
+    mark_started(argv=argv, cwd=str(directory), timeout_seconds=timeout)
     started = time.monotonic()
     try:
         proc = subprocess.Popen(
             argv,
             cwd=directory,
-            env=policy.child_env(),
+            env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -160,6 +165,7 @@ def run_command(
     return {
         "command": command,
         "cwd": str(directory),
+        "pid": proc.pid,
         "exit_code": proc.returncode,
         "timed_out": timed_out,
         "timeout_seconds": timeout,
@@ -174,8 +180,19 @@ def run_command(
 # ----------------------------------------------------------------- sessions
 
 
+ExitCallback = Callable[[dict[str, Any]], None]
+
+
 class _Session:
-    def __init__(self, session_id: str, command: str, cwd: Path, proc: subprocess.Popen[bytes], cap: int) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        command: str,
+        cwd: Path,
+        proc: subprocess.Popen[bytes],
+        cap: int,
+        on_exit: ExitCallback | None = None,
+    ) -> None:
         self.id = session_id
         self.command = command
         self.cwd = cwd
@@ -189,6 +206,17 @@ class _Session:
         self.changed = threading.Condition()
         self.reader = threading.Thread(target=_pump, args=(proc.stdout, self._append), daemon=True)
         self.reader.start()
+        self._on_exit = on_exit
+        threading.Thread(target=self._wait_for_exit, daemon=True).start()
+
+    def _wait_for_exit(self) -> None:
+        self.proc.wait()
+        if self._on_exit is None:
+            return
+        try:
+            self._on_exit(self.status())
+        except Exception as exc:  # an exit report must never crash the waiter thread
+            print(f"[computer] could not report exit of session {self.id}: {exc}", file=sys.stderr, flush=True)
 
     def _append(self, chunk: bytes) -> None:
         with self.changed:
@@ -245,8 +273,9 @@ class _Session:
 class SessionManager:
     """Long-running commands whose output is read incrementally."""
 
-    def __init__(self, policy: ComputerPolicy) -> None:
+    def __init__(self, policy: ComputerPolicy, *, on_exit: ExitCallback | None = None) -> None:
         self._policy = policy
+        self._on_exit = on_exit
         self._sessions: dict[str, _Session] = {}
         self._lock = threading.Lock()
         self._ids = itertools.count(1)
@@ -279,11 +308,13 @@ class SessionManager:
                     "terminate one first."
                 )
             self._evict_finished()
+            env = self._policy.child_env()
+            mark_started(argv=argv, cwd=str(directory), lifetime_seconds=lifetime)
             try:
                 proc = subprocess.Popen(
                     argv,
                     cwd=directory,
-                    env=self._policy.child_env(),
+                    env=env,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
@@ -291,7 +322,14 @@ class SessionManager:
                 )
             except OSError as exc:
                 raise CommandError(f"Could not start command: {exc}") from None
-            session = _Session(f"s{next(self._ids)}", command, directory, proc, self._policy.max_output_bytes * 4)
+            session = _Session(
+                f"s{next(self._ids)}",
+                command,
+                directory,
+                proc,
+                self._policy.max_output_bytes * 4,
+                on_exit=self._on_exit,
+            )
             self._sessions[session.id] = session
         watchdog = threading.Timer(lifetime, self._expire, args=(session,))
         watchdog.daemon = True
@@ -306,13 +344,16 @@ class SessionManager:
             kill_tree(session.proc)
 
     def read(self, session_id: str, *, wait_seconds: float = 0.0) -> dict[str, Any]:
-        return self._get(session_id).read(wait_seconds)
+        session = self._get(session_id)
+        mark_started(session_id=session_id, pid=session.proc.pid)
+        return session.read(wait_seconds)
 
     def send(self, session_id: str, text: str, *, newline: bool = True, wait_seconds: float = 1.0) -> dict[str, Any]:
         session = self._get(session_id)
         if not session.running() or session.proc.stdin is None:
             raise CommandError(f"Session {session_id} is no longer running.")
         payload = (text + ("\n" if newline else "")).encode("utf-8")
+        mark_started(session_id=session_id, pid=session.proc.pid, input_bytes=len(payload))
         try:
             session.proc.stdin.write(payload)
             session.proc.stdin.flush()
@@ -322,6 +363,7 @@ class SessionManager:
 
     def terminate(self, session_id: str) -> dict[str, Any]:
         session = self._get(session_id)
+        mark_started(session_id=session_id, pid=session.proc.pid)
         if session.running():
             kill_tree(session.proc)
             try:
@@ -331,6 +373,7 @@ class SessionManager:
         return session.read(0.0)
 
     def list(self) -> list[dict[str, Any]]:
+        mark_started()
         with self._lock:
             sessions = list(self._sessions.values())
         return [s.status() for s in sessions]
@@ -348,6 +391,7 @@ class SessionManager:
 
 def list_processes(*, name_filter: str | None = None, limit: int = 200) -> dict[str, Any]:
     needle = (name_filter or "").casefold()
+    mark_started(name_filter=name_filter)
     rows: list[dict[str, Any]] = []
     attrs = ["pid", "ppid", "name", "username", "status", "create_time", "memory_info", "cmdline"]
     total = 0
@@ -383,6 +427,7 @@ def kill_process(pid: int, *, force: bool = False) -> dict[str, Any]:
     try:
         proc = psutil.Process(pid)
         name = proc.name()
+        mark_started(pid=pid, name=name, signal="kill" if force else "terminate")
         if force:
             proc.kill()
         else:

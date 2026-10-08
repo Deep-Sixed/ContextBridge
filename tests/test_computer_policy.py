@@ -141,6 +141,12 @@ def test_gateway_tokens_are_stripped_even_with_empty_env_strip(make_policy, monk
     assert "MCP_AUTH_TOKEN" not in policy.child_env()
 
 
+def test_default_timeout_follows_a_lower_max(make_policy):
+    assert make_policy(commands={"max_timeout_seconds": 5}).default_timeout_seconds == 5
+    with pytest.raises(PolicyError, match="cannot exceed"):
+        make_policy(commands={"default_timeout_seconds": 10, "max_timeout_seconds": 5})
+
+
 def test_timeouts_are_clamped(make_policy):
     policy = make_policy(commands={"default_timeout_seconds": 5, "max_timeout_seconds": 20})
     assert policy.clamp_timeout(None) == 5

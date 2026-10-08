@@ -1,8 +1,16 @@
 """ContextBridge computer route — an MCP server for policy-controlled computer access.
 
-The tool surface is derived from the policy: write tools exist only when writable
-roots are configured, command tools only when commands are enabled, and so on.
-A default-deny middleware hides and rejects anything else and audits every call.
+Three independent gates apply to every tool call, at the moment it executes:
+
+1. **Policy surface** — only tools the local policy enables are registered.
+2. **Authorization** — the caller's bearer token must carry the tool's scope.
+3. **Policy checks** — the engine re-validates paths, commands, and limits.
+
+Every call is audited as ``requested`` → ``denied``/``failed`` or
+``requested`` → ``started`` → ``completed`` (see :mod:`.audit`).
+
+The route serves HTTP on a loopback address only and refuses to start without
+its own credential and a writable audit log.
 """
 
 from __future__ import annotations
@@ -27,18 +35,24 @@ from fastmcp.server.auth import StaticTokenVerifier
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.tools.tool import Tool
 from mcp.types import ToolAnnotations
-from starlette.requests import Request
-from starlette.responses import JSONResponse
-
-from uga.audit import UgaAuditLog
 
 from . import commands, files
+from .audit import AuditError, CallAudit, ComputerAuditLog, bind_call, unbind_call
 from .commands import CommandError, SessionManager
 from .files import FileOperationError
 from .policy import ComputerPolicy, PolicyError, PolicyViolation, load_policy
 from .system import system_info
 
 TOKEN_ENV = "CONTEXTBRIDGE_COMPUTER_TOKEN"
+KNOWLEDGE_TOKEN_ENV = "MCP_AUTH_TOKEN"
+CLIENT_ID = "contextbridge-computer"
+MIN_TOKEN_LENGTH = 32
+
+SCOPE_READ = "computer:read"
+SCOPE_WRITE = "computer:write"
+SCOPE_EXECUTE = "computer:execute"
+SCOPE_PROCESS = "computer:process"
+ALL_SCOPES = (SCOPE_READ, SCOPE_WRITE, SCOPE_EXECUTE, SCOPE_PROCESS)
 
 READ_TOOLS = frozenset(
     {"list_directory", "read_file", "get_file_info", "search_files", "search_code", "get_system_info"}
@@ -47,6 +61,14 @@ WRITE_TOOLS = frozenset({"write_file", "edit_block", "create_directory", "move_f
 COMMAND_TOOLS = frozenset(
     {"run_command", "start_process", "read_process_output", "interact_with_process", "force_terminate", "list_sessions"}
 )
+
+TOOL_SCOPES: dict[str, str] = {
+    **{name: SCOPE_READ for name in READ_TOOLS},
+    "list_processes": SCOPE_READ,
+    **{name: SCOPE_WRITE for name in WRITE_TOOLS},
+    **{name: SCOPE_EXECUTE for name in COMMAND_TOOLS},
+    "kill_process": SCOPE_PROCESS,
+}
 
 _AUDITED_ARGS = (
     "path",
@@ -63,12 +85,37 @@ _AUDITED_ARGS = (
     "timeout_seconds",
 )
 _DIGESTED_ARGS = ("content", "old_string", "new_string", "input")
+_OUTCOME_FIELDS = ("pid", "session_id", "exit_code", "timed_out", "stdout_truncated", "stderr_truncated")
 _MAX_AUDIT_VALUE = 1000
 
 _READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
 _WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False)
 _ADDITIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False)
 _EXECUTE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True)
+
+
+class AuthorizationError(PermissionError):
+    """Raised when the caller may not use a tool."""
+
+
+Authorizer = Callable[[str], str]
+"""Given a tool name, return the caller's client id or raise :class:`AuthorizationError`."""
+
+
+def token_authorizer(tool: str) -> str:
+    """Authorize ``tool`` against the bearer token of the current request."""
+    try:
+        from fastmcp.server.dependencies import get_access_token
+
+        token = get_access_token()
+    except Exception:  # no request context at all
+        token = None
+    if token is None:
+        raise AuthorizationError("Authentication required.")
+    scope = TOOL_SCOPES.get(tool)
+    if scope is None or scope not in (token.scopes or []):
+        raise AuthorizationError(f"Token is not authorized for '{tool}' (needs {scope}).")
+    return token.client_id
 
 
 def computer_tool_names(policy: ComputerPolicy) -> frozenset[str]:
@@ -91,6 +138,8 @@ def _call(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         return fn(*args, **kwargs)
     except PolicyViolation as exc:
         raise ToolError(f"Denied by policy: {exc}") from exc
+    except AuditError as exc:
+        raise ToolError(f"Audit log unavailable; operation refused: {exc}") from exc
     except (FileNotFoundError, FileOperationError, CommandError, UnicodeDecodeError) as exc:
         raise ToolError(str(exc)) from exc
     except OSError as exc:
@@ -115,14 +164,11 @@ def _audit_fields(arguments: dict[str, Any] | None) -> dict[str, Any]:
     return fields
 
 
-def _client_label() -> str | None:
-    try:
-        from fastmcp.server.dependencies import get_access_token
-
-        token = get_access_token()
-    except Exception:  # no HTTP request context (stdio, in-memory)
-        return None
-    return getattr(token, "client_id", None) if token else None
+def _succeeded(tool: str, structured: dict[str, Any]) -> bool:
+    """Whether a call that returned normally achieved its goal."""
+    if tool == "run_command":
+        return structured.get("exit_code") == 0 and not structured.get("timed_out")
+    return True
 
 
 def _elapsed_ms(started: float) -> int:
@@ -130,61 +176,71 @@ def _elapsed_ms(started: float) -> int:
 
 
 class ComputerPolicyMiddleware(Middleware):
-    """Hide tools outside the policy surface, reject calls to them, and audit every call."""
+    """Authorize and audit every call at execution time; hide tools the caller cannot use."""
 
-    def __init__(self, allowed: frozenset[str], audit: UgaAuditLog) -> None:
+    def __init__(self, allowed: frozenset[str], audit: ComputerAuditLog, authorize: Authorizer) -> None:
         self._allowed = allowed
         self._audit = audit
+        self._authorize = authorize
+
+    def _check(self, name: str) -> str:
+        if name not in self._allowed:
+            raise AuthorizationError(f"Tool '{name}' is not permitted on this computer.")
+        return self._authorize(name)
 
     async def on_list_tools(self, context: MiddlewareContext[Any], call_next: Any) -> Sequence[Tool]:
         tools = await call_next(context)
-        return [t for t in tools if t.name in self._allowed]
+        visible = []
+        for tool in tools:
+            try:
+                self._check(tool.name)
+            except AuthorizationError:
+                continue
+            visible.append(tool)
+        return visible
 
     async def on_call_tool(self, context: MiddlewareContext[Any], call_next: Any) -> Any:
         started = time.monotonic()
-        message_id = getattr(context.message, "id", None)
-        request_id = f"mcp-{message_id}" if message_id is not None else uuid.uuid4().hex[:12]
+        request_id = uuid.uuid4().hex[:16]
         name = str(getattr(context.message, "name", None) or "<unknown>")
         fields = _audit_fields(getattr(context.message, "arguments", None))
-        client = _client_label()
-        if name not in self._allowed:
-            self._audit.record(
-                tool=name,
-                success=False,
-                detail="policy_denied",
-                client_label=client,
-                request_id=request_id,
-                elapsed_ms=_elapsed_ms(started),
-                extra=fields,
-            )
-            raise ToolError(f"Tool '{name}' is not permitted on this computer.")
+        try:
+            self._audit.record("requested", request_id=request_id, tool=name, **fields)
+        except AuditError as exc:
+            raise ToolError(f"Audit log unavailable; refusing to run '{name}'.") from exc
+
+        try:
+            client = self._check(name)
+        except AuthorizationError as exc:
+            self._audit.record("denied", request_id=request_id, tool=name, reason=str(exc))
+            raise ToolError(str(exc)) from exc
+
+        call = CallAudit(self._audit, request_id, name, client)
+        binding = bind_call(call)
         try:
             result = await call_next(context)
         except Exception as exc:
             cause = exc.__cause__ if isinstance(exc, ToolError) and exc.__cause__ else exc
-            detail = "policy_denied" if isinstance(cause, PolicyViolation) else type(cause).__name__
-            self._audit.record(
-                tool=name,
-                success=False,
-                detail=detail,
-                client_label=client,
-                request_id=request_id,
+            if call.started:
+                event = "completed"
+            elif isinstance(cause, PolicyViolation):
+                event = "denied"
+            else:
+                event = "failed"
+            call.emit(
+                event,
+                success=False if event == "completed" else None,
+                detail=type(cause).__name__,
+                reason=str(exc)[:_MAX_AUDIT_VALUE],
                 elapsed_ms=_elapsed_ms(started),
-                extra={**fields, "error": str(exc)[:_MAX_AUDIT_VALUE]},
             )
             raise
+        finally:
+            unbind_call(binding)
+
         structured = getattr(result, "structured_content", None) or {}
-        for key in ("exit_code", "timed_out"):
-            if key in structured:
-                fields[key] = structured[key]
-        self._audit.record(
-            tool=name,
-            success=True,
-            client_label=client,
-            request_id=request_id,
-            elapsed_ms=_elapsed_ms(started),
-            extra=fields,
-        )
+        outcome = {k: structured[k] for k in _OUTCOME_FIELDS if k in structured}
+        call.emit("completed", success=_succeeded(name, structured), elapsed_ms=_elapsed_ms(started), **outcome)
         return result
 
 
@@ -206,10 +262,10 @@ def _instructions(policy: ComputerPolicy) -> str:
 def create_computer_server(
     policy: ComputerPolicy,
     *,
-    audit: UgaAuditLog | None = None,
+    audit: ComputerAuditLog,
+    authorize: Authorizer = token_authorizer,
     name: str = "ContextBridge Computer",
 ) -> FastMCP:
-    audit = audit or UgaAuditLog(None, route="computer")
     allowed = computer_tool_names(policy)
     server = FastMCP(name=name, instructions=_instructions(policy))
 
@@ -296,7 +352,16 @@ def create_computer_server(
     # --------------------------------------------------------- command tools
 
     if policy.commands_enabled:
-        sessions = SessionManager(policy)
+
+        def report_exit(status: dict[str, Any]) -> None:
+            audit.record(
+                "exited",
+                tool="session",
+                success=status["exit_code"] == 0 and not status["timed_out"],
+                **{k: status[k] for k in ("session_id", "pid", "command", "exit_code", "timed_out", "runtime_seconds")},
+            )
+
+        sessions = SessionManager(policy, on_exit=report_exit)
         atexit.register(sessions.shutdown)
 
         @server.tool(annotations=_EXECUTE)
@@ -354,12 +419,7 @@ def create_computer_server(
             """Terminate a process by PID (force sends SIGKILL / TerminateProcess)."""
             return _call(commands.kill_process, pid, force=force)
 
-    server.add_middleware(ComputerPolicyMiddleware(allowed, audit))
-
-    @server.custom_route("/", methods=["GET"])
-    async def root_status(_request: Request) -> JSONResponse:
-        return JSONResponse({"service": name, "mcp_path": "/mcp", "tools": sorted(allowed)})
-
+    server.add_middleware(ComputerPolicyMiddleware(allowed, audit, authorize))
     return server
 
 
@@ -371,7 +431,10 @@ def advertised_tool_names(server: FastMCP) -> set[str]:
     return anyio.run(_names)
 
 
-def _is_loopback(host: str) -> bool:
+# ------------------------------------------------------------------ startup
+
+
+def is_loopback(host: str) -> bool:
     if host == "localhost":
         return True
     try:
@@ -380,62 +443,89 @@ def _is_loopback(host: str) -> bool:
         return False
 
 
+def load_scopes(cfg: dict[str, Any]) -> tuple[str, ...]:
+    auth = cfg.get("auth") or {}
+    if not isinstance(auth, dict):
+        raise PolicyError("auth must be a mapping")
+    scopes = auth.get("scopes", list(ALL_SCOPES))
+    if not isinstance(scopes, list) or not scopes:
+        raise PolicyError("auth.scopes must be a non-empty list")
+    unknown = [s for s in scopes if s not in ALL_SCOPES]
+    if unknown:
+        raise PolicyError(f"auth.scopes: unknown scope(s) {unknown}; valid: {list(ALL_SCOPES)}")
+    return tuple(dict.fromkeys(scopes))
+
+
+def _require_token() -> str:
+    token = os.environ.get(TOKEN_ENV, "")
+    if not token:
+        raise SystemExit(f"{TOKEN_ENV} must be set (fail closed).")
+    if len(token) < MIN_TOKEN_LENGTH:
+        raise SystemExit(f"{TOKEN_ENV} must be at least {MIN_TOKEN_LENGTH} characters.")
+    if token == os.environ.get(KNOWLEDGE_TOKEN_ENV):
+        raise SystemExit(
+            f"{TOKEN_ENV} must differ from {KNOWLEDGE_TOKEN_ENV}; knowledge and computer access are separate."
+        )
+    return token
+
+
 def main(argv: list[str] | None = None) -> None:
-    ap = argparse.ArgumentParser(description="ContextBridge computer route")
+    ap = argparse.ArgumentParser(description="ContextBridge computer route (HTTP on loopback only)")
     ap.add_argument("--config", required=True)
-    ap.add_argument("--transport", choices=("stdio", "http"), help="override serve.transport")
     args = ap.parse_args(argv)
+
+    token = _require_token()
 
     config_path = Path(args.config).expanduser().resolve()
     with config_path.open(encoding="utf-8") as fh:
         cfg = yaml.safe_load(fh) or {}
-
     serve = cfg.get("serve") or {}
-    transport = args.transport or serve.get("transport", "stdio")
-    if transport not in ("stdio", "http"):
-        raise SystemExit(f"{config_path}: serve.transport must be 'stdio' or 'http'.")
 
-    audit_path = serve.get("audit_log")
-    if audit_path:
-        audit_path = Path(audit_path).expanduser()
-        if not audit_path.is_absolute():
-            audit_path = config_path.parent / audit_path
+    host = str(serve.get("host", "127.0.0.1"))
+    if not is_loopback(host):
+        raise SystemExit(f"{config_path}: serve.host must be a loopback address; {host} is not.")
+    port = serve.get("port")
+    if not isinstance(port, int) or not 0 < port < 65536:
+        raise SystemExit(f"{config_path}: serve.port must be a TCP port number.")
+    if not serve.get("audit_log"):
+        raise SystemExit(f"{config_path}: serve.audit_log is required.")
+    audit_path = Path(serve["audit_log"]).expanduser()
+    if not audit_path.is_absolute():
+        audit_path = config_path.parent / audit_path
+
     try:
-        policy = load_policy(cfg, protected=(config_path, audit_path or ""))
+        scopes = load_scopes(cfg)
+        policy = load_policy(cfg, protected=(config_path, audit_path))
     except PolicyError as exc:
         raise SystemExit(f"{config_path}: {exc}") from None
+    try:
+        audit = ComputerAuditLog(audit_path)
+    except AuditError as exc:
+        raise SystemExit(str(exc)) from None
 
-    server = create_computer_server(
-        policy,
-        audit=UgaAuditLog(audit_path, route="computer"),
-        name=cfg.get("name", "ContextBridge Computer"),
-    )
+    server = create_computer_server(policy, audit=audit, name=cfg.get("name", "ContextBridge Computer"))
     expected = computer_tool_names(policy)
     advertised = advertised_tool_names(server)
     if advertised != expected:
         raise SystemExit(f"Computer tool surface mismatch: expected {set(expected)!r}, got {advertised!r}")
 
-    summary = f"{len(expected)} tools, commands={policy.command_mode}, writable={bool(policy.writable_roots)}"
-    if transport == "stdio":
-        print(f"[computer] serving on stdio ({summary})", file=sys.stderr, flush=True)
-        server.run(transport="stdio", show_banner=False)
-        return
-
-    token = os.environ.get(TOKEN_ENV)
-    if not token:
-        raise SystemExit(f"{TOKEN_ENV} must be set for the HTTP computer route (fail closed).")
-    if token == os.environ.get("MCP_AUTH_TOKEN"):
-        raise SystemExit(f"{TOKEN_ENV} must differ from MCP_AUTH_TOKEN; knowledge and computer access are separate.")
-    host = serve.get("host", "127.0.0.1")
-    port = serve.get("port")
-    if not port:
-        raise SystemExit(f"{config_path}: serve.port is required for the HTTP transport.")
-    if not _is_loopback(host) and not serve.get("allow_non_loopback", False):
-        raise SystemExit(
-            f"{config_path}: refusing to bind {host}; set serve.allow_non_loopback only behind an "
-            "authenticated TLS front end."
+    try:
+        audit.record(
+            "service_started",
+            host=host,
+            port=port,
+            tools=sorted(expected),
+            scopes=list(scopes),
+            policy=policy.summary(),
         )
+    except AuditError as exc:
+        raise SystemExit(str(exc)) from None
 
-    server.auth = StaticTokenVerifier({token: {"client_id": "contextbridge-computer"}})
-    print(f"[computer] serving on {host}:{port} ({summary})", file=sys.stderr, flush=True)
+    server.auth = StaticTokenVerifier({token: {"client_id": CLIENT_ID, "scopes": list(scopes)}})
+    print(
+        f"[computer] serving {len(expected)} tools on http://{host}:{port}/mcp "
+        f"(commands={policy.command_mode}, writable={policy.can_write}, scopes={','.join(scopes)})",
+        file=sys.stderr,
+        flush=True,
+    )
     server.run(transport="http", host=host, port=port, show_banner=False)

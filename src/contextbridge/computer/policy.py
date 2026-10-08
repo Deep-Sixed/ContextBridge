@@ -296,6 +296,13 @@ def load_policy(cfg: dict[str, Any], *, protected: tuple[str | Path, ...] = ()) 
     if mode == "allowlist" and not allow:
         raise PolicyError("commands.allow must list at least one program in allowlist mode")
     shell = _str_list(cmds, "shell")
+    max_timeout = _positive(cmds, "max_timeout_seconds", 600.0, kind=float)
+    if "default_timeout_seconds" in cmds:
+        default_timeout = _positive(cmds, "default_timeout_seconds", 30.0, kind=float)
+        if default_timeout > max_timeout:
+            raise PolicyError("commands.default_timeout_seconds cannot exceed max_timeout_seconds")
+    else:
+        default_timeout = min(30.0, max_timeout)
 
     policy = ComputerPolicy(
         roots=tuple(roots),
@@ -309,8 +316,8 @@ def load_policy(cfg: dict[str, Any], *, protected: tuple[str | Path, ...] = ()) 
         command_mode=mode,
         command_allow=frozenset(allow),
         shell=shell,
-        default_timeout_seconds=_positive(cmds, "default_timeout_seconds", 30.0, kind=float),
-        max_timeout_seconds=_positive(cmds, "max_timeout_seconds", 600.0, kind=float),
+        default_timeout_seconds=default_timeout,
+        max_timeout_seconds=max_timeout,
         max_output_bytes=_positive(cmds, "max_output_bytes", 64 * 1024),
         max_sessions=_positive(cmds, "max_sessions", 4),
         max_session_seconds=_positive(cmds, "max_session_seconds", 3600.0, kind=float),
@@ -318,6 +325,4 @@ def load_policy(cfg: dict[str, Any], *, protected: tuple[str | Path, ...] = ()) 
         list_processes=bool(procs.get("list", True)),
         allow_kill=bool(procs.get("allow_kill", False)),
     )
-    if policy.default_timeout_seconds > policy.max_timeout_seconds:
-        raise PolicyError("commands.default_timeout_seconds cannot exceed max_timeout_seconds")
     return policy

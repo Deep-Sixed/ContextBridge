@@ -44,7 +44,6 @@ class UgaAuditLog:
         client_label: str | None = None,
         request_id: str | None = None,
         elapsed_ms: int | None = None,
-        extra: dict[str, Any] | None = None,
     ) -> None:
         entry: dict[str, Any] = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -67,12 +66,10 @@ class UgaAuditLog:
             entry["result_count"] = result_count
         if detail:
             entry["detail"] = detail
-        if extra:
-            entry.update({k: v for k, v in extra.items() if k not in entry})
         line = json.dumps(entry, separators=(",", ":"))
         if self._fh:
             try:
                 self._fh.write(line + "\n")
             except OSError:
                 pass
-        print(f"[{self.route} audit] {line}", file=sys.stderr, flush=True)
+        print(f"[uga audit] {line}", file=sys.stderr, flush=True)
