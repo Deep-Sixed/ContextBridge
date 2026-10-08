@@ -5,7 +5,6 @@ from .adapter import (
     DatacoreRecordError,
     DatacoreRecordNotFound,
     DatacoreStore,
-    default_jsonl_path,
 )
 from .policy import UGA_ALLOWED_TOOLS, UGA_FORBIDDEN_TOOL_EXAMPLES
 
@@ -20,5 +19,4 @@ __all__ = [
     "UGA_ALLOWED_TOOLS",
     "UGA_FORBIDDEN_TOOL_EXAMPLES",
     "__version__",
-    "default_jsonl_path",
 ]

@@ -7,12 +7,11 @@ name = "contextbridge"
 dynamic = ["version"]
 description = "Read-only authenticated MCP gateway for approved project context"
 requires-python = ">=3.11"
-# fastmcp 4 removed fastmcp.tools.tool and 2.x lacks tool(timeout=...); the
-# gateway is tested against the 3.x line. mcp bounds follow fastmcp 3.x.
-dependencies = ["fastmcp>=3.0,<4", "mcp>=1.24,<2", "anyio", "pyyaml", "starlette"]
+# fastmcp 4 removed fastmcp.tools.tool; anyio 4.1 added abandon_on_cancel.
+dependencies = ["fastmcp>=3,<4", "mcp>=1.24,<2", "anyio>=4.1", "pyyaml", "starlette"]
 
 [project.optional-dependencies]
-test = ["pytest>=8"]
+test = ["pytest"]
 
 [tool.setuptools.dynamic]
 version = { attr = "uga.__version__" }
@@ -21,5 +20,5 @@ version = { attr = "uga.__version__" }
 where = ["src"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
 pythonpath = ["src"]
+testpaths = ["tests"]

@@ -1,54 +1,45 @@
-"""Shared fixtures for the ContextBridge MCP contract tests."""
-
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
-from fastmcp import FastMCP
 
-from uga import gateway
+TOKEN = "t" * 40
 
-FIXTURE_JSONL = Path(__file__).parent / "fixtures" / "contract.jsonl"
-
-
-def _reset_gateway_singletons() -> None:
-    if gateway._audit is not None:
-        gateway._audit.close()
-    gateway._audit = None
-    gateway._store = None
-
-
-@pytest.fixture
-def anyio_backend() -> str:
-    return "asyncio"
+_GATEWAY_ENV = (
+    "MCP_AUTH_TOKEN",
+    "UGA_DATACORE_JSONL",
+    "UGA_AUDIT_LOG",
+    "UGA_AUDIT_LOG_QUERY_TEXT",
+    "UGA_MCP_TOOL_TIMEOUT_SECONDS",
+    "UGA_MCP_METADATA_TIMEOUT_SECONDS",
+    "UGA_MCP_SEARCH_LIMIT",
+)
 
 
-@pytest.fixture
-def audit_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
-    """Point the gateway at the fixture JSONL and a fresh audit file."""
-    path = tmp_path / "audit.jsonl"
-    monkeypatch.setenv("UGA_DATACORE_JSONL", str(FIXTURE_JSONL))
-    monkeypatch.setenv("UGA_AUDIT_LOG", str(path))
-    monkeypatch.delenv("UGA_AUDIT_QUERY_PREVIEW", raising=False)
-    _reset_gateway_singletons()
-    yield path
-    _reset_gateway_singletons()
+@pytest.fixture(autouse=True)
+def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in _GATEWAY_ENV:
+        monkeypatch.delenv(name, raising=False)
 
 
-@pytest.fixture
-def audit_lines(audit_path: Path) -> Callable[[], list[dict[str, Any]]]:
-    def read() -> list[dict[str, Any]]:
-        if not audit_path.exists():
-            return []
-        return [json.loads(line) for line in audit_path.read_text().splitlines() if line]
+def record(record_id: Any = "r1", **fields: Any) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "id": record_id,
+        "title": f"Title {record_id}",
+        "text": f"Body {record_id}",
+        "url": f"https://example.test/{record_id}",
+    }
+    base.update(fields)
+    return base
 
-    return read
+
+def write_jsonl(path: Path, records: list[dict[str, Any]]) -> Path:
+    path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+    return path
 
 
-@pytest.fixture
-def server(audit_path: Path) -> FastMCP:
-    return gateway.create_uga_server(name="ContextBridge")
+def read_audit(path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]

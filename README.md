@@ -2,7 +2,7 @@
 
 A read-only MCP gateway that gives AI agents authenticated access to approved JSONL project context.
 
-**Security model:** exactly two operations (`search` and `fetch`), default-deny tool middleware, read-only annotations, audit logging, and a static bearer token required at startup. It binds only to the loopback interface by default.
+**Security model:** exactly two operations (`search` and `fetch`), default-deny tool middleware, read-only annotations, audit logging, and a static bearer token (at least 32 characters) required at startup. Error details are masked from clients, and only allowlisted record fields are served. It binds only to the loopback interface by default.
 
 ## Installation
 
@@ -13,7 +13,13 @@ export UGA_DATACORE_JSONL="/path/to/approved/datacore.fetch.v1.jsonl"
 ./scripts/run-contextbridge.sh
 ```
 
-The JSONL export must contain approved records with `id`, `title`, `text`, and `url` fields.
+Requires fastmcp 3.x. `MCP_AUTH_TOKEN` must be at least 32 characters (for example `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`).
+
+The data export is required: set `UGA_DATACORE_JSONL`, or `datacore_jsonl` in the config file (a relative path is resolved against the config file's directory). The environment variable wins. The export is loaded and validated at startup, and the gateway refuses to start if it is missing or invalid.
+
+## Data format
+
+Each JSONL line is one approved record with `id` (a non-empty string or integer), `title`, `text`, and `url`, plus an optional `metadata` object. Of the other top-level keys, only the approved fields listed in `_OPTIONAL_TOP_LEVEL_FIELDS` in `src/uga/adapter.py` are kept; any other key is dropped at load time and is never served or searched. Search matches field values, not JSON key names.
 
 ## Tools
 
@@ -26,9 +32,7 @@ Both tools only read the loaded JSONL snapshot. The server reports the package v
 
 ## Audit log
 
-Every MCP request (`initialize`, `tools/list`, `tools/call`) writes one JSON line to stderr, and to `UGA_AUDIT_LOG` (or `serve.audit_log` in the config) when set. Each line carries `request_id` (the JSON-RPC id), `client` (the client's self-reported `clientInfo`, unauthenticated), `success`, `elapsed_ms`, and a `detail` on failure such as `policy_denied`, `not_found`, or `timeout`. Tool calls add `query_hash` or `record_id` and `result_count`. Arguments to denied tools are never logged.
-
-Query text is not logged by default. Set `UGA_AUDIT_QUERY_PREVIEW=1` to add the first 80 characters as `query_preview`.
+Every request is written as one JSON line to stderr and, if `UGA_AUDIT_LOG` (or `serve.audit_log` in the config) is set, to that file, which is created with mode `0600`. A tool call produces two lines (one from the policy middleware, one from the tool) that share a `request_id`. Rejected HTTP requests are logged as `tool: "auth"` with `missing_token` or `invalid_token`. Queries are recorded as a hash and length only; set `UGA_AUDIT_LOG_QUERY_TEXT=1` to also log the first 80 characters.
 
 ## Development
 
@@ -37,7 +41,7 @@ python3 -m pip install -e ".[test]"
 python3 -m pytest
 ```
 
-The tests pin the MCP contract: the exact tool set, annotations, input schemas, reported version, policy denial, audit lines, and that `/mcp` rejects requests without the bearer token. CI runs them on Python 3.11 with the oldest supported fastmcp (3.0.0) and on Python 3.13 with the newest 3.x release.
+`tests/test_contract.py` pins the MCP contract clients see: the exact tool set, annotations, input schemas, reported version, and policy denial. `tests/test_entrypoint.py` starts the real `python -m uga.gateway` entrypoint and checks bearer auth over HTTP. CI runs the suite on Python 3.11 with the oldest supported fastmcp and on Python 3.13 with the newest 3.x release.
 
 ## Access model
 

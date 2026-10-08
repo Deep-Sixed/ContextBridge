@@ -1,4 +1,8 @@
-"""End-to-end check of the real HTTP entrypoint: no bearer token, no MCP."""
+"""End-to-end check of the real ``python -m uga.gateway`` entrypoint over HTTP.
+
+The in-process tests build the server directly; this one runs ``main()`` so that
+config parsing, startup validation, and ``server.run`` are covered too.
+"""
 
 from __future__ import annotations
 
@@ -10,13 +14,14 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
+import anyio
 import httpx
 import pytest
 from fastmcp import Client
 
+from conftest import TOKEN, record, write_jsonl
+
 REPO = Path(__file__).resolve().parents[1]
-FIXTURE_JSONL = Path(__file__).parent / "fixtures" / "contract.jsonl"
-TOKEN = "contract-test-token"
 
 INITIALIZE = {
     "jsonrpc": "2.0",
@@ -25,10 +30,9 @@ INITIALIZE = {
     "params": {
         "protocolVersion": "2025-06-18",
         "capabilities": {},
-        "clientInfo": {"name": "auth-test", "version": "0"},
+        "clientInfo": {"name": "entrypoint-test", "version": "0"},
     },
 }
-MCP_HEADERS = {"Accept": "application/json, text/event-stream"}
 
 
 def _free_port() -> int:
@@ -39,20 +43,23 @@ def _free_port() -> int:
 
 @pytest.fixture(scope="module")
 def gateway_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
-    tmp = tmp_path_factory.mktemp("http")
+    tmp = tmp_path_factory.mktemp("entrypoint")
+    write_jsonl(tmp / "d.jsonl", [record("r1"), record("r2")])
     port = _free_port()
     config = tmp / "contextbridge.yaml"
     config.write_text(
-        f"name: ContextBridge\nserve:\n  transport: http\n  host: 127.0.0.1\n  port: {port}\n",
+        "name: ContextBridge\n"
+        "datacore_jsonl: d.jsonl\n"
+        f"serve:\n  transport: http\n  host: 127.0.0.1\n  port: {port}\n",
         encoding="utf-8",
     )
     env = {
-        **os.environ,
-        "MCP_AUTH_TOKEN": TOKEN,
-        "UGA_DATACORE_JSONL": str(FIXTURE_JSONL),
-        "PYTHONPATH": str(REPO / "src"),
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("UGA_") and key != "MCP_AUTH_TOKEN"
     }
-    env.pop("UGA_AUDIT_LOG", None)
+    env["MCP_AUTH_TOKEN"] = TOKEN
+    env["PYTHONPATH"] = str(REPO / "src")
     log = tmp / "gateway.log"
     base = f"http://127.0.0.1:{port}"
     with log.open("w") as log_fh:
@@ -75,6 +82,7 @@ def gateway_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
                 if time.monotonic() > deadline:
                     pytest.fail(f"gateway did not start:\n{log.read_text()}")
                 time.sleep(0.2)
+            assert "serving search/fetch over 2 records" in log.read_text()
             yield base
         finally:
             proc.terminate()
@@ -85,23 +93,26 @@ def gateway_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
                 proc.wait()
 
 
-@pytest.mark.parametrize("authorization", [None, "Bearer wrong-token"])
-def test_mcp_endpoint_rejects_missing_or_wrong_token(
-    gateway_url: str, authorization: str | None
-) -> None:
-    headers = dict(MCP_HEADERS)
-    if authorization:
-        headers["Authorization"] = authorization
+def test_entrypoint_rejects_requests_without_token(gateway_url: str) -> None:
     response = httpx.post(
-        f"{gateway_url}/mcp", json=INITIALIZE, headers=headers, timeout=5, trust_env=False
+        f"{gateway_url}/mcp",
+        json=INITIALIZE,
+        headers={"Accept": "application/json, text/event-stream"},
+        timeout=5,
+        trust_env=False,
     )
+
     assert response.status_code == 401
 
 
-@pytest.mark.anyio
-async def test_mcp_endpoint_serves_tools_with_token(gateway_url: str) -> None:
-    async with Client(f"{gateway_url}/mcp", auth=TOKEN) as client:
-        tools = await client.list_tools()
-        result = await client.call_tool("search", {"query": "alpha"})
-    assert {tool.name for tool in tools} == {"search", "fetch"}
-    assert [hit["id"] for hit in result.structured_content["results"]] == ["r1"]
+def test_entrypoint_serves_tools_with_token(gateway_url: str) -> None:
+    async def go() -> tuple[set[str], list[str]]:
+        async with Client(f"{gateway_url}/mcp", auth=TOKEN) as client:
+            tools = await client.list_tools()
+            result = await client.call_tool("search", {"query": "r2"})
+        return {tool.name for tool in tools}, [hit["id"] for hit in result.structured_content["results"]]
+
+    names, hits = anyio.run(go)
+
+    assert names == {"search", "fetch"}
+    assert hits == ["r2"]

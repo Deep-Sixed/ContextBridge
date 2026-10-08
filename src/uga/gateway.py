@@ -7,12 +7,15 @@ the read-only Datacore JSONL adapter. Default-deny policy rejects every other to
 from __future__ import annotations
 
 import argparse
-import json
+import hashlib
+import hmac
 import os
 import sys
 import time
 import uuid
 from collections.abc import Sequence
+from contextvars import ContextVar
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -20,23 +23,29 @@ import anyio
 import yaml
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
-from fastmcp.server.auth import StaticTokenVerifier
+from fastmcp.server.auth import AccessToken, TokenVerifier
+from fastmcp.server.dependencies import get_http_request
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.tools.tool import Tool
 from mcp.types import ToolAnnotations
+from starlette.middleware import Middleware as AsgiMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import __version__
-from .adapter import DatacoreRecordNotFound, DatacoreStore, repo_root
+from .adapter import DatacoreRecordNotFound, DatacoreStore
 from .audit import UgaAuditLog
 from .policy import UGA_ALLOWED_TOOLS, is_tool_allowed
 
-_store: DatacoreStore | None = None
-_audit: UgaAuditLog | None = None
 DEFAULT_METADATA_TIMEOUT_SECONDS = 5.0
 DEFAULT_TOOL_TIMEOUT_SECONDS = 10.0
 DEFAULT_SEARCH_LIMIT = 10
+MIN_TOKEN_LENGTH = 32
+
+# Set by the middleware for each tools/call so the tool's own audit line carries
+# the same request_id as the middleware's line.
+_current_request_id: ContextVar[str | None] = ContextVar("uga_request_id", default=None)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -77,100 +86,117 @@ def _elapsed_ms(started: float) -> int:
     return max(0, round((time.monotonic() - started) * 1000))
 
 
-_CLIENT_LABEL_MAX_LEN = 64
-
-
-class RecordNotFoundError(ToolError):
-    """Raised by ``fetch`` for an unknown id; audited as ``not_found``."""
-
-
-def _request_context(context: MiddlewareContext[Any]) -> Any:
-    fastmcp_context = context.fastmcp_context
-    if fastmcp_context is None:
-        return None
-    try:
-        return fastmcp_context.request_context
-    except Exception:
-        return None
-
-
 def _request_id(context: MiddlewareContext[Any]) -> str:
-    """Return the JSON-RPC request id so audit lines match the client's request."""
-    request_context = _request_context(context)
-    message_id = getattr(request_context, "request_id", None)
-    if message_id is None:
-        message_id = getattr(context.message, "id", None)
-    if message_id is not None:
-        return f"mcp-{message_id}"
-    return uuid.uuid4().hex[:12]
+    """Return ``<session>:<json-rpc id>`` when known, else a fresh unique id.
 
-
-def _client_label(context: MiddlewareContext[Any]) -> str | None:
-    """Return the client's self-reported ``clientInfo`` as ``name/version``.
-
-    The value is client-supplied and unauthenticated; it labels audit lines only.
+    JSON-RPC ids are only unique within one MCP session, so they are qualified by
+    the session id. ``initialize`` has no request context yet and gets a UUID.
     """
-    params = getattr(context.message, "params", None)
-    info = getattr(params, "clientInfo", None)
-    if info is None:
-        session = getattr(_request_context(context), "session", None)
-        info = getattr(getattr(session, "client_params", None), "clientInfo", None)
-    name = str(getattr(info, "name", None) or "").strip()
-    if not name:
+    ctx = context.fastmcp_context
+    request_ctx = ctx.request_context if ctx is not None else None
+    if request_ctx is not None:
+        try:
+            return f"{ctx.session_id}:{request_ctx.request_id}"
+        except RuntimeError:
+            pass
+    return uuid.uuid4().hex
+
+
+def _client_name(context: MiddlewareContext[Any]) -> str | None:
+    """The clientInfo name the MCP client reported at initialize (self-declared)."""
+    info = getattr(getattr(context.message, "params", None), "clientInfo", None)
+    if info is None and context.fastmcp_context is not None:
+        try:
+            client_params = context.fastmcp_context.session.client_params
+        except RuntimeError:
+            client_params = None
+        info = getattr(client_params, "clientInfo", None)
+    return getattr(info, "name", None)
+
+
+def _peer() -> str | None:
+    try:
+        request = get_http_request()
+    except RuntimeError:
         return None
-    version = str(getattr(info, "version", None) or "").strip()
-    label = f"{name}/{version}" if version else name
-    return label[:_CLIENT_LABEL_MAX_LEN]
+    return request.client.host if request.client else None
 
 
-def _call_fields(name: str, arguments: Any) -> dict[str, str]:
-    """Pick the audited argument for an allowed tool; other arguments are never logged."""
-    if not isinstance(arguments, dict):
-        return {}
-    if name == "search" and isinstance(arguments.get("query"), str):
-        return {"query": arguments["query"]}
-    if name == "fetch" and isinstance(arguments.get("id"), str):
-        return {"record_id": arguments["id"]}
-    return {}
+def _require_token(token: str | None) -> str:
+    if not token:
+        raise ValueError("MCP_AUTH_TOKEN must be set for the UGA gateway (fail closed).")
+    if len(token) < MIN_TOKEN_LENGTH:
+        raise ValueError(f"MCP_AUTH_TOKEN must be at least {MIN_TOKEN_LENGTH} characters.")
+    return token
 
 
-def _result_count(result: Any) -> int | None:
-    structured = getattr(result, "structured_content", None)
-    if isinstance(structured, dict) and isinstance(structured.get("results"), list):
-        return len(structured["results"])
-    return None
+def _audit_from_env() -> UgaAuditLog:
+    log_query_text = os.environ.get("UGA_AUDIT_LOG_QUERY_TEXT", "").lower() in {"1", "true", "yes"}
+    return UgaAuditLog(os.environ.get("UGA_AUDIT_LOG"), route="uga", log_query_text=log_query_text)
 
 
-def _failure_detail(exc: BaseException) -> str:
-    if isinstance(exc, RecordNotFoundError):
-        return "not_found"
-    # FastMCP wraps unexpected tool exceptions in ToolError; audit the original type.
-    if isinstance(exc, ToolError) and exc.__cause__ is not None:
-        return type(exc.__cause__).__name__
-    return type(exc).__name__
+def _store_from_env() -> DatacoreStore:
+    path = os.environ.get("UGA_DATACORE_JSONL")
+    if not path:
+        raise ValueError("UGA_DATACORE_JSONL must point at the approved datacore JSONL export.")
+    return DatacoreStore.from_jsonl(path)
 
 
-def _get_store() -> DatacoreStore:
-    global _store
-    if _store is None:
-        path = os.environ.get("UGA_DATACORE_JSONL")
-        _store = DatacoreStore.from_jsonl(path) if path else DatacoreStore.from_jsonl()
-    return _store
+class _BearerTokenVerifier(TokenVerifier):
+    """Accept exactly one static bearer token, compared in constant time.
+
+    Only a SHA-256 digest of the token is kept in memory.
+    """
+
+    def __init__(self, token: str) -> None:
+        super().__init__()
+        self._digest = hashlib.sha256(token.encode("utf-8")).digest()
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        presented = hashlib.sha256(token.encode("utf-8")).digest()
+        if not hmac.compare_digest(presented, self._digest):
+            return None
+        return AccessToken(token=token, client_id="nexus-uga", scopes=[])
 
 
-def _get_audit() -> UgaAuditLog:
-    global _audit
-    if _audit is None:
-        _audit = UgaAuditLog(
-            os.environ.get("UGA_AUDIT_LOG"),
-            route="uga",
-            include_query_preview=os.environ.get("UGA_AUDIT_QUERY_PREVIEW") == "1",
-        )
-    return _audit
+class AuthFailureAuditMiddleware:
+    """Audit HTTP requests rejected by auth; these never reach the MCP middleware."""
+
+    def __init__(self, app: ASGIApp, audit: UgaAuditLog) -> None:
+        self.app = app
+        self._audit = audit
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def audited_send(message: Message) -> None:
+            if message["type"] == "http.response.start" and message["status"] in (401, 403):
+                if message["status"] == 403:
+                    detail = "forbidden"
+                elif any(name == b"authorization" for name, _ in scope.get("headers", [])):
+                    detail = "invalid_token"
+                else:
+                    detail = "missing_token"
+                client = scope.get("client")
+                self._audit.record(
+                    tool="auth",
+                    success=False,
+                    detail=detail,
+                    peer=client[0] if client else None,
+                )
+            await send(message)
+
+        await self.app(scope, receive, audited_send)
+
+
+def http_middleware(audit: UgaAuditLog) -> list[AsgiMiddleware]:
+    return [AsgiMiddleware(AuthFailureAuditMiddleware, audit=audit)]
 
 
 class UgaAllowlistMiddleware(Middleware):
-    """Hide non-allowed tools, reject forbidden calls, and audit each request once."""
+    """Hide non-allowed tools and reject forbidden calls before execution."""
 
     def __init__(self, audit: UgaAuditLog) -> None:
         self._audit = audit
@@ -178,7 +204,7 @@ class UgaAllowlistMiddleware(Middleware):
     async def on_initialize(self, context: MiddlewareContext[Any], call_next: Any) -> Any:
         started = time.monotonic()
         request_id = _request_id(context)
-        client = _client_label(context)
+        who = {"client_label": _client_name(context), "peer": _peer()}
         try:
             with anyio.fail_after(_metadata_timeout_seconds()):
                 result = await call_next(context)
@@ -188,9 +214,9 @@ class UgaAllowlistMiddleware(Middleware):
                 tool="initialize",
                 success=False,
                 detail="timeout",
-                client_label=client,
                 request_id=request_id,
                 elapsed_ms=elapsed,
+                **who,
             )
             raise RuntimeError("Nexus Datacore MCP initialize timed out") from None
         except Exception as exc:
@@ -199,25 +225,25 @@ class UgaAllowlistMiddleware(Middleware):
                 tool="initialize",
                 success=False,
                 detail=type(exc).__name__,
-                client_label=client,
                 request_id=request_id,
                 elapsed_ms=elapsed,
+                **who,
             )
             raise
         elapsed = _elapsed_ms(started)
         self._audit.record(
             tool="initialize",
             success=True,
-            client_label=client,
             request_id=request_id,
             elapsed_ms=elapsed,
+            **who,
         )
         return result
 
     async def on_list_tools(self, context: MiddlewareContext[Any], call_next: Any) -> Sequence[Tool]:
         started = time.monotonic()
         request_id = _request_id(context)
-        client = _client_label(context)
+        who = {"client_label": _client_name(context), "peer": _peer()}
         try:
             with anyio.fail_after(_metadata_timeout_seconds()):
                 tools = await call_next(context)
@@ -227,9 +253,9 @@ class UgaAllowlistMiddleware(Middleware):
                 tool="tools/list",
                 success=False,
                 detail="timeout",
-                client_label=client,
                 request_id=request_id,
                 elapsed_ms=elapsed,
+                **who,
             )
             raise RuntimeError("Nexus Datacore MCP tools/list timed out") from None
         except Exception as exc:
@@ -238,9 +264,9 @@ class UgaAllowlistMiddleware(Middleware):
                 tool="tools/list",
                 success=False,
                 detail=type(exc).__name__,
-                client_label=client,
                 request_id=request_id,
                 elapsed_ms=elapsed,
+                **who,
             )
             raise
         filtered = [t for t in tools if is_tool_allowed(t.name)]
@@ -249,16 +275,16 @@ class UgaAllowlistMiddleware(Middleware):
             tool="tools/list",
             success=True,
             result_count=len(filtered),
-            client_label=client,
             request_id=request_id,
             elapsed_ms=elapsed,
+            **who,
         )
         return filtered
 
     async def on_call_tool(self, context: MiddlewareContext[Any], call_next: Any) -> Any:
         started = time.monotonic()
         request_id = _request_id(context)
-        client = _client_label(context)
+        who = {"client_label": _client_name(context), "peer": _peer()}
         raw_name = getattr(context.message, "name", None)
         name = str(raw_name) if raw_name else "<unknown>"
         if not is_tool_allowed(name):
@@ -266,12 +292,12 @@ class UgaAllowlistMiddleware(Middleware):
                 tool=name,
                 success=False,
                 detail="policy_denied",
-                client_label=client,
                 request_id=request_id,
                 elapsed_ms=_elapsed_ms(started),
+                **who,
             )
             raise ToolError(f"Tool '{name}' is not permitted on the UGA route.")
-        fields = _call_fields(name, getattr(context.message, "arguments", None))
+        request_id_token = _current_request_id.set(request_id)
         try:
             with anyio.fail_after(_tool_timeout_seconds()):
                 result = await call_next(context)
@@ -281,10 +307,9 @@ class UgaAllowlistMiddleware(Middleware):
                 tool=name,
                 success=False,
                 detail="timeout",
-                client_label=client,
                 request_id=request_id,
                 elapsed_ms=elapsed,
-                **fields,
+                **who,
             )
             raise ToolError(f"Tool '{name}' timed out on the Nexus Datacore route.") from None
         except Exception as exc:
@@ -292,22 +317,21 @@ class UgaAllowlistMiddleware(Middleware):
             self._audit.record(
                 tool=name,
                 success=False,
-                detail=_failure_detail(exc),
-                client_label=client,
+                detail=type(exc).__name__,
                 request_id=request_id,
                 elapsed_ms=elapsed,
-                **fields,
+                **who,
             )
             raise
+        finally:
+            _current_request_id.reset(request_id_token)
         elapsed = _elapsed_ms(started)
         self._audit.record(
             tool=name,
             success=True,
-            result_count=_result_count(result),
-            client_label=client,
             request_id=request_id,
             elapsed_ms=elapsed,
-            **fields,
+            **who,
         )
         return result
 
@@ -322,24 +346,100 @@ _READ_ONLY = ToolAnnotations(
 )
 
 
-def create_uga_server(*, name: str = "Nexus UGA") -> FastMCP:
-    server = FastMCP(name=name, version=__version__)
+def create_uga_server(
+    *,
+    name: str = "Nexus UGA",
+    store: DatacoreStore | None = None,
+    token: str | None = None,
+    audit: UgaAuditLog | None = None,
+) -> FastMCP:
+    """Build the gateway with bearer auth always attached.
 
-    # Tool calls are audited once, in UgaAllowlistMiddleware.on_call_tool.
-    @server.tool(name="search", annotations=_READ_ONLY, timeout=_tool_timeout_seconds())
-    def search(query: str) -> dict[str, Any]:
-        """Search approved Datacore records by keyword."""
-        return {"results": _get_store().search_records(query, limit=_search_limit())}
+    ``store``, ``token`` and ``audit`` default to ``UGA_DATACORE_JSONL``,
+    ``MCP_AUTH_TOKEN`` and ``UGA_AUDIT_LOG``; a missing store or token raises.
+    """
+    verifier = _BearerTokenVerifier(
+        _require_token(token if token is not None else os.environ.get("MCP_AUTH_TOKEN"))
+    )
+    if store is None:
+        store = _store_from_env()
+    if audit is None:
+        audit = _audit_from_env()
+    server = FastMCP(name=name, version=__version__, auth=verifier, mask_error_details=True)
 
-    @server.tool(name="fetch", annotations=_READ_ONLY, timeout=_tool_timeout_seconds())
-    def fetch(id: str) -> dict[str, Any]:
-        """Fetch a single approved Datacore record by id."""
+    def run_search(query: str) -> dict[str, Any]:
+        started = time.monotonic()
+        request_id = _current_request_id.get()
         try:
-            return _get_store().fetch_record(id)
-        except DatacoreRecordNotFound:
-            raise RecordNotFoundError(f"Record not found: {id}") from None
+            results = store.search_records(query, limit=_search_limit())
+        except Exception as exc:
+            audit.record(
+                tool="search",
+                query=query,
+                success=False,
+                detail=type(exc).__name__,
+                request_id=request_id,
+                elapsed_ms=_elapsed_ms(started),
+            )
+            raise
+        audit.record(
+            tool="search",
+            query=query,
+            result_count=len(results),
+            success=True,
+            request_id=request_id,
+            elapsed_ms=_elapsed_ms(started),
+        )
+        return {"results": results}
 
-    server.add_middleware(UgaAllowlistMiddleware(_get_audit()))
+    def run_fetch(record_id: str) -> dict[str, Any]:
+        started = time.monotonic()
+        request_id = _current_request_id.get()
+        try:
+            payload = store.fetch_record(record_id)
+        except DatacoreRecordNotFound:
+            audit.record(
+                tool="fetch",
+                record_id=record_id,
+                success=False,
+                detail="not_found",
+                request_id=request_id,
+                elapsed_ms=_elapsed_ms(started),
+            )
+            raise ToolError(f"Record not found: {record_id}") from None
+        except Exception as exc:
+            audit.record(
+                tool="fetch",
+                record_id=record_id,
+                success=False,
+                detail=type(exc).__name__,
+                request_id=request_id,
+                elapsed_ms=_elapsed_ms(started),
+            )
+            raise
+        audit.record(
+            tool="fetch",
+            record_id=record_id,
+            success=True,
+            request_id=request_id,
+            elapsed_ms=_elapsed_ms(started),
+        )
+        return payload
+
+    # The tools are async and hand the work to a thread with abandon_on_cancel so
+    # the middleware's fail_after can cancel them. A sync tool runs in a thread
+    # anyio will not abandon, so its timeout would never fire.
+    @server.tool(name="search", annotations=_READ_ONLY)
+    async def search(query: str) -> dict[str, Any]:
+        """Search approved Datacore records by keyword."""
+        return await anyio.to_thread.run_sync(partial(run_search, query), abandon_on_cancel=True)
+
+    @server.tool(name="fetch", annotations=_READ_ONLY)
+    async def fetch(id: str) -> dict[str, Any]:
+        """Fetch a single approved Datacore record by id."""
+        return await anyio.to_thread.run_sync(partial(run_fetch, id), abandon_on_cancel=True)
+
+    server.add_middleware(UgaAllowlistMiddleware(audit))
 
     @server.custom_route("/", methods=["GET"])
     async def root_status(_request: Request) -> JSONResponse:
@@ -364,6 +464,28 @@ def advertised_tool_names(server: FastMCP) -> set[str]:
     return anyio.run(_names)
 
 
+def _datacore_path(cfg: dict[str, Any], *, config_path: Path) -> Path:
+    """Resolve the JSONL export: ``UGA_DATACORE_JSONL`` wins over ``datacore_jsonl``.
+
+    A relative ``datacore_jsonl`` is resolved against the config file's directory.
+    """
+    env_path = os.environ.get("UGA_DATACORE_JSONL")
+    if env_path:
+        path = Path(env_path).expanduser()
+    else:
+        configured = cfg.get("datacore_jsonl")
+        if not configured:
+            raise ValueError(
+                "No datacore export configured: set UGA_DATACORE_JSONL or datacore_jsonl."
+            )
+        path = Path(configured).expanduser()
+        if not path.is_absolute():
+            path = config_path.resolve().parent / path
+    if not path.is_file():
+        raise ValueError(f"datacore JSONL export not found: {path}")
+    return path
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Nexus Unidirectional Gateway Appliance")
     ap.add_argument("--config", required=True)
@@ -372,9 +494,10 @@ def main() -> None:
     with open(args.config, encoding="utf-8") as fh:
         cfg = yaml.safe_load(fh) or {}
 
-    token = os.environ.get("MCP_AUTH_TOKEN")
-    if not token:
-        raise SystemExit("MCP_AUTH_TOKEN must be set for the UGA gateway (fail closed).")
+    try:
+        token = _require_token(os.environ.get("MCP_AUTH_TOKEN"))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
 
     serve = cfg.get("serve") or {}
     host = serve.get("host", "127.0.0.1")
@@ -386,23 +509,35 @@ def main() -> None:
     if audit_path:
         os.environ.setdefault("UGA_AUDIT_LOG", audit_path)
 
-    jsonl_path = cfg.get("datacore_jsonl")
-    if jsonl_path:
-        resolved = Path(jsonl_path)
-        if not resolved.is_absolute():
-            resolved = repo_root() / resolved
-        os.environ.setdefault("UGA_DATACORE_JSONL", str(resolved))
+    # Load and validate the export now so a bad or missing file stops startup
+    # instead of failing every request.
+    try:
+        store = DatacoreStore.from_jsonl(_datacore_path(cfg, config_path=Path(args.config)))
+        audit = _audit_from_env()
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"UGA gateway startup failed: {exc}") from None
 
-    server = create_uga_server(name=cfg.get("name", "Nexus UGA"))
+    server = create_uga_server(
+        name=cfg.get("name", "Nexus UGA"), store=store, token=token, audit=audit
+    )
     advertised = advertised_tool_names(server)
     if advertised != UGA_ALLOWED_TOOLS:
         raise SystemExit(
             f"UGA tool surface mismatch: expected {set(UGA_ALLOWED_TOOLS)!r}, got {advertised!r}"
         )
 
-    server.auth = StaticTokenVerifier({token: {"client_id": "nexus-uga"}})
-    print(f"[uga] serving search/fetch on {host}:{port}", file=sys.stderr, flush=True)
-    server.run(transport="http", host=host, port=port, show_banner=False)
+    print(
+        f"[uga] serving search/fetch over {len(store)} records on {host}:{port}",
+        file=sys.stderr,
+        flush=True,
+    )
+    server.run(
+        transport="http",
+        host=host,
+        port=port,
+        show_banner=False,
+        middleware=http_middleware(audit),
+    )
 
 
 if __name__ == "__main__":
