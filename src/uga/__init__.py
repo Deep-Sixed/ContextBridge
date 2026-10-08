@@ -9,6 +9,9 @@ from .adapter import (
 )
 from .policy import UGA_ALLOWED_TOOLS, UGA_FORBIDDEN_TOOL_EXAMPLES
 
+# Single source of truth: pyproject.toml reads this, and the MCP server reports it.
+__version__ = "0.1.0"
+
 __all__ = [
     "DatacoreFetchRecord",
     "DatacoreRecordError",
@@ -16,5 +19,6 @@ __all__ = [
     "DatacoreStore",
     "UGA_ALLOWED_TOOLS",
     "UGA_FORBIDDEN_TOOL_EXAMPLES",
+    "__version__",
     "default_jsonl_path",
 ]

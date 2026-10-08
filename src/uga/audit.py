@@ -22,15 +22,32 @@ def _query_hash(query: str) -> str:
 
 
 class UgaAuditLog:
-    """Append-only JSONL audit sink. Failures to write never block tool execution."""
+    """Append-only JSONL audit sink. Failures to write never block tool execution.
 
-    def __init__(self, path: str | Path | None, *, route: str = "uga") -> None:
+    Queries are recorded as a SHA-256 prefix only. A plain-text preview is written
+    only when ``include_query_preview`` is set, because query text can carry
+    sensitive content into stderr and the audit file.
+    """
+
+    def __init__(
+        self,
+        path: str | Path | None,
+        *,
+        route: str = "uga",
+        include_query_preview: bool = False,
+    ) -> None:
         self.route = route
+        self.include_query_preview = include_query_preview
         self._fh = None
         if path:
             p = Path(path)
             p.parent.mkdir(parents=True, exist_ok=True)
             self._fh = p.open("a", buffering=1, encoding="utf-8")
+
+    def close(self) -> None:
+        if self._fh:
+            self._fh.close()
+            self._fh = None
 
     def record(
         self,
@@ -58,7 +75,8 @@ class UgaAuditLog:
         if elapsed_ms is not None:
             entry["elapsed_ms"] = elapsed_ms
         if query is not None:
-            entry["query_preview"] = _query_preview(query)
+            if self.include_query_preview:
+                entry["query_preview"] = _query_preview(query)
             entry["query_hash"] = _query_hash(query)
         if record_id is not None:
             entry["record_id"] = record_id

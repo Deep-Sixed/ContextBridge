@@ -27,6 +27,7 @@ from mcp.types import ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from . import __version__
 from .adapter import DatacoreRecordNotFound, DatacoreStore, repo_root
 from .audit import UgaAuditLog
 from .policy import UGA_ALLOWED_TOOLS, is_tool_allowed
@@ -76,11 +77,77 @@ def _elapsed_ms(started: float) -> int:
     return max(0, round((time.monotonic() - started) * 1000))
 
 
+_CLIENT_LABEL_MAX_LEN = 64
+
+
+class RecordNotFoundError(ToolError):
+    """Raised by ``fetch`` for an unknown id; audited as ``not_found``."""
+
+
+def _request_context(context: MiddlewareContext[Any]) -> Any:
+    fastmcp_context = context.fastmcp_context
+    if fastmcp_context is None:
+        return None
+    try:
+        return fastmcp_context.request_context
+    except Exception:
+        return None
+
+
 def _request_id(context: MiddlewareContext[Any]) -> str:
-    message_id = getattr(context.message, "id", None)
+    """Return the JSON-RPC request id so audit lines match the client's request."""
+    request_context = _request_context(context)
+    message_id = getattr(request_context, "request_id", None)
+    if message_id is None:
+        message_id = getattr(context.message, "id", None)
     if message_id is not None:
         return f"mcp-{message_id}"
     return uuid.uuid4().hex[:12]
+
+
+def _client_label(context: MiddlewareContext[Any]) -> str | None:
+    """Return the client's self-reported ``clientInfo`` as ``name/version``.
+
+    The value is client-supplied and unauthenticated; it labels audit lines only.
+    """
+    params = getattr(context.message, "params", None)
+    info = getattr(params, "clientInfo", None)
+    if info is None:
+        session = getattr(_request_context(context), "session", None)
+        info = getattr(getattr(session, "client_params", None), "clientInfo", None)
+    name = str(getattr(info, "name", None) or "").strip()
+    if not name:
+        return None
+    version = str(getattr(info, "version", None) or "").strip()
+    label = f"{name}/{version}" if version else name
+    return label[:_CLIENT_LABEL_MAX_LEN]
+
+
+def _call_fields(name: str, arguments: Any) -> dict[str, str]:
+    """Pick the audited argument for an allowed tool; other arguments are never logged."""
+    if not isinstance(arguments, dict):
+        return {}
+    if name == "search" and isinstance(arguments.get("query"), str):
+        return {"query": arguments["query"]}
+    if name == "fetch" and isinstance(arguments.get("id"), str):
+        return {"record_id": arguments["id"]}
+    return {}
+
+
+def _result_count(result: Any) -> int | None:
+    structured = getattr(result, "structured_content", None)
+    if isinstance(structured, dict) and isinstance(structured.get("results"), list):
+        return len(structured["results"])
+    return None
+
+
+def _failure_detail(exc: BaseException) -> str:
+    if isinstance(exc, RecordNotFoundError):
+        return "not_found"
+    # FastMCP wraps unexpected tool exceptions in ToolError; audit the original type.
+    if isinstance(exc, ToolError) and exc.__cause__ is not None:
+        return type(exc.__cause__).__name__
+    return type(exc).__name__
 
 
 def _get_store() -> DatacoreStore:
@@ -94,12 +161,16 @@ def _get_store() -> DatacoreStore:
 def _get_audit() -> UgaAuditLog:
     global _audit
     if _audit is None:
-        _audit = UgaAuditLog(os.environ.get("UGA_AUDIT_LOG"), route="uga")
+        _audit = UgaAuditLog(
+            os.environ.get("UGA_AUDIT_LOG"),
+            route="uga",
+            include_query_preview=os.environ.get("UGA_AUDIT_QUERY_PREVIEW") == "1",
+        )
     return _audit
 
 
 class UgaAllowlistMiddleware(Middleware):
-    """Hide non-allowed tools and reject forbidden calls before execution."""
+    """Hide non-allowed tools, reject forbidden calls, and audit each request once."""
 
     def __init__(self, audit: UgaAuditLog) -> None:
         self._audit = audit
@@ -107,6 +178,7 @@ class UgaAllowlistMiddleware(Middleware):
     async def on_initialize(self, context: MiddlewareContext[Any], call_next: Any) -> Any:
         started = time.monotonic()
         request_id = _request_id(context)
+        client = _client_label(context)
         try:
             with anyio.fail_after(_metadata_timeout_seconds()):
                 result = await call_next(context)
@@ -116,6 +188,7 @@ class UgaAllowlistMiddleware(Middleware):
                 tool="initialize",
                 success=False,
                 detail="timeout",
+                client_label=client,
                 request_id=request_id,
                 elapsed_ms=elapsed,
             )
@@ -126,6 +199,7 @@ class UgaAllowlistMiddleware(Middleware):
                 tool="initialize",
                 success=False,
                 detail=type(exc).__name__,
+                client_label=client,
                 request_id=request_id,
                 elapsed_ms=elapsed,
             )
@@ -134,6 +208,7 @@ class UgaAllowlistMiddleware(Middleware):
         self._audit.record(
             tool="initialize",
             success=True,
+            client_label=client,
             request_id=request_id,
             elapsed_ms=elapsed,
         )
@@ -142,6 +217,7 @@ class UgaAllowlistMiddleware(Middleware):
     async def on_list_tools(self, context: MiddlewareContext[Any], call_next: Any) -> Sequence[Tool]:
         started = time.monotonic()
         request_id = _request_id(context)
+        client = _client_label(context)
         try:
             with anyio.fail_after(_metadata_timeout_seconds()):
                 tools = await call_next(context)
@@ -151,6 +227,7 @@ class UgaAllowlistMiddleware(Middleware):
                 tool="tools/list",
                 success=False,
                 detail="timeout",
+                client_label=client,
                 request_id=request_id,
                 elapsed_ms=elapsed,
             )
@@ -161,6 +238,7 @@ class UgaAllowlistMiddleware(Middleware):
                 tool="tools/list",
                 success=False,
                 detail=type(exc).__name__,
+                client_label=client,
                 request_id=request_id,
                 elapsed_ms=elapsed,
             )
@@ -171,6 +249,7 @@ class UgaAllowlistMiddleware(Middleware):
             tool="tools/list",
             success=True,
             result_count=len(filtered),
+            client_label=client,
             request_id=request_id,
             elapsed_ms=elapsed,
         )
@@ -179,6 +258,7 @@ class UgaAllowlistMiddleware(Middleware):
     async def on_call_tool(self, context: MiddlewareContext[Any], call_next: Any) -> Any:
         started = time.monotonic()
         request_id = _request_id(context)
+        client = _client_label(context)
         raw_name = getattr(context.message, "name", None)
         name = str(raw_name) if raw_name else "<unknown>"
         if not is_tool_allowed(name):
@@ -186,10 +266,12 @@ class UgaAllowlistMiddleware(Middleware):
                 tool=name,
                 success=False,
                 detail="policy_denied",
+                client_label=client,
                 request_id=request_id,
                 elapsed_ms=_elapsed_ms(started),
             )
             raise ToolError(f"Tool '{name}' is not permitted on the UGA route.")
+        fields = _call_fields(name, getattr(context.message, "arguments", None))
         try:
             with anyio.fail_after(_tool_timeout_seconds()):
                 result = await call_next(context)
@@ -199,8 +281,10 @@ class UgaAllowlistMiddleware(Middleware):
                 tool=name,
                 success=False,
                 detail="timeout",
+                client_label=client,
                 request_id=request_id,
                 elapsed_ms=elapsed,
+                **fields,
             )
             raise ToolError(f"Tool '{name}' timed out on the Nexus Datacore route.") from None
         except Exception as exc:
@@ -208,86 +292,52 @@ class UgaAllowlistMiddleware(Middleware):
             self._audit.record(
                 tool=name,
                 success=False,
-                detail=type(exc).__name__,
+                detail=_failure_detail(exc),
+                client_label=client,
                 request_id=request_id,
                 elapsed_ms=elapsed,
+                **fields,
             )
             raise
         elapsed = _elapsed_ms(started)
         self._audit.record(
             tool=name,
             success=True,
+            result_count=_result_count(result),
+            client_label=client,
             request_id=request_id,
             elapsed_ms=elapsed,
+            **fields,
         )
         return result
 
 
-_READ_ONLY = ToolAnnotations(readOnlyHint=True)
+# search and fetch only read a fixed local snapshot: no side effects, same input
+# gives the same output, and nothing outside the approved JSONL is reached.
+_READ_ONLY = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
 
 
 def create_uga_server(*, name: str = "Nexus UGA") -> FastMCP:
-    server = FastMCP(name=name)
+    server = FastMCP(name=name, version=__version__)
 
+    # Tool calls are audited once, in UgaAllowlistMiddleware.on_call_tool.
     @server.tool(name="search", annotations=_READ_ONLY, timeout=_tool_timeout_seconds())
     def search(query: str) -> dict[str, Any]:
         """Search approved Datacore records by keyword."""
-        store = _get_store()
-        audit = _get_audit()
-        started = time.monotonic()
-        try:
-            results = store.search_records(query, limit=_search_limit())
-            audit.record(
-                tool="search",
-                query=query,
-                result_count=len(results),
-                success=True,
-                elapsed_ms=_elapsed_ms(started),
-            )
-            return {"results": results}
-        except Exception as exc:
-            audit.record(
-                tool="search",
-                query=query,
-                success=False,
-                detail=type(exc).__name__,
-                elapsed_ms=_elapsed_ms(started),
-            )
-            raise
+        return {"results": _get_store().search_records(query, limit=_search_limit())}
 
     @server.tool(name="fetch", annotations=_READ_ONLY, timeout=_tool_timeout_seconds())
     def fetch(id: str) -> dict[str, Any]:
         """Fetch a single approved Datacore record by id."""
-        store = _get_store()
-        audit = _get_audit()
-        started = time.monotonic()
         try:
-            payload = store.fetch_record(id)
-            audit.record(
-                tool="fetch",
-                record_id=id,
-                success=True,
-                elapsed_ms=_elapsed_ms(started),
-            )
-            return payload
+            return _get_store().fetch_record(id)
         except DatacoreRecordNotFound:
-            audit.record(
-                tool="fetch",
-                record_id=id,
-                success=False,
-                detail="not_found",
-                elapsed_ms=_elapsed_ms(started),
-            )
-            raise ToolError(f"Record not found: {id}") from None
-        except Exception as exc:
-            audit.record(
-                tool="fetch",
-                record_id=id,
-                success=False,
-                detail=type(exc).__name__,
-                elapsed_ms=_elapsed_ms(started),
-            )
-            raise
+            raise RecordNotFoundError(f"Record not found: {id}") from None
 
     server.add_middleware(UgaAllowlistMiddleware(_get_audit()))
 
