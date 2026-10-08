@@ -12,6 +12,7 @@ dependencies = ["fastmcp>=3,<4", "mcp>=1.24,<2", "anyio>=4.1", "pyyaml", "starle
 
 [project.optional-dependencies]
 test = ["pytest"]
+docs = ["reportlab>=4.0"]
 
 [tool.setuptools.dynamic]
 version = { attr = "uga.__version__" }
