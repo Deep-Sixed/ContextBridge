@@ -66,6 +66,7 @@ from .dispatch import (
     PROCESS_LIST_TOOL,
     READ_TOOLS,
     DESKTOP_TOOLS,
+    MEDIA_TOOLS,
     WRITE_TOOLS,
     Engine,
     InvalidArguments,
@@ -88,12 +89,14 @@ SCOPE_WRITE = "computer:write"
 SCOPE_EXECUTE = "computer:execute"
 SCOPE_PROCESS = "computer:process"
 SCOPE_DESKTOP_OBSERVE = "desktop:observe"
-ALL_SCOPES = (SCOPE_READ, SCOPE_WRITE, SCOPE_EXECUTE, SCOPE_PROCESS, SCOPE_DESKTOP_OBSERVE)
+SCOPE_MEDIA_DISCOVER = "media:discover"
+ALL_SCOPES = (SCOPE_READ, SCOPE_WRITE, SCOPE_EXECUTE, SCOPE_PROCESS, SCOPE_DESKTOP_OBSERVE, SCOPE_MEDIA_DISCOVER)
 
 TOOL_SCOPES: dict[str, str] = {
     **{name: SCOPE_READ for name in READ_TOOLS},
     PROCESS_LIST_TOOL: SCOPE_READ,
     **{name: SCOPE_DESKTOP_OBSERVE for name in DESKTOP_TOOLS},
+    **{name: SCOPE_MEDIA_DISCOVER for name in MEDIA_TOOLS},
     LIST_DEVICES_TOOL: SCOPE_READ,
     **{name: SCOPE_WRITE for name in WRITE_TOOLS},
     **{name: SCOPE_EXECUTE for name in COMMAND_TOOLS},
@@ -462,6 +465,11 @@ def create_computer_server(
     async def list_windows(device: str = LOCAL_DEVICE) -> dict[str, Any]:
         """List visible top-level window titles and IDs, only with desktop:observe host and client permissions."""
         return await run(device, "list_windows", {})
+
+    @server.tool(annotations=_READ_ONLY)
+    async def media_inventory(device: str = LOCAL_DEVICE) -> dict[str, Any]:
+        """Inspect media-device availability hints only with media:discover permission; no recording."""
+        return await run(device, "media_inventory", {})
 
     # ----------------------------------------------------------- write tools
 

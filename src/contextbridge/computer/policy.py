@@ -138,6 +138,7 @@ class ComputerPolicy:
     list_processes: bool = True
     allow_kill: bool = False
     desktop_observe: bool = False
+    media_discover: bool = False
     windows: bool = IS_WINDOWS
 
     # ------------------------------------------------------------------ paths
@@ -280,6 +281,7 @@ class ComputerPolicy:
             "list_processes": self.list_processes,
             "allow_kill": self.allow_kill,
             "desktop_observe": self.desktop_observe,
+            "media_discover": self.media_discover,
         }
 
 
@@ -323,7 +325,8 @@ def load_policy(
     cmds = cfg.get("commands") or {}
     procs = cfg.get("processes") or {}
     desktop_cfg = cfg.get("desktop") or {}
-    if not all(isinstance(s, dict) for s in (fs, cmds, procs, desktop_cfg)):
+    media_cfg = cfg.get("media") or {}
+    if not all(isinstance(s, dict) for s in (fs, cmds, procs, desktop_cfg, media_cfg)):
         raise PolicyError("filesystem, commands, and processes must be mappings")
 
     roots: list[Path] = []
@@ -387,6 +390,7 @@ def load_policy(
         list_processes=bool(procs.get("list", True)),
         allow_kill=bool(procs.get("allow_kill", False)),
         desktop_observe=desktop_cfg.get("observe", False) is True,
+        media_discover=media_cfg.get("discover", False) is True,
         windows=windows,
     )
     return policy
