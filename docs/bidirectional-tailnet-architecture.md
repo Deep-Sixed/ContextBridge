@@ -107,9 +107,16 @@ without an authenticated trusted proxy.
 
 ## Boundaries
 
-ContextBridge handles machines and connection lifecycles, not LLM model
-selection or AI task orchestration. InferenceDeck remains inference gateway;
-Cerberus remains router; Ensemble/OpenCode remain coding-context/client layers.
+ContextBridge is a standalone computer-control product and service. It owns its
+MCP gateway, agent runtimes, enrollment, configuration, policy, audit logging,
+release process, and system services. Its build, startup, tests, and operation
+must have **no dependency on any external AI router, inference gateway, coding
+harness, or knowledge system**. The agent protocol and API are usable by any
+authorized MCP client; clients are integrations, not runtime dependencies.
+
+Existing read-only Datacore behavior remains an optional, isolated capability.
+Core file, process, terminal, network, and desktop-control operations must not
+require Datacore or any knowledge export to be present.
 
 **Never merge the broad remote-agent PR solely on a green unit-test run.**
 Review and merge in independently testable security and transport stages.
