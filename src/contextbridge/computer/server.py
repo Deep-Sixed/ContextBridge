@@ -623,11 +623,16 @@ class AgentListenerConfig:
         self.tls_key = _path(base, cfg.get("tls_key"))
         self.registry = _path(base, cfg.get("registry"))
         ids = cfg.get("tailnet_node_ids")
-        if not isinstance(ids, list) or not ids or any(
-            not isinstance(item, str) or not item.strip() for item in ids
-        ):
-            raise SystemExit(f"{where}: agents.tailnet_node_ids must contain enrolled Tailscale node IDs.")
-        self.tailnet_node_ids = frozenset(ids)
+        # A loopback listener is usable for a local agent and offline tests.
+        # A non-loopback listener must enforce tailnet peer admission.
+        if is_loopback(self.host):
+            self.tailnet_node_ids = None
+        else:
+            if not isinstance(ids, list) or not ids or any(
+                not isinstance(item, str) or not item.strip() for item in ids
+            ):
+                raise SystemExit(f"{where}: agents.tailnet_node_ids must contain enrolled Tailscale node IDs.")
+            self.tailnet_node_ids = frozenset(ids)
         try:
             self.heartbeat_seconds = float(cfg.get("heartbeat_seconds", 15))
             self.call_timeout_seconds = float(cfg.get("call_timeout_seconds", 660))

@@ -525,4 +525,4 @@ def test_agent_listener_requires_a_registry_and_numeric_timing(gateway_config):
 
 def test_agent_listener_requires_tailnet_enrollment(gateway_config):
     with pytest.raises(SystemExit, match="tailnet_node_ids"):
-        gateway_config(tailnet_node_ids=[])
+        gateway_config(host="100.91.238.124", tls_cert="c", tls_key="k", tailnet_node_ids=[])
