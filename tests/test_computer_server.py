@@ -92,13 +92,13 @@ def test_full_policy_surface(make_policy, audit):
     policy = make_policy(processes={"allow_kill": True})
     expected = READ_TOOLS | WRITE_TOOLS | COMMAND_TOOLS | {"list_processes", "kill_process"}
     assert computer_tool_names(policy) == expected
-    assert set(TOOL_SCOPES) == expected | {"list_devices"} == SERVER_TOOLS
+    assert set(TOOL_SCOPES) == expected | {"list_devices", "list_windows"} == SERVER_TOOLS
     server = create_computer_server(policy, audit=audit, authorize=allow_scopes(*ALL_SCOPES))
 
     async def listed(client):
         return {t.name for t in await client.list_tools()}
 
-    assert run(server, listed) == SERVER_TOOLS
+    assert run(server, listed) == expected | {"list_devices"}
 
 
 def test_tool_annotations(policy, audit):
@@ -305,3 +305,26 @@ def test_scope_config_defaults_and_validation():
     for bad in ([], ["computer:root"], "computer:read"):
         with pytest.raises(PolicyError):
             load_scopes({"auth": {"scopes": bad}})
+
+
+def test_desktop_observe_requires_host_opt_in_and_explicit_client_scope(workspace, audit, monkeypatch):
+    from contextbridge.computer import desktop
+    monkeypatch.setattr(desktop, "_linux_windows", lambda: [{"id": "0x1", "title": "Editor"}])
+    monkeypatch.setattr(desktop.os, "name", "posix")
+    policy = load_policy({"filesystem": {"roots": [str(workspace)]}, "desktop": {"observe": True}})
+    assert "list_windows" in computer_tool_names(policy)
+
+    async def list_and_call(client):
+        names = {tool.name for tool in await client.list_tools()}
+        result = await client.call_tool("list_windows", {})
+        return names, result.data
+
+    limited = create_computer_server(policy, audit=audit, authorize=allow_scopes(SCOPE_READ))
+    async def listed(client):
+        return {t.name for t in await client.list_tools()}
+    assert "list_windows" not in run(limited, listed)
+
+    granted = create_computer_server(policy, audit=audit, authorize=allow_scopes(*ALL_SCOPES))
+    names, result = run(granted, list_and_call)
+    assert "list_windows" in names
+    assert result["count"] == 1
