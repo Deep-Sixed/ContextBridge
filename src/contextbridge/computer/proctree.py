@@ -156,10 +156,13 @@ class ProcessTree:
             children = psutil.Process(self.proc.pid).children(recursive=True)
         except psutil.Error:
             children = []
-        if not IS_WINDOWS and self.proc.poll() is None:
+        if not IS_WINDOWS:
+            # The session leader can exit before its background children do.
+            # Its process group remains live until every member exits, so
+            # kill the group even if the leader has already terminated.
             try:
                 os.killpg(self.proc.pid, signal.SIGKILL)
-            except OSError:
+            except ProcessLookupError:
                 pass
         for child in children:
             try:
