@@ -187,6 +187,15 @@ Do not forward ports 8790, 8791, or 8792 to the internet.
 5. Authenticated remote MCP endpoint for ChatGPT and Claude (OAuth front end, per-device permissions)
 6. Failover acceptance test with Desktop Commander fully stopped
 
+## Documentation
+
+`docs/desktop-commander-inventory.pdf` lists the Desktop Commander functionality ContextBridge targets, with an implementation checklist. To rebuild it after editing `scripts/build-inventory-pdf.py` (requires the DejaVu fonts):
+
+```sh
+python3 -m pip install -e '.[docs]'
+./scripts/build-inventory-pdf.py
+```
+
 ## Status
 
 The knowledge route is a standalone extraction from an archived UGA implementation. Authentication-front/sidecar deployments and systemd services were intentionally left out. Neither route is production-validated yet.

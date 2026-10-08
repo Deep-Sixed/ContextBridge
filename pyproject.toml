@@ -21,6 +21,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
+docs = ["reportlab>=4.0"]
 
 [project.scripts]
 contextbridge-computer = "contextbridge.computer.server:main"
