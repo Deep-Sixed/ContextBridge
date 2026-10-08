@@ -1,0 +1,40 @@
+# ContextBridge computer route — policy for this machine.
+# Everything not granted here is denied. The tool surface shrinks to match:
+# no writable_roots => no write tools; commands.mode disabled => no command tools.
+name: ContextBridge Computer
+
+serve:
+  transport: http          # http (needs CONTEXTBRIDGE_COMPUTER_TOKEN) or stdio (local clients)
+  host: 127.0.0.1          # non-loopback binds are refused unless allow_non_loopback: true
+  port: 8791
+  audit_log: ../audit/computer.audit.jsonl   # relative to this file; always write-protected
+
+filesystem:
+  roots:                   # readable; relative paths resolve against the first entry
+    - "~"
+  writable_roots: []       # start read-only; add e.g. ~/ContextBridge to enable write tools
+  # deny: path-component globs hidden from every file tool. Omit to use the built-in list
+  # (.ssh, .gnupg, .aws, .kube, .docker, .env*, *.pem, *.key, *.kdbx, id_rsa*, ...).
+  max_read_bytes: 1048576
+  max_write_bytes: 1048576
+  max_results: 500
+  max_search_seconds: 10
+
+commands:
+  mode: allowlist          # disabled | allowlist | unrestricted
+  # Allowlist mode runs one program per call without a shell. It limits WHICH programs
+  # run, not what they touch: commands run with this OS user's full permissions and are
+  # not subject to the filesystem deny list. Adding a shell or interpreter (bash, python3,
+  # powershell) makes allowlist mode equivalent to unrestricted.
+  allow: [git, ls, df, du, ps, uptime, whoami, hostname, uname, date, pwd]
+  default_timeout_seconds: 30
+  max_timeout_seconds: 600
+  max_output_bytes: 65536
+  max_sessions: 4
+  max_session_seconds: 3600
+  # env_strip: variables matching these globs are removed from child processes.
+  # Omit for the built-in list (*TOKEN*, *SECRET*, *PASSWORD*, *API_KEY*, ...).
+
+processes:
+  list: true
+  allow_kill: false
