@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "contextbridge"
+version = "0.1.0"
+description = "Read-only authenticated MCP gateway for approved project context"
+requires-python = ">=3.11"
+dependencies = ["fastmcp", "mcp", "anyio", "pyyaml", "starlette"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
