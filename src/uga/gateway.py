@@ -33,6 +33,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from . import __version__
 from .adapter import DatacoreRecordNotFound, DatacoreStore
 from .audit import UgaAuditLog
 from .policy import UGA_ALLOWED_TOOLS, is_tool_allowed
@@ -335,7 +336,14 @@ class UgaAllowlistMiddleware(Middleware):
         return result
 
 
-_READ_ONLY = ToolAnnotations(readOnlyHint=True)
+# search and fetch only read a fixed local snapshot: no side effects, same input
+# gives the same output, and nothing outside the approved JSONL is reached.
+_READ_ONLY = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
 
 
 def create_uga_server(
@@ -357,7 +365,7 @@ def create_uga_server(
         store = _store_from_env()
     if audit is None:
         audit = _audit_from_env()
-    server = FastMCP(name=name, auth=verifier, mask_error_details=True)
+    server = FastMCP(name=name, version=__version__, auth=verifier, mask_error_details=True)
 
     def run_search(query: str) -> dict[str, Any]:
         started = time.monotonic()

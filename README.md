@@ -22,6 +22,8 @@ python3 -m pytest        # includes acceptance tests that launch the gateways an
 
 ContextBridge requires FastMCP 3.x (`fastmcp>=3,<4`). It has no runtime dependency on Desktop Commander, Node, or npx, and the acceptance tests run both gateways in an environment without them.
 
+`tests/test_contract.py` pins the knowledge route's MCP contract: the exact tool set, annotations, input schemas, reported version, and policy denial. `tests/test_entrypoint.py` starts the real `python -m uga.gateway` entrypoint and checks bearer auth over HTTP. CI runs the whole suite on Ubuntu and Windows, with Python 3.11 against the oldest supported FastMCP (3.0.0) and Python 3.13 against the newest 3.x release.
+
 ## Knowledge route
 
 **Security model:** exactly two operations (`search` and `fetch`), default-deny tool middleware, read-only annotations, audit logging, and a static bearer token (at least 32 characters) required at startup. Error details are masked from clients, and only allowlisted record fields are served. It binds only to the loopback interface by default.
@@ -39,6 +41,15 @@ The data export is required: set `UGA_DATACORE_JSONL`, or `datacore_jsonl` in th
 ### Data format
 
 Each JSONL line is one approved record with `id` (a non-empty string or integer), `title`, `text`, and `url`, plus an optional `metadata` object. Of the other top-level keys, only the approved fields listed in `_OPTIONAL_TOP_LEVEL_FIELDS` in `src/uga/adapter.py` are kept; any other key is dropped at load time and is never served or searched. Search matches field values, not JSON key names.
+
+### Tools
+
+| Tool | Input | Annotations |
+| --- | --- | --- |
+| `search` | `query` | `readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`, `openWorldHint=false` |
+| `fetch` | `id` | same as `search` |
+
+Both tools only read the loaded JSONL snapshot. The server reports the package version in `serverInfo`.
 
 ### Audit log
 
@@ -293,7 +304,7 @@ contextbridge-admin --config configs/computer.yaml oauth-unlock               # 
 ## Network exposure
 
 Neither route depends on Authentik.
-- **Knowledge route:** binds to loopback by default.
+- **Knowledge route:** binds to loopback by default. It has no OAuth front end; the remote endpoint serves only the computer route.
 - **Computer MCP endpoints:** refuse any non-loopback address; there is no override.
   - **Local listener (8791):** accepts only the static token.
   - **Remote listener (8793):** accepts only OAuth tokens. It is meant to be published only through a TLS tunnel.

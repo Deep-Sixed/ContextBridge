@@ -484,7 +484,7 @@ def test_tunnel_host_passes_the_guard_and_strangers_do_not(policy, tmp_path, sto
     server = create_remote_server(
         build_router(policy, audit=audit), audit=audit, settings=remote_cfg.settings(), store=store
     )
-    app = server.http_app(**{k: v for k, v in options.items() if k not in ("host", "port")})
+    app = server.http_app(middleware=options["middleware"])
 
     async def scenario():
         transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 50000))
@@ -502,6 +502,36 @@ def test_tunnel_host_passes_the_guard_and_strangers_do_not(policy, tmp_path, sto
     assert consent.status_code == 400  # reached the consent handler (unknown request), not the guard
     assert rebinding.status_code == 421
     assert foreign.status_code == 403
+
+
+@pytest.mark.parametrize(
+    ("headers", "status"),
+    [
+        ({"host": "127.0.0.1:8791"}, 200),
+        ({"host": "[::1]:8791"}, 200),
+        ({"host": "localhost:8791", "origin": "http://localhost:6274"}, 200),  # a local browser tool
+        ({"host": "friday.example.ts.net"}, 200),
+        ({"host": "FRIDAY.example.ts.net:443", "origin": "https://friday.example.ts.net"}, 200),
+        ({"host": "evil.example"}, 421),
+        ({"host": "127.0.0.1.evil.example"}, 421),
+        ({"host": "127.0.0.1:8791", "origin": "https://evil.example"}, 403),
+        ({"host": "127.0.0.1:8791", "origin": "null"}, 403),
+    ],
+)
+def test_host_origin_guard(headers, status):
+    from contextbridge.net import HostOriginGuard
+
+    async def ok(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    app = HostOriginGuard(ok, hosts=["friday.example.ts.net"], origins=["https://friday.example.ts.net"])
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1") as http:
+            return (await http.get("/", headers=headers)).status_code
+
+    assert anyio.run(scenario) == status
 
 
 # ------------------------------------------------------------- startup

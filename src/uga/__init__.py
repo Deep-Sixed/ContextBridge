@@ -1,5 +1,9 @@
 """Unidirectional Gateway Appliance (UGA) — read-only Datacore MCP route."""
 
+# One version for the whole distribution: pyproject.toml reads contextbridge.__version__,
+# and both MCP servers report it.
+from contextbridge import __version__
+
 from .adapter import (
     DatacoreFetchRecord,
     DatacoreRecordError,
@@ -15,4 +19,5 @@ __all__ = [
     "DatacoreStore",
     "UGA_ALLOWED_TOOLS",
     "UGA_FORBIDDEN_TOOL_EXAMPLES",
+    "__version__",
 ]

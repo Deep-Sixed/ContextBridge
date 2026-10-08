@@ -44,8 +44,10 @@ from fastmcp.server.auth import StaticTokenVerifier
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.tools.tool import Tool
 from mcp.types import ToolAnnotations
+from starlette.middleware import Middleware as ASGIMiddleware
 
-from ..net import is_loopback, is_private_bind
+from .. import __version__
+from ..net import HostOriginGuard, is_loopback, is_private_bind
 from .audit import (
     MAX_AUDIT_VALUE,
     AuditError,
@@ -390,7 +392,7 @@ def create_computer_server(
     if router is None:
         router = build_router(policy, audit=audit, hub=hub)
     policy = router.local.policy if router.local is not None else None
-    server = FastMCP(name=name, instructions=_instructions(policy, router.hub is not None))
+    server = FastMCP(name=name, version=__version__, instructions=_instructions(policy, router.hub is not None))
     run = functools.partial(_invoke, router)
 
     # ------------------------------------------------------------ read tools
@@ -712,15 +714,12 @@ class RemoteListenerConfig:
         return urlsplit(self.public_url).hostname or ""
 
     def http_options(self) -> dict[str, Any]:
-        """Bind and Host/Origin-guard settings: loopback names plus the public name the tunnel forwards."""
+        """Bind address plus a Host/Origin guard that also admits the public name the tunnel forwards."""
         public = urlsplit(self.public_url)
-        return {
-            "host": self.host,
-            "port": self.port,
-            "host_origin_protection": True,
-            "allowed_hosts": [self.host, self.public_host],
-            "allowed_origins": [f"{public.scheme}://{public.netloc}"],
-        }
+        guard = ASGIMiddleware(
+            HostOriginGuard, hosts=[self.host, self.public_host], origins=[f"{public.scheme}://{public.netloc}"]
+        )
+        return {"host": self.host, "port": self.port, "middleware": [guard]}
 
     @property
     def secret_paths(self) -> list[Path]:
@@ -881,8 +880,9 @@ def main(argv: list[str] | None = None) -> None:
             await hub.start(listener.host, listener.port, ssl_context)
             scheme = "wss" if ssl_context else "ws"
             print(f"[computer] agents on {scheme}://{listener.host}:{hub.port}", file=sys.stderr, flush=True)
-        # Host/Origin guard on (FastMCP leaves it off by default): refuses DNS-rebinding requests.
-        listeners = [(server, {"host": host, "port": port, "host_origin_protection": True})]
+        # The Host/Origin guard refuses DNS-rebinding requests (FastMCP's own is off by default or absent).
+        local_options = {"host": host, "port": port, "middleware": [ASGIMiddleware(HostOriginGuard, hosts=[host])]}
+        listeners = [(server, local_options)]
         if remote_server is not None:
             listeners.append((remote_server, remote.http_options()))
         running = len(listeners)
