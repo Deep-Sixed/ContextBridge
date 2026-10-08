@@ -622,6 +622,12 @@ class AgentListenerConfig:
         self.tls_cert = _path(base, cfg.get("tls_cert"))
         self.tls_key = _path(base, cfg.get("tls_key"))
         self.registry = _path(base, cfg.get("registry"))
+        ids = cfg.get("tailnet_node_ids")
+        if not isinstance(ids, list) or not ids or any(
+            not isinstance(item, str) or not item.strip() for item in ids
+        ):
+            raise SystemExit(f"{where}: agents.tailnet_node_ids must contain enrolled Tailscale node IDs.")
+        self.tailnet_node_ids = frozenset(ids)
         try:
             self.heartbeat_seconds = float(cfg.get("heartbeat_seconds", 15))
             self.call_timeout_seconds = float(cfg.get("call_timeout_seconds", 660))
@@ -811,6 +817,7 @@ def main(argv: list[str] | None = None) -> None:
             audit,
             heartbeat_seconds=listener.heartbeat_seconds,
             call_timeout_seconds=listener.call_timeout_seconds,
+            allowed_tailnet_node_ids=listener.tailnet_node_ids,
         )
 
     name = cfg.get("name", "ContextBridge Computer")
