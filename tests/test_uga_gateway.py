@@ -5,10 +5,12 @@ from pathlib import Path
 
 import anyio
 import pytest
+from conftest import TOKEN
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
 import uga.gateway as gateway
+from uga.adapter import DatacoreStore
 from uga.gateway import advertised_tool_names, create_uga_server
 from uga.policy import UGA_ALLOWED_TOOLS
 
@@ -16,10 +18,8 @@ FIXTURE = Path(__file__).parent / "fixtures" / "datacore" / "datacore.fetch.v1.j
 
 
 @pytest.fixture
-def knowledge_server(monkeypatch):
-    monkeypatch.setenv("UGA_DATACORE_JSONL", str(FIXTURE))
-    monkeypatch.setattr(gateway, "_store", None)
-    return create_uga_server()
+def knowledge_server():
+    return create_uga_server(store=DatacoreStore.from_jsonl(FIXTURE), token=TOKEN)
 
 
 def run(server, fn):
@@ -30,8 +30,8 @@ def run(server, fn):
     return anyio.run(inner)
 
 
-def test_knowledge_route_advertises_only_search_and_fetch():
-    assert advertised_tool_names(create_uga_server()) == set(UGA_ALLOWED_TOOLS)
+def test_knowledge_route_advertises_only_search_and_fetch(knowledge_server):
+    assert advertised_tool_names(knowledge_server) == set(UGA_ALLOWED_TOOLS)
 
 
 def test_search_and_fetch(knowledge_server):
