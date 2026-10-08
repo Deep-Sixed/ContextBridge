@@ -179,9 +179,16 @@ def test_create_directory_and_move(policy, workspace):
 
 
 def test_new_files_get_normal_permissions(policy, workspace):
-    files.write_file(policy, "work/fresh.txt", "x")
+    # Host services may run with a restrictive umask (for example 077).
+    # Verify ordinary file creation honors the selected umask instead of
+    # assuming group/other read access on every host.
+    previous_umask = os.umask(0o022)
+    try:
+        files.write_file(policy, "work/fresh.txt", "x")
+    finally:
+        os.umask(previous_umask)
     mode = stat.S_IMODE((workspace / "work" / "fresh.txt").stat().st_mode)
-    assert mode & 0o044  # group/other readable under a normal umask, unlike mkstemp's 0600
+    assert mode == 0o644
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs FIFOs")
