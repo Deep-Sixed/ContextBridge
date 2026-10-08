@@ -36,7 +36,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from . import __version__
 from .adapter import DatacoreRecordNotFound, DatacoreStore
 from .audit import UgaAuditLog
-from .policy import UGA_ALLOWED_TOOLS, is_tool_allowed
+from .policy import UGA_ALLOWED_TOOLS
 
 DEFAULT_METADATA_TIMEOUT_SECONDS = 5.0
 DEFAULT_TOOL_TIMEOUT_SECONDS = 10.0
@@ -122,11 +122,11 @@ def _peer() -> str | None:
     return request.client.host if request.client else None
 
 
-def _require_token(token: str | None) -> str:
+def _require_token(token: str | None, *, name: str = "MCP_AUTH_TOKEN") -> str:
     if not token:
-        raise ValueError("MCP_AUTH_TOKEN must be set for the UGA gateway (fail closed).")
+        raise ValueError(f"{name} must be set (fail closed).")
     if len(token) < MIN_TOKEN_LENGTH:
-        raise ValueError(f"MCP_AUTH_TOKEN must be at least {MIN_TOKEN_LENGTH} characters.")
+        raise ValueError(f"{name} must be at least {MIN_TOKEN_LENGTH} characters.")
     return token
 
 
@@ -196,10 +196,24 @@ def http_middleware(audit: UgaAuditLog) -> list[AsgiMiddleware]:
 
 
 class UgaAllowlistMiddleware(Middleware):
-    """Hide non-allowed tools and reject forbidden calls before execution."""
+    """Hide non-allowed tools and reject forbidden calls before execution.
 
-    def __init__(self, audit: UgaAuditLog) -> None:
+    The defaults are the UGA route's; the filesystem route passes its own
+    allowlist and names.
+    """
+
+    def __init__(
+        self,
+        audit: UgaAuditLog,
+        *,
+        allowed_tools: frozenset[str] = UGA_ALLOWED_TOOLS,
+        route_name: str = "UGA",
+        service_name: str = "Nexus Datacore",
+    ) -> None:
         self._audit = audit
+        self._allowed_tools = allowed_tools
+        self._route_name = route_name
+        self._service_name = service_name
 
     async def on_initialize(self, context: MiddlewareContext[Any], call_next: Any) -> Any:
         started = time.monotonic()
@@ -218,7 +232,7 @@ class UgaAllowlistMiddleware(Middleware):
                 elapsed_ms=elapsed,
                 **who,
             )
-            raise RuntimeError("Nexus Datacore MCP initialize timed out") from None
+            raise RuntimeError(f"{self._service_name} MCP initialize timed out") from None
         except Exception as exc:
             elapsed = _elapsed_ms(started)
             self._audit.record(
@@ -257,7 +271,7 @@ class UgaAllowlistMiddleware(Middleware):
                 elapsed_ms=elapsed,
                 **who,
             )
-            raise RuntimeError("Nexus Datacore MCP tools/list timed out") from None
+            raise RuntimeError(f"{self._service_name} MCP tools/list timed out") from None
         except Exception as exc:
             elapsed = _elapsed_ms(started)
             self._audit.record(
@@ -269,7 +283,7 @@ class UgaAllowlistMiddleware(Middleware):
                 **who,
             )
             raise
-        filtered = [t for t in tools if is_tool_allowed(t.name)]
+        filtered = [t for t in tools if t.name in self._allowed_tools]
         elapsed = _elapsed_ms(started)
         self._audit.record(
             tool="tools/list",
@@ -287,7 +301,7 @@ class UgaAllowlistMiddleware(Middleware):
         who = {"client_label": _client_name(context), "peer": _peer()}
         raw_name = getattr(context.message, "name", None)
         name = str(raw_name) if raw_name else "<unknown>"
-        if not is_tool_allowed(name):
+        if name not in self._allowed_tools:
             self._audit.record(
                 tool=name,
                 success=False,
@@ -296,7 +310,7 @@ class UgaAllowlistMiddleware(Middleware):
                 elapsed_ms=_elapsed_ms(started),
                 **who,
             )
-            raise ToolError(f"Tool '{name}' is not permitted on the UGA route.")
+            raise ToolError(f"Tool '{name}' is not permitted on the {self._route_name} route.")
         request_id_token = _current_request_id.set(request_id)
         try:
             with anyio.fail_after(_tool_timeout_seconds()):
@@ -311,7 +325,9 @@ class UgaAllowlistMiddleware(Middleware):
                 elapsed_ms=elapsed,
                 **who,
             )
-            raise ToolError(f"Tool '{name}' timed out on the Nexus Datacore route.") from None
+            raise ToolError(
+                f"Tool '{name}' timed out on the {self._service_name} route."
+            ) from None
         except Exception as exc:
             elapsed = _elapsed_ms(started)
             self._audit.record(
