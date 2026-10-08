@@ -25,6 +25,23 @@ agents:
   heartbeat_seconds: 15    # a device is dropped after 3 missed heartbeats
   call_timeout_seconds: 660
 
+remote:
+  # ChatGPT, Claude, and other remote MCP clients connect here with OAuth. Off until you set it up:
+  #   contextbridge-admin --config configs/computer.yaml owner-init    # passphrase + authenticator app
+  #   tailscale funnel --bg 8793                                       # or any TLS tunnel to host:port
+  # Then add <public_url>/mcp as a custom connector. Each client is approved on a consent page
+  # (passphrase + authenticator code) where you pick its permissions and devices.
+  enabled: false
+  host: 127.0.0.1          # loopback only; the tunnel publishes it
+  port: 8793               # must differ from serve.port and agents.port
+  public_url: https://friday.example.ts.net   # the https origin the tunnel serves (no path)
+  state: ../state/oauth.json   # owner credentials, clients, hashed tokens; hidden from every file tool
+  allow_scopes: [computer:read]   # the most any remote client can be approved for; add more deliberately
+  allow_devices: [local]   # device names remote clients may be offered; "*" for every enrolled device
+  allowed_redirect_hosts: [claude.ai, claude.com, chatgpt.com]   # who may register as a client
+  access_token_minutes: 60
+  refresh_token_days: 30   # a client unused this long must be approved again
+
 # The sections below configure the "local" device: this machine.
 # Remove filesystem/commands/processes entirely to run a gateway with no local device.
 

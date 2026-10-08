@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "contextbridge"
-version = "0.3.0"
+version = "0.4.0"
 description = "Self-hosted MCP gateway for approved project context and policy-controlled computer access"
 requires-python = ">=3.11"
 # fastmcp 4 removed fastmcp.tools.tool; anyio 4.1 added abandon_on_cancel.

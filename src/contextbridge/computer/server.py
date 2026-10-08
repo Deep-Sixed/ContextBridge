@@ -14,7 +14,10 @@ Every call is audited as ``requested`` → ``denied``/``failed`` or
 ``requested`` → ``started`` → ``completed`` (see :mod:`.audit`).
 
 The MCP endpoint serves HTTP on a loopback address only. The optional agent
-listener may bind a LAN or overlay address, but only with TLS.
+listener may bind a LAN or overlay address, but only with TLS. The optional
+remote listener (:mod:`contextbridge.oauth`) is a second MCP endpoint on its
+own loopback port, for a TLS tunnel to expose; it accepts only OAuth tokens,
+each limited to the scopes and devices the owner approved.
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ import uuid
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import anyio
 import yaml
@@ -76,6 +80,7 @@ CLIENT_ID = "contextbridge-computer"
 MIN_TOKEN_LENGTH = 32
 LOCAL_DEVICE = "local"
 LIST_DEVICES_TOOL = "list_devices"
+DEFAULT_REDIRECT_HOSTS = ("claude.ai", "claude.com", "chatgpt.com")
 
 SCOPE_READ = "computer:read"
 SCOPE_WRITE = "computer:write"
@@ -112,6 +117,14 @@ class AuthorizationError(PermissionError):
 Authorizer = Callable[[str], str]
 """Given a tool name, return the caller's client id or raise :class:`AuthorizationError`."""
 
+DeviceGrant = Callable[[], frozenset[str] | None]
+"""The devices the current caller may reach, or None for every device."""
+
+
+def all_devices() -> frozenset[str] | None:
+    """The static-token grant: the owner's token reaches every device."""
+    return None
+
 
 def token_authorizer(tool: str) -> str:
     """Authorize ``tool`` against the bearer token of the current request."""
@@ -139,10 +152,13 @@ class DeviceRouter:
         self.local = local
         self.hub = hub
 
-    def available_tools(self) -> frozenset[str]:
-        tools = set(self.local.tools) if self.local else set()
+    def available_tools(self, devices: frozenset[str] | None = None) -> frozenset[str]:
+        """Tools offered by online devices (only those in ``devices``, unless None)."""
+        tools: set[str] = set()
+        if self.local is not None and (devices is None or LOCAL_DEVICE in devices):
+            tools |= self.local.tools
         if self.hub is not None:
-            tools |= self.hub.online_tools()
+            tools |= self.hub.online_tools(devices)
         return frozenset(tools)
 
     def check(self, device: str, tool: str) -> None:
@@ -176,7 +192,7 @@ class DeviceRouter:
             return await anyio.to_thread.run_sync(self.local.execute, tool, args)
         return await self.hub.call(device, tool, args, current_call())
 
-    def describe(self) -> list[dict[str, Any]]:
+    def describe(self, devices: frozenset[str] | None = None) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         if self.local is not None:
             rows.append(
@@ -190,7 +206,7 @@ class DeviceRouter:
             )
         if self.hub is not None:
             rows.extend(self.hub.describe())
-        return rows
+        return [row for row in rows if devices is None or row["device"] in devices]
 
 
 def _device_errors() -> tuple[type[Exception], ...]:
@@ -222,22 +238,35 @@ def _elapsed_ms(started: float) -> int:
 class ComputerPolicyMiddleware(Middleware):
     """Authorize and audit every call at execution time; hide tools the caller cannot use."""
 
-    def __init__(self, router: DeviceRouter, audit: ComputerAuditLog, authorize: Authorizer) -> None:
+    def __init__(
+        self,
+        router: DeviceRouter,
+        audit: ComputerAuditLog,
+        authorize: Authorizer,
+        devices: DeviceGrant = all_devices,
+        listener: str = "local",
+    ) -> None:
         self._router = router
         self._audit = audit
         self._authorize = authorize
+        self._devices = devices
+        self._listener = listener
 
     def _check(self, name: str, device: str | None) -> str:
         if name not in SERVER_TOOLS:
             raise AuthorizationError(f"Tool '{name}' is not permitted on this computer.")
         client = self._authorize(name)
         if name != LIST_DEVICES_TOOL:
-            self._router.check(device or LOCAL_DEVICE, name)
+            target = device or LOCAL_DEVICE
+            granted = self._devices()
+            if granted is not None and target not in granted:
+                raise AuthorizationError(f"This client is not authorized for device '{target}'.")
+            self._router.check(target, name)
         return client
 
     async def on_list_tools(self, context: MiddlewareContext[Any], call_next: Any) -> Sequence[Tool]:
         tools = await call_next(context)
-        offered = self._router.available_tools() | {LIST_DEVICES_TOOL}
+        offered = self._router.available_tools(self._devices()) | {LIST_DEVICES_TOOL}
         visible = []
         for tool in tools:
             if tool.name not in offered:
@@ -260,7 +289,9 @@ class ComputerPolicyMiddleware(Middleware):
         fields = summarize_args(arguments)
         fields.pop("device", None)
         try:
-            self._audit.record("requested", request_id=request_id, tool=name, device=device, **fields)
+            self._audit.record(
+                "requested", request_id=request_id, tool=name, device=device, listener=self._listener, **fields
+            )
         except AuditError as exc:
             raise ToolError(f"Audit log unavailable; refusing to run '{name}'.") from exc
 
@@ -324,15 +355,8 @@ def _instructions(policy: ComputerPolicy | None, remote: bool) -> str:
     return " ".join(parts)
 
 
-def create_computer_server(
-    policy: ComputerPolicy | None,
-    *,
-    audit: ComputerAuditLog,
-    authorize: Authorizer = token_authorizer,
-    hub: Any | None = None,
-    name: str = "ContextBridge Computer",
-) -> FastMCP:
-    """Build the MCP server. ``policy`` configures the ``local`` device (None for a gateway without one)."""
+def build_router(policy: ComputerPolicy | None, *, audit: ComputerAuditLog, hub: Any | None = None) -> DeviceRouter:
+    """The devices one or more MCP servers share: ``local`` under ``policy`` (if any) plus the hub's agents."""
 
     def report_exit(status: dict[str, Any]) -> None:
         audit.record(
@@ -344,8 +368,29 @@ def create_computer_server(
         )
 
     local = Engine(policy, on_exit=report_exit) if policy is not None else None
-    router = DeviceRouter(local, hub)
-    server = FastMCP(name=name, instructions=_instructions(policy, hub is not None))
+    return DeviceRouter(local, hub)
+
+
+def create_computer_server(
+    policy: ComputerPolicy | None,
+    *,
+    audit: ComputerAuditLog,
+    authorize: Authorizer = token_authorizer,
+    devices: DeviceGrant = all_devices,
+    hub: Any | None = None,
+    router: DeviceRouter | None = None,
+    listener: str = "local",
+    name: str = "ContextBridge Computer",
+) -> FastMCP:
+    """Build the MCP server. ``policy`` configures the ``local`` device (None for a gateway without one).
+
+    Pass ``router`` (from :func:`build_router`) to serve the same devices, sessions included,
+    from several servers; ``policy`` and ``hub`` are then taken from it.
+    """
+    if router is None:
+        router = build_router(policy, audit=audit, hub=hub)
+    policy = router.local.policy if router.local is not None else None
+    server = FastMCP(name=name, instructions=_instructions(policy, router.hub is not None))
     run = functools.partial(_invoke, router)
 
     # ------------------------------------------------------------ read tools
@@ -354,7 +399,7 @@ def create_computer_server(
     async def list_devices() -> dict[str, Any]:
         """List the computers this gateway can reach, whether each is online, and what it allows."""
         mark_started()
-        return {"devices": router.describe()}
+        return {"devices": router.describe(devices())}
 
     @server.tool(annotations=_READ_ONLY)
     async def list_directory(path: str, depth: int = 1, device: str = LOCAL_DEVICE) -> dict[str, Any]:
@@ -514,7 +559,7 @@ def create_computer_server(
         """Terminate a process by PID (force sends SIGKILL / TerminateProcess)."""
         return await run(device, "kill_process", {"pid": pid, "force": force})
 
-    server.add_middleware(ComputerPolicyMiddleware(router, audit, authorize))
+    server.add_middleware(ComputerPolicyMiddleware(router, audit, authorize, devices, listener))
     return server
 
 
@@ -607,6 +652,95 @@ class AgentListenerConfig:
             raise SystemExit(f"cannot load agent TLS certificate/key: {exc}") from None
 
 
+def _str_list(value: Any, where: str) -> list[str]:
+    if not isinstance(value, list) or not value or not all(isinstance(v, str) and v for v in value):
+        raise SystemExit(f"{where} must be a non-empty list of strings.")
+    return list(dict.fromkeys(value))
+
+
+class RemoteListenerConfig:
+    """The ``remote`` section: an OAuth-protected MCP endpoint for ChatGPT, Claude, and other remote clients.
+
+    It listens on loopback only; a TLS tunnel (Tailscale Funnel, Cloudflare Tunnel, a
+    reverse proxy) publishes it at ``public_url``.
+    """
+
+    def __init__(self, cfg: dict[str, Any], base: Path, where: Path) -> None:
+        self.host = str(cfg.get("host", "127.0.0.1"))
+        self.port = _port(cfg.get("port"), f"{where}: remote.port")
+        self.public_url = str(cfg.get("public_url") or "").rstrip("/")
+        self.state = _path(base, cfg.get("state"))
+        self.allow_scopes = _str_list(cfg.get("allow_scopes", [SCOPE_READ]), f"{where}: remote.allow_scopes")
+        self.allow_devices = _str_list(cfg.get("allow_devices", [LOCAL_DEVICE]), f"{where}: remote.allow_devices")
+        self.redirect_hosts = [
+            h.lower()
+            for h in _str_list(
+                cfg.get("allowed_redirect_hosts", list(DEFAULT_REDIRECT_HOSTS)), f"{where}: remote.allowed_redirect_hosts"
+            )
+        ]
+        minutes, days = cfg.get("access_token_minutes", 60), cfg.get("refresh_token_days", 30)
+        if not is_loopback(self.host):
+            raise SystemExit(
+                f"{where}: remote.host must be a loopback address; publish it through a TLS tunnel, not a bind."
+            )
+        parts = urlsplit(self.public_url)
+        if (
+            not parts.hostname
+            or parts.path
+            or parts.query
+            or parts.fragment
+            or parts.username
+            or not (parts.scheme == "https" or (parts.scheme == "http" and is_loopback(parts.hostname)))
+        ):
+            raise SystemExit(
+                f"{where}: remote.public_url must be the https:// origin clients reach (no path), "
+                f"e.g. https://friday.example.ts.net; got {self.public_url!r}."
+            )
+        if self.state is None:
+            raise SystemExit(f"{where}: remote.state is required.")
+        unknown = [s for s in self.allow_scopes if s not in ALL_SCOPES]
+        if unknown:
+            raise SystemExit(f"{where}: remote.allow_scopes: unknown scope(s) {unknown}; valid: {list(ALL_SCOPES)}")
+        for value, low, high, key in ((minutes, 1, 1440, "access_token_minutes"), (days, 1, 365, "refresh_token_days")):
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or not low <= value <= high:
+                raise SystemExit(f"{where}: remote.{key} must be a number from {low} to {high}.")
+        self.access_seconds = round(minutes * 60)
+        self.refresh_seconds = round(days * 86400)
+
+    @property
+    def public_host(self) -> str:
+        return urlsplit(self.public_url).hostname or ""
+
+    def http_options(self) -> dict[str, Any]:
+        """Bind and Host/Origin-guard settings: loopback names plus the public name the tunnel forwards."""
+        public = urlsplit(self.public_url)
+        return {
+            "host": self.host,
+            "port": self.port,
+            "host_origin_protection": True,
+            "allowed_hosts": [self.host, self.public_host],
+            "allowed_origins": [f"{public.scheme}://{public.netloc}"],
+        }
+
+    @property
+    def secret_paths(self) -> list[Path]:
+        """The OAuth state file and its lock and temp files: never visible to any file tool."""
+        assert self.state is not None
+        return [self.state, *(self.state.with_name(self.state.name + suffix) for suffix in (".lock", ".tmp"))]
+
+    def settings(self):
+        from ..oauth.provider import RemoteSettings
+
+        return RemoteSettings(
+            public_url=self.public_url,
+            allow_scopes=tuple(self.allow_scopes),
+            allow_devices=tuple(self.allow_devices),
+            allowed_redirect_hosts=tuple(self.redirect_hosts),
+            access_seconds=self.access_seconds,
+            refresh_seconds=self.refresh_seconds,
+        )
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="ContextBridge computer route (MCP over HTTP on loopback only)")
     ap.add_argument("--config", required=True)
@@ -630,7 +764,13 @@ def main(argv: list[str] | None = None) -> None:
 
     agents_cfg = cfg.get("agents") or {}
     listener = AgentListenerConfig(agents_cfg, base, config_path) if agents_cfg.get("enabled") else None
-    # The local device may never read the gateway's TLS key or device registry, nor rewrite its config.
+    remote_cfg = cfg.get("remote") or {}
+    remote = RemoteListenerConfig(remote_cfg, base, config_path) if remote_cfg.get("enabled") else None
+    ports = [port] + ([listener.port] if listener else []) + ([remote.port] if remote else [])
+    if len(set(ports)) != len(ports):
+        raise SystemExit(f"{config_path}: serve.port, agents.port, and remote.port must all differ.")
+    # The local device may never read the gateway's TLS key, device registry, or OAuth state,
+    # nor rewrite its config.
     hidden: list[Path] = []
     protected: list[Path] = [config_path, audit_path]
     if listener is not None:
@@ -638,6 +778,8 @@ def main(argv: list[str] | None = None) -> None:
         if listener.tls_key and listener.tls_cert:
             hidden.append(listener.tls_key)
             protected.append(listener.tls_cert)
+    if remote is not None:
+        hidden += remote.secret_paths
 
     try:
         scopes = load_scopes(cfg)
@@ -671,10 +813,29 @@ def main(argv: list[str] | None = None) -> None:
             call_timeout_seconds=listener.call_timeout_seconds,
         )
 
-    server = create_computer_server(policy, audit=audit, hub=hub, name=cfg.get("name", "ContextBridge Computer"))
-    advertised = advertised_tool_names(server)
-    if advertised != SERVER_TOOLS:
-        raise SystemExit(f"Computer tool surface mismatch: expected {set(SERVER_TOOLS)!r}, got {advertised!r}")
+    name = cfg.get("name", "ContextBridge Computer")
+    router = build_router(policy, audit=audit, hub=hub)
+    server = create_computer_server(None, audit=audit, router=router, name=name)
+    remote_server = None
+    if remote is not None:
+        from ..oauth.remote import create_remote_server
+        from ..oauth.store import OAuthStateError, OAuthStore
+
+        store = OAuthStore(remote.state)
+        try:
+            ready = store.owner_initialized()
+        except OAuthStateError as exc:
+            raise SystemExit(str(exc)) from None
+        if not ready:
+            raise SystemExit(
+                f"{config_path}: remote is enabled but no owner credentials exist (fail closed). Run:\n"
+                f"  contextbridge-admin --config {config_path} owner-init"
+            )
+        remote_server = create_remote_server(router, audit=audit, settings=remote.settings(), store=store, name=name)
+    for srv in (server, remote_server):
+        advertised = advertised_tool_names(srv) if srv is not None else SERVER_TOOLS
+        if advertised != SERVER_TOOLS:
+            raise SystemExit(f"Computer tool surface mismatch: expected {set(SERVER_TOOLS)!r}, got {advertised!r}")
 
     try:
         audit.record(
@@ -685,6 +846,16 @@ def main(argv: list[str] | None = None) -> None:
             local_tools=sorted(available_tools(policy)) if policy else None,
             policy=policy.summary() if policy else None,
             agents=f"{'wss' if ssl_context else 'ws'}://{listener.host}:{listener.port}" if listener else None,
+            remote=(
+                {
+                    "listen": f"http://{remote.host}:{remote.port}",
+                    "public_url": remote.public_url,
+                    "allow_scopes": remote.allow_scopes,
+                    "allow_devices": remote.allow_devices,
+                }
+                if remote
+                else None
+            ),
         )
     except AuditError as exc:
         raise SystemExit(str(exc)) from None
@@ -697,13 +868,49 @@ def main(argv: list[str] | None = None) -> None:
         flush=True,
     )
 
+    if remote is not None:
+        print(
+            f"[computer] remote MCP on http://{remote.host}:{remote.port}/mcp for {remote.public_url}/mcp "
+            f"(OAuth; scopes<={','.join(remote.allow_scopes)}, devices<={','.join(remote.allow_devices)})",
+            file=sys.stderr,
+            flush=True,
+        )
+
     async def serve_all() -> None:
         if hub is not None:
             await hub.start(listener.host, listener.port, ssl_context)
             scheme = "wss" if ssl_context else "ws"
             print(f"[computer] agents on {scheme}://{listener.host}:{hub.port}", file=sys.stderr, flush=True)
+        # Host/Origin guard on (FastMCP leaves it off by default): refuses DNS-rebinding requests.
+        listeners = [(server, {"host": host, "port": port, "host_origin_protection": True})]
+        if remote_server is not None:
+            listeners.append((remote_server, remote.http_options()))
+        running = len(listeners)
+        one_stopped, all_stopped = anyio.Event(), anyio.Event()
+
+        async def serve(srv: FastMCP, options: dict[str, Any]) -> None:
+            nonlocal running
+            try:
+                await srv.run_async(transport="http", show_banner=False, **options)
+            finally:
+                running -= 1
+                one_stopped.set()
+                if running == 0:
+                    all_stopped.set()
+
+        async def stop_together() -> None:
+            # uvicorn hands a stop signal from one server to the next, so all drain gracefully;
+            # if a listener stops on its own instead, the rest follow within a few seconds.
+            await one_stopped.wait()
+            with anyio.move_on_after(5):
+                await all_stopped.wait()
+            tg.cancel_scope.cancel()
+
         try:
-            await server.run_async(transport="http", host=host, port=port, show_banner=False)
+            async with anyio.create_task_group() as tg:
+                for srv, options in listeners:
+                    tg.start_soon(serve, srv, options)
+                tg.start_soon(stop_together)
         finally:
             if hub is not None:
                 with contextlib.suppress(Exception):

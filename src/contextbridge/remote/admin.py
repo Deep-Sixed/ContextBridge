@@ -1,35 +1,61 @@
-"""Gateway administration: TLS setup, device pairing, listing, and revocation.
+"""Gateway administration: devices, TLS, and remote-client (OAuth) access.
 
 Runs on the gateway host and works directly on the files named in the
-``agents`` section of the gateway config. Pairing is deliberately not an MCP
-tool: whoever holds an MCP token must not be able to enroll new machines.
+``agents`` and ``remote`` sections of the gateway config. None of this is an
+MCP tool: whoever holds an MCP token must not be able to enroll machines,
+approve clients, or change the owner credentials.
 
     contextbridge-admin --config configs/computer.yaml tls-init --hostname friday --ip 100.101.102.103
     contextbridge-admin --config configs/computer.yaml pair thanatos
     contextbridge-admin --config configs/computer.yaml devices
     contextbridge-admin --config configs/computer.yaml revoke thanatos
+
+    contextbridge-admin --config configs/computer.yaml owner-init
+    contextbridge-admin --config configs/computer.yaml oauth-clients
+    contextbridge-admin --config configs/computer.yaml oauth-revoke <client_id> | --all
+    contextbridge-admin --config configs/computer.yaml oauth-unlock
 """
 
 from __future__ import annotations
 
 import argparse
+import getpass
+import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import yaml
 
-from ..computer.server import ALL_SCOPES, AgentListenerConfig
+from ..computer.server import ALL_SCOPES, AgentListenerConfig, RemoteListenerConfig
+from ..oauth import totp
+from ..oauth.store import MIN_PASSPHRASE_LENGTH, OAuthStateError, OAuthStore
 from .registry import DEFAULT_ENROLLMENT_MINUTES, DeviceRegistry, RegistryError
 from .tls import cert_fingerprint, generate_self_signed
 
 
-def _listener(config: str) -> AgentListenerConfig:
+def _section(config: str, name: str) -> tuple[dict[str, Any], Path]:
     path = Path(config).expanduser().resolve()
     cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    agents = cfg.get("agents") or {}
-    if not agents:
-        raise SystemExit(f"{path}: no agents section")
-    return AgentListenerConfig(agents, path.parent, path)
+    section = cfg.get(name) or {}
+    if not section:
+        raise SystemExit(f"{path}: no {name} section")
+    return section, path
+
+
+def _listener(config: str) -> AgentListenerConfig:
+    section, path = _section(config, "agents")
+    return AgentListenerConfig(section, path.parent, path)
+
+
+def _remote(config: str) -> RemoteListenerConfig:
+    section, path = _section(config, "remote")
+    return RemoteListenerConfig(section, path.parent, path)
+
+
+def _store(remote: RemoteListenerConfig) -> OAuthStore:
+    assert remote.state is not None
+    return OAuthStore(remote.state)
 
 
 def _fingerprint(listener: AgentListenerConfig) -> str | None:
@@ -97,6 +123,81 @@ def cmd_revoke(listener: AgentListenerConfig, args: argparse.Namespace) -> None:
     print(f"revoked {what}; a running gateway disconnects it within a second")
 
 
+def _when(ts: float | None) -> str:
+    return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ts)) if ts else "-"
+
+
+def _read_passphrase(from_stdin: bool) -> str:
+    if from_stdin:
+        return sys.stdin.readline().rstrip("\r\n")
+    first = getpass.getpass("New owner passphrase (12+ characters): ")
+    if getpass.getpass("Repeat it: ") != first:
+        raise SystemExit("passphrases do not match")
+    return first
+
+
+def cmd_owner_init(remote: RemoteListenerConfig, args: argparse.Namespace) -> None:
+    store = _store(remote)
+    try:
+        if store.owner_initialized() and not args.force:
+            raise SystemExit("owner credentials already exist; pass --force to replace them (grants are kept)")
+        passphrase = _read_passphrase(args.passphrase_stdin)
+        if len(passphrase) < MIN_PASSPHRASE_LENGTH:
+            raise SystemExit(f"the passphrase must be at least {MIN_PASSPHRASE_LENGTH} characters")
+        secret = totp.new_secret()
+        uri = totp.provisioning_uri(secret, account=remote.public_host or "owner")
+        print("Add this account to your authenticator app (scan the URI as a QR code, or type the secret):")
+        print(f"  secret: {secret}")
+        print(f"  uri:    {uri}")
+        print(f"  (to show a QR code in this terminal: qrencode -t ansiutf8 '{uri}')", flush=True)
+        if not args.no_confirm:
+            code = input("Enter the 6-digit code it shows now: ") if sys.stdin.isatty() else sys.stdin.readline()
+            if totp.verify(secret, code.strip(), last_counter=-1, window=1) is None:
+                raise SystemExit("that code does not match; nothing was saved. Run owner-init again.")
+        store.set_owner(passphrase, secret)
+    except OAuthStateError as exc:
+        raise SystemExit(str(exc)) from None
+    print(f"Owner credentials saved to {remote.state}. Approving a remote client now needs the passphrase and a code.")
+
+
+def cmd_oauth_clients(remote: RemoteListenerConfig, args: argparse.Namespace) -> None:
+    try:
+        clients = _store(remote).clients()
+    except OAuthStateError as exc:
+        raise SystemExit(str(exc)) from None
+    if not clients:
+        print("no remote clients registered")
+    for client in sorted(clients, key=lambda c: c["registered_at"]):
+        hosts = sorted({u.split("/")[2] for u in client.get("redirect_uris", []) if "://" in u})
+        state = "approved" if client.get("authorized") else "never approved"
+        print(f"{client['client_id']}  {client.get('client_name') or '(unnamed)'}  [{state}]  redirects to {', '.join(hosts)}")
+        for grant in client["grants"]:
+            print(
+                f"    {grant['grant_id']}: scopes={','.join(grant['scopes'])} devices={','.join(grant['devices'])} "
+                f"since {_when(grant['created_at'])}, refresh expires {_when(grant['refresh_expires_at'])}"
+            )
+
+
+def cmd_oauth_revoke(remote: RemoteListenerConfig, args: argparse.Namespace) -> None:
+    store = _store(remote)
+    try:
+        targets = [c["client_id"] for c in store.clients()] if args.all else [args.client_id]
+        if not args.all and store.get_client(args.client_id) is None:
+            raise SystemExit(f"no client {args.client_id!r}; see oauth-clients")
+        grants = sum(store.revoke_client(cid) for cid in targets)
+    except OAuthStateError as exc:
+        raise SystemExit(str(exc)) from None
+    print(f"revoked {len(targets)} client(s) and {grants} grant(s); their tokens stop working on the next request")
+
+
+def cmd_oauth_unlock(remote: RemoteListenerConfig, args: argparse.Namespace) -> None:
+    try:
+        _store(remote).unlock()
+    except OAuthStateError as exc:
+        raise SystemExit(str(exc)) from None
+    print("consent lockout cleared")
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="ContextBridge gateway administration")
     ap.add_argument("--config", required=True, help="gateway config (configs/computer.yaml)")
@@ -121,8 +222,27 @@ def main(argv: list[str] | None = None) -> None:
     revoke.add_argument("name")
     revoke.set_defaults(fn=cmd_revoke)
 
+    owner = sub.add_parser("owner-init", help="set the passphrase and authenticator that approve remote clients")
+    owner.add_argument("--force", action="store_true", help="replace existing owner credentials")
+    owner.add_argument("--passphrase-stdin", action="store_true", help="read the passphrase from stdin's first line")
+    owner.add_argument("--no-confirm", action="store_true", help="save without checking a code from the authenticator")
+    owner.set_defaults(fn=cmd_owner_init, section="remote")
+
+    clients = sub.add_parser("oauth-clients", help="list remote clients and what each was granted")
+    clients.set_defaults(fn=cmd_oauth_clients, section="remote")
+
+    oauth_revoke = sub.add_parser("oauth-revoke", help="revoke a remote client's tokens and registration")
+    target = oauth_revoke.add_mutually_exclusive_group(required=True)
+    target.add_argument("client_id", nargs="?")
+    target.add_argument("--all", action="store_true", help="revoke every remote client")
+    oauth_revoke.set_defaults(fn=cmd_oauth_revoke, section="remote")
+
+    unlock = sub.add_parser("oauth-unlock", help="clear the lockout after repeated failed approvals")
+    unlock.set_defaults(fn=cmd_oauth_unlock, section="remote")
+
     args = ap.parse_args(argv)
-    args.fn(_listener(args.config), args)
+    section = _remote if getattr(args, "section", "agents") == "remote" else _listener
+    args.fn(section(args.config), args)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,8 @@ It has two routes, each with its own server, port, and credential:
 
 Being able to read knowledge never grants computer access. The computer route won't start if its token matches `MCP_AUTH_TOKEN`, and each route rejects the other's token.
 
+The computer route can also serve ChatGPT, Claude, and other remote MCP clients through a second, OAuth-protected endpoint. Each client gets only the permissions and devices you approve for it (see [Remote MCP clients](#remote-mcp-clients-chatgpt-claude)).
+
 ## Installation
 
 ```sh
@@ -78,7 +80,7 @@ There is no unauthenticated mode. Every MCP request is checked against the token
 These checks run on **every tool call**, at the moment it executes:
 
 1. **Token scope.** The bearer token must carry the tool's scope: `computer:read` (file reading, search, system info, process listing, `list_devices`), `computer:write` (file changes), `computer:execute` (commands and sessions), or `computer:process` (`kill_process`). `auth.scopes` in the config sets what the token carries. Tools outside those scopes are hidden from the tool list and refused if called anyway.
-2. **Device.** The device must exist and be online. Its policy must enable the tool. A remote device must also have been granted the tool's scope when it was paired.
+2. **Device.** A remote (OAuth) client may only use the devices its grant names. The local token reaches every device. The device must exist and be online. Its policy must enable the tool. A remote device must also have been granted the tool's scope when it was paired.
 3. **Policy checks.** The device's engine re-validates every path, command, working directory, and limit before acting. For a remote device, that's the agent on that machine, under its own policy.
 
 ### Policy
@@ -103,7 +105,7 @@ Each tool call writes a sequence of JSONL events that share a `request_id`:
 | `completed` | The operation finished. `success` says whether it achieved its goal: for commands, exit code 0 and no timeout. A command that ran and exited 1 is `completed` with `success: false`. |
 | `exited` | A background session's process ended, with its exit code. |
 
-A `service_started` event records the policy and tool surface at startup. The audit log fails closed: if the `requested` or `started` event can't be written, the operation does not run. File content and stdin are logged only as a size and a hash, never the text.
+`requested` also records which `listener` the call came in on (`local` or `remote`), and the later events carry the caller's `client`, which is the OAuth client id for remote calls. A `service_started` event records the policy and tool surface at startup. The audit log fails closed: if the `requested` or `started` event can't be written, the operation does not run. File content and stdin are logged only as a size and a hash, never the text.
 
 ## Remote devices
 
@@ -213,14 +215,91 @@ copy configs\agent.windows.yaml configs\agent.yaml     # then set name, gateway.
 
 CI runs the whole suite on `windows-latest` as well as Ubuntu. That includes the gateway-and-agent tests and the CLI end-to-end test, plus Windows-only tests for job objects, alternate data streams, `.bat` refusal, ACLs, and the PowerShell and cmd shells.
 
+## Remote MCP clients (ChatGPT, Claude)
+
+ChatGPT and Claude reach MCP servers from their own clouds, so they need a public HTTPS URL and OAuth. ContextBridge provides both without a third-party identity provider (no Authentik, no hosted relay). The `remote` section of the gateway config adds a second MCP endpoint on its own loopback port. It accepts only OAuth access tokens, and a TLS tunnel publishes it.
+
+```
+ Claude / ChatGPT ──HTTPS──▶ tunnel (e.g. Tailscale Funnel) ──▶ 127.0.0.1:8793  remote listener (OAuth)
+ local MCP client ─────────────────────────────────────────────▶ 127.0.0.1:8791  local listener (static token)
+                                     both share one set of devices, policies, sessions, and audit log
+```
+
+### Setting it up
+
+1. **Fill in `remote`** in `configs/computer.yaml`:
+   - `public_url`: the HTTPS origin the tunnel serves, for example `https://friday.<tailnet>.ts.net`.
+   - `allow_scopes`: the most any remote client can ever be approved for. The default is `[computer:read]`.
+   - `allow_devices`: which devices remote clients can be offered. The default is `[local]`; `"*"` means every enrolled device.
+2. **Create the owner credentials.** Approving a remote client needs both a passphrase and a code from an authenticator app:
+
+   ```sh
+   contextbridge-admin --config configs/computer.yaml owner-init
+   ```
+
+   This prints a TOTP secret and an `otpauth://` URI to add to any authenticator app (`qrencode -t ansiutf8 '<uri>'` shows it as a QR code). It saves nothing until you type back a valid code.
+3. **Enable it and start the tunnel.** Set `remote.enabled: true`, restart `run-computer.sh`, then run:
+
+   ```sh
+   tailscale funnel --bg 8793    # https://friday.<tailnet>.ts.net → http://127.0.0.1:8793
+   ```
+
+   Any TLS-terminating tunnel or reverse proxy works the same way. The gateway won't start remote mode until the owner credentials exist.
+4. **Add the connector.** In Claude or ChatGPT, add a custom connector with the URL `https://friday.<tailnet>.ts.net/mcp`. The client registers itself and opens a ContextBridge consent page in your browser.
+5. **Approve on the consent page.**
+   - **Permissions.** Only `computer:read` starts ticked; anything more is a deliberate choice.
+   - **Devices.** Tick which devices this client may use.
+   - **Confirm.** Enter your passphrase and the current authenticator code.
+
+### Managing clients
+
+```sh
+contextbridge-admin --config configs/computer.yaml oauth-clients              # who has access, with what
+contextbridge-admin --config configs/computer.yaml oauth-revoke <client_id>   # or --all; next request fails
+contextbridge-admin --config configs/computer.yaml oauth-unlock               # clear a consent lockout
+```
+
+### How the remote endpoint is secured
+
+- **Owner consent on every authorization.** No client gets a token until you approve it on the consent page, which requires both the passphrase and a TOTP code.
+  - **Single-use codes.** A TOTP code works only once.
+  - **Lockout.** Five failures lock approvals for 15 minutes, and `oauth-unlock` clears the lock early. Anyone can trigger the lockout, but no one can get past it.
+  - **Stored hashed.** The passphrase is kept only as an scrypt hash.
+- **Least privilege.**
+  - **Per-client grants.** Each client gets only the scopes and devices you tick.
+  - **Config caps.** `remote.allow_scopes` and `remote.allow_devices` cap every grant. They are re-applied on every call, so narrowing the config and restarting narrows existing grants too.
+  - **Hidden tools.** A tool the client can't use is hidden from its tool list and refused if called.
+  - **Device policy still applies.** The device's own policy is enforced on top, exactly as for local calls.
+- **Standard OAuth 2.1 for MCP.** The endpoint follows the MCP authorization spec:
+  - **Discovery:** RFC 9728 protected-resource metadata and RFC 8414 authorization-server metadata.
+  - **Registration:** Dynamic Client Registration, accepted only for HTTPS redirect URIs on `remote.allowed_redirect_hosts` (Claude and ChatGPT by default).
+  - **PKCE:** S256 is required.
+  - **Bound tokens:** tokens are tied to this server's `/mcp` resource.
+- **Tokens.** Access tokens are opaque and short-lived (60 minutes by default). Refresh tokens rotate on every use, and presenting an already-rotated refresh token revokes the client's whole grant.
+  - **Hashed at rest.** Codes and tokens are stored only as SHA-256 hashes, in a 0600 state file the file tools can never read.
+  - **Live revocation.** A revocation from the CLI applies to the very next request.
+- **Separate listeners.**
+  - **Static token:** accepted only on the local listener.
+  - **OAuth tokens:** accepted only on the remote listener.
+  - **Host/Origin guard:** both listeners refuse requests whose `Host` or `Origin` isn't theirs, which blocks DNS rebinding. The remote listener also accepts the `public_url` name the tunnel forwards.
+- **Hardened consent page.** It sends a strict CSP (no scripts, no framing, form posts only to itself and the client's redirect origin) and `no-store`. Every value on it is HTML-escaped.
+- **Audit.** These events are written to the computer audit log: `oauth_client_registered`, `oauth_authorization_requested`, `oauth_consent_granted` / `_denied` / `_failed`, `oauth_token_issued`, `oauth_token_refreshed`, `oauth_refresh_reuse_detected`, and `oauth_grant_revoked`.
+
+**Know the boundary.**
+- **Commands can reach the secrets.** Granting a remote client `computer:execute` on a device lets it run whatever that device's command policy allows. If that includes a shell, it can read the gateway's secrets the same way any command could.
+- **Keep remote clients read-only** unless you need more, and prefer `allowlist` mode.
+- **Device names are visible.** The consent page shows the names of the devices you allow remotely to anyone who starts an authorization.
+
 ## Network exposure
 
-Neither route includes an OAuth server or a public HTTPS listener, and neither depends on Authentik.
+Neither route depends on Authentik.
 - **Knowledge route:** binds to loopback by default.
-- **Computer MCP endpoint:** refuses any non-loopback address; there is no override.
-- **Agent listener:** the only network-facing piece. It is TLS-only, limited to private addresses, and accepts only enrolled devices.
+- **Computer MCP endpoints:** refuse any non-loopback address; there is no override.
+  - **Local listener (8791):** accepts only the static token.
+  - **Remote listener (8793):** accepts only OAuth tokens. It is meant to be published only through a TLS tunnel.
+- **Agent listener:** TLS-only, limited to private addresses, and accepts only enrolled devices.
 
-Do not forward ports 8790, 8791, or 8792 to the internet.
+Do not forward ports 8790, 8791, or 8792 to the internet. Publish 8793 only through a TLS tunnel, and only once `owner-init` is done.
 
 ## Roadmap
 
@@ -228,7 +307,7 @@ Do not forward ports 8790, 8791, or 8792 to the internet.
 2. ~~Local policy enforcement, execution limits, tests~~
 3. ~~Remote agent transport and device registration (outbound agent connections, heartbeats, revocation)~~
 4. ~~Windows agent for Thanatos (native agent, job-object process trees, scheduled-task install, Windows CI)~~
-5. Authenticated remote MCP endpoint for ChatGPT and Claude (OAuth front end, per-device permissions)
+5. ~~Authenticated remote MCP endpoint for ChatGPT and Claude (OAuth front end, per-device permissions)~~
 6. Failover acceptance test with Desktop Commander fully stopped
 
 ## Documentation

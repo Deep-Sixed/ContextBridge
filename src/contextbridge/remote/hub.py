@@ -162,10 +162,12 @@ class AgentHub:
                 return conn
         return None
 
-    def online_tools(self) -> frozenset[str]:
+    def online_tools(self, devices: frozenset[str] | None = None) -> frozenset[str]:
+        """Tools offered by connected devices (only those named in ``devices``, unless None)."""
         tools: set[str] = set()
         for conn in self._connections.values():
-            tools |= conn.tools
+            if devices is None or conn.device.name in devices:
+                tools |= conn.tools
         return frozenset(tools)
 
     def describe(self) -> list[dict[str, Any]]:
