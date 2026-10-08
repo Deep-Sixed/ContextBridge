@@ -21,7 +21,19 @@ import httpx
 import pytest
 import yaml
 from fastmcp.exceptions import ToolError
-from helpers import IS_WINDOWS, PY, REPO, call, cli, free_port, isolated_env, python_cmd, serve
+from helpers import (
+    IS_WINDOWS,
+    PY,
+    REPO,
+    call,
+    cli,
+    free_port,
+    isolated_env,
+    python_cmd,
+    read_log,
+    serve,
+    spawn_logged,
+)
 
 from contextbridge.computer.server import main as computer_main
 
@@ -298,6 +310,7 @@ def test_remote_agent_end_to_end(tmp_path, workspace):
                     "tls_key": "state/tls/gateway.key",
                     "registry": "state/devices.json",
                     "heartbeat_seconds": 2,
+                    "call_timeout_seconds": 60,
                 },
             }
         ),
@@ -339,13 +352,9 @@ def test_remote_agent_end_to_end(tmp_path, workspace):
         )  # identity exists → refused locally
         assert reused.returncode != 0
 
-        agent_proc = subprocess.Popen(
-            [sys.executable, "-m", *agent, "run", "--config", str(agent_config)],
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        agent_log = tmp_path / "agent.stderr.log"
+        agent_cmd = [sys.executable, "-m", *agent, "run", "--config", str(agent_config)]
+        agent_proc = spawn_logged(agent_cmd, env=env, log=agent_log)
         try:
 
             async def wait_online(client):
@@ -378,7 +387,7 @@ def test_remote_agent_end_to_end(tmp_path, workspace):
             revoked = cli(*admin, "revoke", "thanatos", env=env)
             assert revoked.returncode == 0, revoked.stderr
             assert agent_proc.wait(timeout=15) != 0
-            assert "revoked" in agent_proc.stderr.read()
+            assert "revoked" in read_log(agent_log)
 
             async def after(client):
                 devices = (await client.call_tool("list_devices", {})).structured_content["devices"]

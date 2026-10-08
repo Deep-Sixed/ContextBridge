@@ -26,7 +26,8 @@ jobs:
       - name: Install
         run: python -m pip install -e ".[test]"
       - name: Test
-        run: python -m pytest -q -rs
+        # faulthandler dumps every thread's stack if a test runs over 4 minutes, so a hang is diagnosable.
+        run: python -m pytest -q -rs -o faulthandler_timeout=240
       - name: Check PowerShell scripts
         if: runner.os == 'Windows'
         shell: pwsh

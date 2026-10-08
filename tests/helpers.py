@@ -80,20 +80,29 @@ def isolated_env(**extra: str) -> dict[str, str]:
     return env
 
 
+def spawn_logged(args: list[str], *, env: dict[str, str], log: Path) -> subprocess.Popen[bytes]:
+    """Start a process with stderr going to ``log``.
+
+    Never an unread pipe: a Windows pipe buffer holds about 4 KB, and a gateway
+    or agent echoing audit lines would block on its next write.
+    """
+    with log.open("wb") as fh:
+        return subprocess.Popen(args, env=env, stdout=subprocess.DEVNULL, stderr=fh)
+
+
+def read_log(log: Path) -> str:
+    return log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
+
+
 @contextmanager
 def serve(module: str, config: Path, port: int, env: dict[str, str]) -> Iterator[str]:
-    proc = subprocess.Popen(
-        [sys.executable, "-m", module, "--config", str(config)],
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    log = config.with_name(f"{config.stem}.{module}.stderr.log")
+    proc = spawn_logged([sys.executable, "-m", module, "--config", str(config)], env=env, log=log)
     try:
         deadline = time.monotonic() + 60
         while True:
             if proc.poll() is not None:
-                raise AssertionError(f"{module} exited early:\n{proc.stderr.read()}")
+                raise AssertionError(f"{module} exited early:\n{read_log(log)}")
             try:
                 with socket.create_connection(("127.0.0.1", port), timeout=0.2):
                     break
