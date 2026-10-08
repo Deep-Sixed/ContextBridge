@@ -4,16 +4,27 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "contextbridge"
-version = "0.2.0"
+version = "0.3.0"
 description = "Self-hosted MCP gateway for approved project context and policy-controlled computer access"
 requires-python = ">=3.11"
-dependencies = ["fastmcp>=3,<4", "mcp", "anyio", "pyyaml", "starlette", "psutil>=5.9"]
+dependencies = [
+    "fastmcp>=3,<4",
+    "mcp",
+    "anyio",
+    "pyyaml",
+    "starlette",
+    "psutil>=5.9",
+    "websockets>=13",
+    "cryptography>=42",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 
 [project.scripts]
 contextbridge-computer = "contextbridge.computer.server:main"
+contextbridge-agent = "contextbridge.remote.agent:main"
+contextbridge-admin = "contextbridge.remote.admin:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

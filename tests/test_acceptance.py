@@ -334,3 +334,131 @@ def test_no_desktop_commander_dependency():
         if pattern.search(path.read_text(encoding="utf-8"))
     ]
     assert offenders == []
+
+
+# ------------------------------------------------------- Phase 3: remote agents
+
+
+def _cli(module: str, *args: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", module, *args], env=env, capture_output=True, text=True, timeout=60, check=False
+    )
+
+
+def test_remote_agent_end_to_end(tmp_path, workspace):
+    """Pair, enroll, and serve a remote device over TLS using only the shipped CLIs, then revoke it."""
+    mcp_port, agent_port = _free_port(), _free_port()
+    gateway_config = tmp_path / "gateway.yaml"
+    gateway_config.write_text(
+        yaml.safe_dump(
+            {
+                "serve": {"host": "127.0.0.1", "port": mcp_port, "audit_log": "audit/gateway.jsonl"},
+                "agents": {
+                    "enabled": True,
+                    "host": "127.0.0.1",
+                    "port": agent_port,
+                    "tls_cert": "state/tls/gateway.crt",
+                    "tls_key": "state/tls/gateway.key",
+                    "registry": "state/devices.json",
+                    "heartbeat_seconds": 2,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    env = _isolated_env()
+    admin = ("contextbridge.remote.admin", "--config", str(gateway_config))
+
+    tls = _cli(*admin, "tls-init", "--hostname", "localhost", "--ip", "127.0.0.1", env=env)
+    assert tls.returncode == 0, tls.stderr
+    fingerprint = re.search(r"fingerprint: (sha256:[0-9A-F:]+)", tls.stdout).group(1)
+    pair = _cli(*admin, "pair", "thanatos", env=env)
+    assert pair.returncode == 0, pair.stderr
+    code = re.search(r"Enrollment code for thanatos: (\S+)", pair.stdout).group(1)
+    assert fingerprint in pair.stdout
+
+    agent_config = tmp_path / "agent.yaml"
+    agent_config.write_text(
+        yaml.safe_dump(
+            {
+                "name": "thanatos",
+                "gateway": {"url": f"wss://127.0.0.1:{agent_port}", "fingerprint": fingerprint},
+                "identity": "agent-state/identity.json",
+                "audit_log": "audit/agent.jsonl",
+                "filesystem": {"roots": [str(workspace)], "writable_roots": [str(workspace / "work")]},
+                "commands": {"mode": "allowlist", "allow": ["echo", "ls"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    agent = ("contextbridge.remote.agent",)
+
+    gateway_env = _isolated_env(CONTEXTBRIDGE_COMPUTER_TOKEN=COMPUTER_TOKEN)
+    with serve("contextbridge.computer", gateway_config, mcp_port, gateway_env) as url:
+        enrolled = _cli(*agent, "enroll", "--config", str(agent_config), "--code", code, env=env)
+        assert enrolled.returncode == 0, enrolled.stderr
+        reused = _cli(
+            *agent, "enroll", "--config", str(agent_config), "--code", code, env=env
+        )  # identity exists → refused locally
+        assert reused.returncode != 0
+
+        agent_proc = subprocess.Popen(
+            [sys.executable, "-m", *agent, "run", "--config", str(agent_config)],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+
+            async def wait_online(client):
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline:
+                    devices = (await client.call_tool("list_devices", {})).structured_content["devices"]
+                    if devices and devices[0]["online"]:
+                        return devices
+                    await anyio.sleep(0.2)
+                raise AssertionError("agent never came online")
+
+            async def use(client):
+                devices = await wait_online(client)
+                text = await client.call_tool("read_file", {"path": "docs/notes.md", "device": "thanatos"})
+                echoed = await client.call_tool("run_command", {"command": "echo remote", "device": "thanatos"})
+                with pytest.raises(ToolError, match="Denied by policy"):
+                    await client.call_tool("read_file", {"path": "../outside.txt", "device": "thanatos"})
+                with pytest.raises(ToolError, match="Denied by policy"):
+                    await client.call_tool("run_command", {"command": "touch pwned", "device": "thanatos"})
+                return devices, text.structured_content, echoed.structured_content
+
+            devices, text, echoed = call(url, COMPUTER_TOKEN, use)
+            assert devices[0]["device"] == "thanatos" and devices[0]["info"]["platform"]
+            assert text["content"] == "alpha\nbeta\ngamma\n"
+            assert echoed["stdout"] == "remote\n"
+            assert not (workspace / "pwned").exists()
+
+            revoked = _cli(*admin, "revoke", "thanatos", env=env)
+            assert revoked.returncode == 0, revoked.stderr
+            assert agent_proc.wait(timeout=15) != 0
+            assert "revoked" in agent_proc.stderr.read()
+
+            async def after(client):
+                devices = (await client.call_tool("list_devices", {})).structured_content["devices"]
+                with pytest.raises(ToolError, match="Unknown device"):
+                    await client.call_tool("read_file", {"path": "docs/notes.md", "device": "thanatos"})
+                return devices
+
+            assert call(url, COMPUTER_TOKEN, after) == []
+        finally:
+            if agent_proc.poll() is None:
+                agent_proc.kill()
+            agent_proc.wait()
+
+    gateway_events = [json.loads(line) for line in (tmp_path / "audit" / "gateway.jsonl").read_text().splitlines()]
+    agent_events = [json.loads(line) for line in (tmp_path / "audit" / "agent.jsonl").read_text().splitlines()]
+    kinds = {e["event"] for e in gateway_events}
+    assert {"device_enrolled", "device_connected", "device_revoked", "device_disconnected"} <= kinds
+    remote_ids = {e["request_id"] for e in gateway_events if e.get("device") == "thanatos" and "request_id" in e}
+    agent_ids = {e["request_id"] for e in agent_events if "request_id" in e}
+    assert remote_ids & agent_ids  # the same request is traceable on both machines
+    identity = tmp_path / "agent-state" / "identity.json"
+    assert oct(identity.stat().st_mode & 0o777) == "0o600"

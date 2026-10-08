@@ -17,10 +17,12 @@ raised, and an operation whose ``requested`` or ``started`` event fails never ru
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import threading
 import time
+from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,11 +33,58 @@ class AuditError(RuntimeError):
     """Raised when an audit event cannot be written."""
 
 
+_AUDITED_ARGS = (
+    "path",
+    "source",
+    "destination",
+    "command",
+    "cwd",
+    "pattern",
+    "file_pattern",
+    "mode",
+    "session_id",
+    "pid",
+    "force",
+    "timeout_seconds",
+    "device",
+)
+_DIGESTED_ARGS = ("content", "old_string", "new_string", "input")
+_OUTCOME_FIELDS = ("pid", "session_id", "exit_code", "timed_out", "stdout_truncated", "stderr_truncated")
+MAX_AUDIT_VALUE = 1000
+
+
+def summarize_args(arguments: dict[str, Any] | None) -> dict[str, Any]:
+    """Audit-safe view of tool arguments: paths and commands verbatim, content as size + hash."""
+    fields: dict[str, Any] = {}
+    args = arguments if isinstance(arguments, dict) else {}
+    for key in _AUDITED_ARGS:
+        value = args.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str) and len(value) > MAX_AUDIT_VALUE:
+            value = value[: MAX_AUDIT_VALUE - 3] + "..."
+        fields[key] = value
+    for key in _DIGESTED_ARGS:
+        value = args.get(key)
+        if isinstance(value, str):
+            data = value.encode("utf-8")
+            fields[f"{key}_bytes"] = len(data)
+            fields[f"{key}_sha256"] = hashlib.sha256(data).hexdigest()[:16]
+    return fields
+
+
+def outcome_fields(result: Any) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        return {}
+    return {k: result[k] for k in _OUTCOME_FIELDS if k in result}
+
+
 class ComputerAuditLog:
     """Append-only JSONL audit sink shared by tool calls and session threads."""
 
-    def __init__(self, path: str | Path | None, *, echo: bool = True) -> None:
+    def __init__(self, path: str | Path | None, *, route: str = "computer", echo: bool = True) -> None:
         self.path = Path(path) if path else None
+        self.route = route
         self._echo = echo
         self._lock = threading.Lock()
         self._fh: TextIO | None = None
@@ -49,7 +98,7 @@ class ComputerAuditLog:
     def record(self, event: str, **fields: Any) -> None:
         entry: dict[str, Any] = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "route": "computer",
+            "route": self.route,
             "event": event,
         }
         entry.update({k: v for k, v in fields.items() if v is not None})
@@ -62,7 +111,7 @@ class ComputerAuditLog:
                 except (OSError, ValueError) as exc:
                     raise AuditError(f"Cannot write audit log {self.path}: {exc}") from exc
             if self._echo:
-                print(f"[computer audit] {line}", file=sys.stderr, flush=True)
+                print(f"[{self.route} audit] {line}", file=sys.stderr, flush=True)
 
     def close(self) -> None:
         with self._lock:
@@ -79,10 +128,23 @@ class CallAudit:
     request_id: str
     tool: str
     client: str | None
+    device: str | None = None
+    on_started: Callable[[dict[str, Any]], None] | None = None
     started: bool = False
 
     def emit(self, event: str, **fields: Any) -> None:
-        self.log.record(event, request_id=self.request_id, tool=self.tool, client=self.client, **fields)
+        self.log.record(
+            event, request_id=self.request_id, tool=self.tool, device=self.device, client=self.client, **fields
+        )
+
+    def mark_started(self, **fields: Any) -> None:
+        """Record ``started`` once; ``on_started`` (e.g. telling the gateway) must succeed too."""
+        if self.started:
+            return
+        self.emit("started", **fields)
+        if self.on_started is not None:
+            self.on_started(fields)
+        self.started = True
 
 
 _current_call: ContextVar[CallAudit | None] = ContextVar("contextbridge_current_call", default=None)
@@ -107,7 +169,5 @@ def mark_started(**fields: Any) -> None:
     tool call (direct engine use in tests or scripts) it does nothing.
     """
     call = _current_call.get()
-    if call is None or call.started:
-        return
-    call.emit("started", **fields)
-    call.started = True
+    if call is not None:
+        call.mark_started(**fields)

@@ -91,6 +91,7 @@ class ComputerPolicy:
     writable_roots: tuple[Path, ...] = ()
     deny: tuple[str, ...] = DEFAULT_DENY
     protected: frozenset[Path] = frozenset()
+    hidden: frozenset[Path] = frozenset()
     max_read_bytes: int = 1024 * 1024
     max_write_bytes: int = 1024 * 1024
     max_results: int = 500
@@ -139,7 +140,7 @@ class ComputerPolicy:
         if _within(resolved, roots) is None:
             kind = "writable" if write else "readable"
             raise PolicyViolation(f"{raw} is outside the {kind} roots of this computer.")
-        if self._is_denied(resolved):
+        if self._is_denied(resolved) or resolved in self.hidden:
             raise PolicyViolation(f"{raw} matches a denied path pattern.")
         if write and resolved in self.protected:
             raise PolicyViolation(f"{raw} is protected and cannot be modified through ContextBridge.")
@@ -149,7 +150,7 @@ class ComputerPolicy:
         """Refuse to move a root, or a directory holding a protected path, out from under the policy."""
         if source in self.roots or source in self.writable_roots:
             raise PolicyViolation(f"{source} is a configured root and cannot be moved.")
-        if any(p.is_relative_to(source) for p in self.protected):
+        if any(p.is_relative_to(source) for p in self.protected | self.hidden):
             raise PolicyViolation(f"{source} contains a protected path and cannot be moved.")
 
     def is_visible(self, path: Path) -> bool:
@@ -263,8 +264,14 @@ def _str_list(section: dict[str, Any], key: str, default: tuple[str, ...] = ()) 
     return tuple(value)
 
 
-def load_policy(cfg: dict[str, Any], *, protected: tuple[str | Path, ...] = ()) -> ComputerPolicy:
-    """Build a :class:`ComputerPolicy` from the ``filesystem``/``commands``/``processes`` sections."""
+def load_policy(
+    cfg: dict[str, Any], *, protected: tuple[str | Path, ...] = (), hidden: tuple[str | Path, ...] = ()
+) -> ComputerPolicy:
+    """Build a :class:`ComputerPolicy` from the ``filesystem``/``commands``/``processes`` sections.
+
+    ``protected`` paths can be read but never written or moved (config, audit log).
+    ``hidden`` paths can never be read, listed, written, or moved (private keys, device registry).
+    """
     fs = cfg.get("filesystem") or {}
     cmds = cfg.get("commands") or {}
     procs = cfg.get("processes") or {}
@@ -308,7 +315,8 @@ def load_policy(cfg: dict[str, Any], *, protected: tuple[str | Path, ...] = ()) 
         roots=tuple(roots),
         writable_roots=tuple(writable),
         deny=_str_list(fs, "deny", DEFAULT_DENY),
-        protected=frozenset(_real(p) for p in protected if p),
+        protected=frozenset(_real(p) for p in (*protected, *hidden) if p),
+        hidden=frozenset(_real(p) for p in hidden if p),
         max_read_bytes=_positive(fs, "max_read_bytes", 1024 * 1024),
         max_write_bytes=_positive(fs, "max_write_bytes", 1024 * 1024),
         max_results=_positive(fs, "max_results", 500),

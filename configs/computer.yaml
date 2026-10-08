@@ -12,6 +12,22 @@ auth:
   # Scopes granted to the token, checked on every tool call. Remove one to withhold it.
   scopes: [computer:read, computer:write, computer:execute, computer:process]
 
+agents:
+  # Remote agents (other machines) dial in here. Off until you set it up:
+  #   contextbridge-admin --config configs/computer.yaml tls-init --hostname friday --ip <this host's LAN/Tailscale IP>
+  #   contextbridge-admin --config configs/computer.yaml pair thanatos
+  enabled: false
+  host: 127.0.0.1          # a specific loopback, LAN, or Tailscale IP; never 0.0.0.0 or a public address
+  port: 8792
+  tls_cert: ../state/tls/gateway.crt   # required unless host is loopback
+  tls_key: ../state/tls/gateway.key    # hidden from every file tool
+  registry: ../state/devices.json      # enrolled devices; hidden from every file tool
+  heartbeat_seconds: 15    # a device is dropped after 3 missed heartbeats
+  call_timeout_seconds: 660
+
+# The sections below configure the "local" device: this machine.
+# Remove filesystem/commands/processes entirely to run a gateway with no local device.
+
 filesystem:
   roots:                   # readable; relative paths resolve against the first entry
     - "~"

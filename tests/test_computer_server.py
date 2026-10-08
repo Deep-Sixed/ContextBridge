@@ -18,6 +18,7 @@ from contextbridge.computer.server import (
     COMMAND_TOOLS,
     READ_TOOLS,
     SCOPE_READ,
+    SERVER_TOOLS,
     TOOL_SCOPES,
     WRITE_TOOLS,
     AuthorizationError,
@@ -79,20 +80,25 @@ def test_read_only_policy_exposes_only_read_tools(workspace, audit):
     policy = load_policy({"filesystem": {"roots": [str(workspace)]}, "processes": {"list": False}})
     server = create_computer_server(policy, audit=audit, authorize=allow_scopes(*ALL_SCOPES))
     assert computer_tool_names(policy) == READ_TOOLS
-    assert advertised_tool_names(server) == READ_TOOLS
+    assert advertised_tool_names(server) == SERVER_TOOLS  # registered once; filtered per caller and device
 
     async def listed(client):
         return {t.name for t in await client.list_tools()}
 
-    assert run(server, listed) == READ_TOOLS
+    assert run(server, listed) == READ_TOOLS | {"list_devices"}
 
 
 def test_full_policy_surface(make_policy, audit):
     policy = make_policy(processes={"allow_kill": True})
     expected = READ_TOOLS | WRITE_TOOLS | COMMAND_TOOLS | {"list_processes", "kill_process"}
     assert computer_tool_names(policy) == expected
-    assert set(TOOL_SCOPES) == expected
-    assert advertised_tool_names(create_computer_server(policy, audit=audit)) == expected
+    assert set(TOOL_SCOPES) == expected | {"list_devices"} == SERVER_TOOLS
+    server = create_computer_server(policy, audit=audit, authorize=allow_scopes(*ALL_SCOPES))
+
+    async def listed(client):
+        return {t.name for t in await client.list_tools()}
+
+    assert run(server, listed) == SERVER_TOOLS
 
 
 def test_tool_annotations(policy, audit):

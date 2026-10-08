@@ -1,25 +1,30 @@
 """ContextBridge computer route — an MCP server for policy-controlled computer access.
 
-Three independent gates apply to every tool call, at the moment it executes:
+Tool calls go to a *device*: ``local`` (this machine, under this config's policy)
+or a remote agent registered with the gateway. Gates applied to every call, at
+the moment it executes:
 
-1. **Policy surface** — only tools the local policy enables are registered.
-2. **Authorization** — the caller's bearer token must carry the tool's scope.
-3. **Policy checks** — the engine re-validates paths, commands, and limits.
+1. **Token scope** — the caller's bearer token must carry the tool's scope.
+2. **Device** — the device must exist, be online, be granted that scope in the
+   device registry, and advertise the tool.
+3. **Policy** — the device's own engine re-validates paths, commands, and limits.
+   For remote devices that is the agent, under the agent's local policy.
 
 Every call is audited as ``requested`` → ``denied``/``failed`` or
 ``requested`` → ``started`` → ``completed`` (see :mod:`.audit`).
 
-The route serves HTTP on a loopback address only and refuses to start without
-its own credential and a writable audit log.
+The MCP endpoint serves HTTP on a loopback address only. The optional agent
+listener may bind a LAN or overlay address, but only with TLS.
 """
 
 from __future__ import annotations
 
 import argparse
-import atexit
-import hashlib
-import ipaddress
+import contextlib
+import functools
 import os
+import platform
+import socket
 import sys
 import time
 import uuid
@@ -36,17 +41,41 @@ from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.tools.tool import Tool
 from mcp.types import ToolAnnotations
 
-from . import commands, files
-from .audit import AuditError, CallAudit, ComputerAuditLog, bind_call, unbind_call
-from .commands import CommandError, SessionManager
+from ..net import is_loopback, is_private_bind
+from .audit import (
+    MAX_AUDIT_VALUE,
+    AuditError,
+    CallAudit,
+    ComputerAuditLog,
+    bind_call,
+    current_call,
+    mark_started,
+    outcome_fields,
+    summarize_args,
+    unbind_call,
+)
+from .commands import CommandError
+from .dispatch import (
+    COMMAND_TOOLS,
+    ENGINE_TOOLS,
+    PROCESS_KILL_TOOL,
+    PROCESS_LIST_TOOL,
+    READ_TOOLS,
+    WRITE_TOOLS,
+    Engine,
+    InvalidArguments,
+    available_tools,
+    call_succeeded,
+)
 from .files import FileOperationError
 from .policy import ComputerPolicy, PolicyError, PolicyViolation, load_policy
-from .system import system_info
 
 TOKEN_ENV = "CONTEXTBRIDGE_COMPUTER_TOKEN"
 KNOWLEDGE_TOKEN_ENV = "MCP_AUTH_TOKEN"
 CLIENT_ID = "contextbridge-computer"
 MIN_TOKEN_LENGTH = 32
+LOCAL_DEVICE = "local"
+LIST_DEVICES_TOOL = "list_devices"
 
 SCOPE_READ = "computer:read"
 SCOPE_WRITE = "computer:write"
@@ -54,44 +83,26 @@ SCOPE_EXECUTE = "computer:execute"
 SCOPE_PROCESS = "computer:process"
 ALL_SCOPES = (SCOPE_READ, SCOPE_WRITE, SCOPE_EXECUTE, SCOPE_PROCESS)
 
-READ_TOOLS = frozenset(
-    {"list_directory", "read_file", "get_file_info", "search_files", "search_code", "get_system_info"}
-)
-WRITE_TOOLS = frozenset({"write_file", "edit_block", "create_directory", "move_file"})
-COMMAND_TOOLS = frozenset(
-    {"run_command", "start_process", "read_process_output", "interact_with_process", "force_terminate", "list_sessions"}
-)
-
 TOOL_SCOPES: dict[str, str] = {
     **{name: SCOPE_READ for name in READ_TOOLS},
-    "list_processes": SCOPE_READ,
+    PROCESS_LIST_TOOL: SCOPE_READ,
+    LIST_DEVICES_TOOL: SCOPE_READ,
     **{name: SCOPE_WRITE for name in WRITE_TOOLS},
     **{name: SCOPE_EXECUTE for name in COMMAND_TOOLS},
-    "kill_process": SCOPE_PROCESS,
+    PROCESS_KILL_TOOL: SCOPE_PROCESS,
 }
-
-_AUDITED_ARGS = (
-    "path",
-    "source",
-    "destination",
-    "command",
-    "cwd",
-    "pattern",
-    "file_pattern",
-    "mode",
-    "session_id",
-    "pid",
-    "force",
-    "timeout_seconds",
-)
-_DIGESTED_ARGS = ("content", "old_string", "new_string", "input")
-_OUTCOME_FIELDS = ("pid", "session_id", "exit_code", "timed_out", "stdout_truncated", "stderr_truncated")
-_MAX_AUDIT_VALUE = 1000
+SERVER_TOOLS = ENGINE_TOOLS | {LIST_DEVICES_TOOL}
 
 _READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
 _WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False)
 _ADDITIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False)
 _EXECUTE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True)
+_DEVICE_DOC = " device: 'local' (default) or a name from list_devices."
+
+
+def computer_tool_names(policy: ComputerPolicy) -> frozenset[str]:
+    """The tools ``policy`` enables on a device."""
+    return available_tools(policy)
 
 
 class AuthorizationError(PermissionError):
@@ -118,57 +129,90 @@ def token_authorizer(tool: str) -> str:
     return token.client_id
 
 
-def computer_tool_names(policy: ComputerPolicy) -> frozenset[str]:
-    """The exact tool surface ``policy`` permits."""
-    names = set(READ_TOOLS)
-    if policy.can_write:
-        names |= WRITE_TOOLS
-    if policy.commands_enabled:
-        names |= COMMAND_TOOLS
-    if policy.list_processes:
-        names.add("list_processes")
-    if policy.allow_kill:
-        names.add("kill_process")
-    return frozenset(names)
+# --------------------------------------------------------------------- devices
 
 
-def _call(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-    """Run an engine function, turning expected failures into client-facing ToolErrors."""
+class DeviceRouter:
+    """Sends each tool call to the local engine or to a remote agent."""
+
+    def __init__(self, local: Engine | None, hub: Any | None) -> None:
+        self.local = local
+        self.hub = hub
+
+    def available_tools(self) -> frozenset[str]:
+        tools = set(self.local.tools) if self.local else set()
+        if self.hub is not None:
+            tools |= self.hub.online_tools()
+        return frozenset(tools)
+
+    def check(self, device: str, tool: str) -> None:
+        """Raise AuthorizationError (denied) or DeviceUnavailable (failed) unless the call may proceed."""
+        if device == LOCAL_DEVICE:
+            if self.local is None:
+                raise AuthorizationError("This gateway has no local device; choose one from list_devices.")
+            if tool not in self.local.tools:
+                raise AuthorizationError(f"Tool '{tool}' is not permitted on this computer.")
+            return
+        from ..remote.hub import DeviceUnavailable
+        from ..remote.registry import RegistryError
+
+        if self.hub is None:
+            raise AuthorizationError(f"Unknown device '{device}'.")
+        with contextlib.suppress(RegistryError, OSError):
+            self.hub.registry.refresh()  # a revocation applies to the very next call
+        record = self.hub.registry.by_name(device)
+        if record is None:
+            raise AuthorizationError(f"Unknown device '{device}'.")
+        if TOOL_SCOPES[tool] not in record.scopes:
+            raise AuthorizationError(f"Device '{device}' is not authorized for '{tool}' (needs {TOOL_SCOPES[tool]}).")
+        conn = self.hub.connection(device)
+        if conn is None:
+            raise DeviceUnavailable(f"Device '{device}' is offline.")
+        if tool not in conn.tools:
+            raise AuthorizationError(f"Tool '{tool}' is not enabled on device '{device}'.")
+
+    async def call(self, device: str, tool: str, args: dict[str, Any]) -> dict[str, Any]:
+        if device == LOCAL_DEVICE:
+            return await anyio.to_thread.run_sync(self.local.execute, tool, args)
+        return await self.hub.call(device, tool, args, current_call())
+
+    def describe(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        if self.local is not None:
+            rows.append(
+                {
+                    "device": LOCAL_DEVICE,
+                    "online": True,
+                    "tools": sorted(self.local.tools),
+                    "policy": self.local.policy.summary(),
+                    "info": {"hostname": socket.gethostname(), "platform": f"{platform.system()} {platform.release()}"},
+                }
+            )
+        if self.hub is not None:
+            rows.extend(self.hub.describe())
+        return rows
+
+
+def _device_errors() -> tuple[type[Exception], ...]:
+    from ..remote.hub import DeviceUnavailable, RemoteFailed
+
+    return (DeviceUnavailable, RemoteFailed)
+
+
+async def _invoke(router: DeviceRouter, device: str, tool: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Run a tool call, turning expected failures into client-facing ToolErrors."""
     try:
-        return fn(*args, **kwargs)
+        return await router.call(device, tool, args)
     except PolicyViolation as exc:
         raise ToolError(f"Denied by policy: {exc}") from exc
     except AuditError as exc:
         raise ToolError(f"Audit log unavailable; operation refused: {exc}") from exc
-    except (FileNotFoundError, FileOperationError, CommandError, UnicodeDecodeError) as exc:
+    except (FileNotFoundError, FileOperationError, CommandError, UnicodeDecodeError, InvalidArguments) as exc:
+        raise ToolError(str(exc)) from exc
+    except _device_errors() as exc:
         raise ToolError(str(exc)) from exc
     except OSError as exc:
         raise ToolError(f"{type(exc).__name__}: {exc.strerror or exc}") from exc
-
-
-def _audit_fields(arguments: dict[str, Any] | None) -> dict[str, Any]:
-    fields: dict[str, Any] = {}
-    for key in _AUDITED_ARGS:
-        value = (arguments or {}).get(key)
-        if value is None:
-            continue
-        if isinstance(value, str) and len(value) > _MAX_AUDIT_VALUE:
-            value = value[: _MAX_AUDIT_VALUE - 3] + "..."
-        fields[key] = value
-    for key in _DIGESTED_ARGS:
-        value = (arguments or {}).get(key)
-        if isinstance(value, str):
-            data = value.encode("utf-8")
-            fields[f"{key}_bytes"] = len(data)
-            fields[f"{key}_sha256"] = hashlib.sha256(data).hexdigest()[:16]
-    return fields
-
-
-def _succeeded(tool: str, structured: dict[str, Any]) -> bool:
-    """Whether a call that returned normally achieved its goal."""
-    if tool == "run_command":
-        return structured.get("exit_code") == 0 and not structured.get("timed_out")
-    return True
 
 
 def _elapsed_ms(started: float) -> int:
@@ -178,22 +222,28 @@ def _elapsed_ms(started: float) -> int:
 class ComputerPolicyMiddleware(Middleware):
     """Authorize and audit every call at execution time; hide tools the caller cannot use."""
 
-    def __init__(self, allowed: frozenset[str], audit: ComputerAuditLog, authorize: Authorizer) -> None:
-        self._allowed = allowed
+    def __init__(self, router: DeviceRouter, audit: ComputerAuditLog, authorize: Authorizer) -> None:
+        self._router = router
         self._audit = audit
         self._authorize = authorize
 
-    def _check(self, name: str) -> str:
-        if name not in self._allowed:
+    def _check(self, name: str, device: str | None) -> str:
+        if name not in SERVER_TOOLS:
             raise AuthorizationError(f"Tool '{name}' is not permitted on this computer.")
-        return self._authorize(name)
+        client = self._authorize(name)
+        if name != LIST_DEVICES_TOOL:
+            self._router.check(device or LOCAL_DEVICE, name)
+        return client
 
     async def on_list_tools(self, context: MiddlewareContext[Any], call_next: Any) -> Sequence[Tool]:
         tools = await call_next(context)
+        offered = self._router.available_tools() | {LIST_DEVICES_TOOL}
         visible = []
         for tool in tools:
+            if tool.name not in offered:
+                continue
             try:
-                self._check(tool.name)
+                self._authorize(tool.name)
             except AuthorizationError:
                 continue
             visible.append(tool)
@@ -203,19 +253,27 @@ class ComputerPolicyMiddleware(Middleware):
         started = time.monotonic()
         request_id = uuid.uuid4().hex[:16]
         name = str(getattr(context.message, "name", None) or "<unknown>")
-        fields = _audit_fields(getattr(context.message, "arguments", None))
+        arguments = getattr(context.message, "arguments", None) or {}
+        device = arguments.get("device") if isinstance(arguments.get("device"), str) else None
+        if name != LIST_DEVICES_TOOL:
+            device = device or LOCAL_DEVICE
+        fields = summarize_args(arguments)
+        fields.pop("device", None)
         try:
-            self._audit.record("requested", request_id=request_id, tool=name, **fields)
+            self._audit.record("requested", request_id=request_id, tool=name, device=device, **fields)
         except AuditError as exc:
             raise ToolError(f"Audit log unavailable; refusing to run '{name}'.") from exc
 
         try:
-            client = self._check(name)
+            client = self._check(name, device)
         except AuthorizationError as exc:
-            self._audit.record("denied", request_id=request_id, tool=name, reason=str(exc))
+            self._audit.record("denied", request_id=request_id, tool=name, device=device, reason=str(exc))
+            raise ToolError(str(exc)) from exc
+        except _device_errors() as exc:
+            self._audit.record("failed", request_id=request_id, tool=name, device=device, reason=str(exc))
             raise ToolError(str(exc)) from exc
 
-        call = CallAudit(self._audit, request_id, name, client)
+        call = CallAudit(self._audit, request_id, name, client, device=device)
         binding = bind_call(call)
         try:
             result = await call_next(context)
@@ -231,7 +289,7 @@ class ComputerPolicyMiddleware(Middleware):
                 event,
                 success=False if event == "completed" else None,
                 detail=type(cause).__name__,
-                reason=str(exc)[:_MAX_AUDIT_VALUE],
+                reason=str(exc)[:MAX_AUDIT_VALUE],
                 elapsed_ms=_elapsed_ms(started),
             )
             raise
@@ -239,61 +297,92 @@ class ComputerPolicyMiddleware(Middleware):
             unbind_call(binding)
 
         structured = getattr(result, "structured_content", None) or {}
-        outcome = {k: structured[k] for k in _OUTCOME_FIELDS if k in structured}
-        call.emit("completed", success=_succeeded(name, structured), elapsed_ms=_elapsed_ms(started), **outcome)
+        call.emit(
+            "completed",
+            success=call_succeeded(name, structured),
+            elapsed_ms=_elapsed_ms(started),
+            **outcome_fields(structured),
+        )
         return result
 
 
-def _instructions(policy: ComputerPolicy) -> str:
-    roots = ", ".join(str(p) for p in policy.roots)
-    writable = ", ".join(str(p) for p in policy.writable_roots) or "none (read-only)"
-    if policy.command_mode == "allowlist":
-        cmds = "allowlist only: " + ", ".join(sorted(policy.command_allow)) + " (no shell operators)"
+def _instructions(policy: ComputerPolicy | None, remote: bool) -> str:
+    parts = ["Policy-controlled access to computers. Every tool takes a 'device' argument (default 'local')."]
+    if policy is not None:
+        roots = ", ".join(str(p) for p in policy.roots)
+        writable = ", ".join(str(p) for p in policy.writable_roots) or "none (read-only)"
+        if policy.command_mode == "allowlist":
+            cmds = "allowlist only: " + ", ".join(sorted(policy.command_allow)) + " (no shell operators)"
+        else:
+            cmds = policy.command_mode
+        parts.append(f"On 'local': readable roots {roots}; writable roots {writable}; commands {cmds}.")
     else:
-        cmds = policy.command_mode
-    return (
-        "Policy-controlled access to one computer. "
-        f"Readable roots: {roots}. Writable roots: {writable}. Commands: {cmds}. "
-        "Relative paths resolve against the first readable root. "
-        "Requests outside the policy are refused; call get_system_info to see the full policy."
-    )
+        parts.append("This gateway has no local device.")
+    if remote:
+        parts.append("Call list_devices to see remote computers, whether they are online, and their policies.")
+    parts.append("Requests outside a device's policy are refused.")
+    return " ".join(parts)
 
 
 def create_computer_server(
-    policy: ComputerPolicy,
+    policy: ComputerPolicy | None,
     *,
     audit: ComputerAuditLog,
     authorize: Authorizer = token_authorizer,
+    hub: Any | None = None,
     name: str = "ContextBridge Computer",
 ) -> FastMCP:
-    allowed = computer_tool_names(policy)
-    server = FastMCP(name=name, instructions=_instructions(policy))
+    """Build the MCP server. ``policy`` configures the ``local`` device (None for a gateway without one)."""
+
+    def report_exit(status: dict[str, Any]) -> None:
+        audit.record(
+            "exited",
+            tool="session",
+            device=LOCAL_DEVICE,
+            success=status["exit_code"] == 0 and not status["timed_out"],
+            **{k: status[k] for k in ("session_id", "pid", "command", "exit_code", "timed_out", "runtime_seconds")},
+        )
+
+    local = Engine(policy, on_exit=report_exit) if policy is not None else None
+    router = DeviceRouter(local, hub)
+    server = FastMCP(name=name, instructions=_instructions(policy, hub is not None))
+    run = functools.partial(_invoke, router)
 
     # ------------------------------------------------------------ read tools
 
     @server.tool(annotations=_READ_ONLY)
-    def list_directory(path: str, depth: int = 1) -> dict[str, Any]:
-        """List a directory's entries (type, size, modified time). depth 1-5 recurses into subdirectories."""
-        return _call(files.list_directory, policy, path, depth=depth)
+    async def list_devices() -> dict[str, Any]:
+        """List the computers this gateway can reach, whether each is online, and what it allows."""
+        mark_started()
+        return {"devices": router.describe()}
 
     @server.tool(annotations=_READ_ONLY)
-    def read_file(path: str, offset: int = 0, length: int | None = None) -> dict[str, Any]:
+    async def list_directory(path: str, depth: int = 1, device: str = LOCAL_DEVICE) -> dict[str, Any]:
+        """List a directory's entries (type, size, modified time). depth 1-5 recurses into subdirectories."""
+        return await run(device, "list_directory", {"path": path, "depth": depth})
+
+    @server.tool(annotations=_READ_ONLY)
+    async def read_file(
+        path: str, offset: int = 0, length: int | None = None, device: str = LOCAL_DEVICE
+    ) -> dict[str, Any]:
         """Read a text file. offset is the 0-based first line; a negative offset reads the last N lines.
         length limits the number of lines returned. Large files are truncated at the read limit."""
-        return _call(files.read_file, policy, path, offset=offset, length=length)
+        return await run(device, "read_file", {"path": path, "offset": offset, "length": length})
 
     @server.tool(annotations=_READ_ONLY)
-    def get_file_info(path: str) -> dict[str, Any]:
+    async def get_file_info(path: str, device: str = LOCAL_DEVICE) -> dict[str, Any]:
         """Show size, timestamps, permissions, line count, and whether the policy allows writing."""
-        return _call(files.get_file_info, policy, path)
+        return await run(device, "get_file_info", {"path": path})
 
     @server.tool(annotations=_READ_ONLY)
-    def search_files(path: str, pattern: str, max_results: int | None = None) -> dict[str, Any]:
+    async def search_files(
+        path: str, pattern: str, max_results: int | None = None, device: str = LOCAL_DEVICE
+    ) -> dict[str, Any]:
         """Find files and directories under path whose name matches a glob (*.py) or contains a substring."""
-        return _call(files.search_files, policy, path, pattern, max_results=max_results)
+        return await run(device, "search_files", {"path": path, "pattern": pattern, "max_results": max_results})
 
     @server.tool(annotations=_READ_ONLY)
-    def search_code(
+    async def search_code(
         path: str,
         pattern: str,
         file_pattern: str | None = None,
@@ -301,125 +390,131 @@ def create_computer_server(
         case_sensitive: bool = False,
         context_lines: int = 0,
         max_results: int | None = None,
+        device: str = LOCAL_DEVICE,
     ) -> dict[str, Any]:
         """Search text file contents under path. Literal match unless regex is true.
         file_pattern filters file names by glob (e.g. *.py). context_lines adds up to 5 surrounding lines."""
-        return _call(
-            files.search_code,
-            policy,
-            path,
-            pattern,
-            file_pattern=file_pattern,
-            regex=regex,
-            case_sensitive=case_sensitive,
-            context_lines=context_lines,
-            max_results=max_results,
-        )
+        args = {
+            "path": path,
+            "pattern": pattern,
+            "file_pattern": file_pattern,
+            "regex": regex,
+            "case_sensitive": case_sensitive,
+            "context_lines": context_lines,
+            "max_results": max_results,
+        }
+        return await run(device, "search_code", args)
 
     @server.tool(annotations=_READ_ONLY)
-    def get_system_info() -> dict[str, Any]:
-        """Describe this computer (OS, CPU, memory, disks) and the access policy in force."""
-        return _call(system_info, policy)
+    async def get_system_info(device: str = LOCAL_DEVICE) -> dict[str, Any]:
+        """Describe a computer (OS, CPU, memory, disks) and the access policy in force."""
+        return await run(device, "get_system_info", {})
 
     # ----------------------------------------------------------- write tools
 
-    if policy.can_write:
+    @server.tool(annotations=_WRITE)
+    async def write_file(path: str, content: str, mode: str = "rewrite", device: str = LOCAL_DEVICE) -> dict[str, Any]:
+        """Write a text file. mode 'rewrite' replaces it atomically; 'append' adds to the end.
+        The parent directory must already exist."""
+        return await run(device, "write_file", {"path": path, "content": content, "mode": mode})
 
-        @server.tool(annotations=_WRITE)
-        def write_file(path: str, content: str, mode: str = "rewrite") -> dict[str, Any]:
-            """Write a text file. mode 'rewrite' replaces it atomically; 'append' adds to the end.
-            The parent directory must already exist."""
-            return _call(files.write_file, policy, path, content, mode=mode)
+    @server.tool(annotations=_WRITE)
+    async def edit_block(
+        path: str, old_string: str, new_string: str, expected_replacements: int = 1, device: str = LOCAL_DEVICE
+    ) -> dict[str, Any]:
+        """Replace exact text in a file. Fails unless old_string occurs exactly expected_replacements times,
+        so include enough surrounding context to make the match unique."""
+        args = {
+            "path": path,
+            "old_string": old_string,
+            "new_string": new_string,
+            "expected_replacements": expected_replacements,
+        }
+        return await run(device, "edit_block", args)
 
-        @server.tool(annotations=_WRITE)
-        def edit_block(path: str, old_string: str, new_string: str, expected_replacements: int = 1) -> dict[str, Any]:
-            """Replace exact text in a file. Fails unless old_string occurs exactly expected_replacements times,
-            so include enough surrounding context to make the match unique."""
-            return _call(
-                files.edit_block, policy, path, old_string, new_string, expected_replacements=expected_replacements
-            )
+    @server.tool(annotations=_ADDITIVE)
+    async def create_directory(path: str, device: str = LOCAL_DEVICE) -> dict[str, Any]:
+        """Create a directory, including missing parents."""
+        return await run(device, "create_directory", {"path": path})
 
-        @server.tool(annotations=_ADDITIVE)
-        def create_directory(path: str) -> dict[str, Any]:
-            """Create a directory, including missing parents."""
-            return _call(files.create_directory, policy, path)
-
-        @server.tool(annotations=_WRITE)
-        def move_file(source: str, destination: str) -> dict[str, Any]:
-            """Move or rename a file or directory. The destination must not already exist."""
-            return _call(files.move_file, policy, source, destination)
+    @server.tool(annotations=_WRITE)
+    async def move_file(source: str, destination: str, device: str = LOCAL_DEVICE) -> dict[str, Any]:
+        """Move or rename a file or directory. The destination must not already exist."""
+        return await run(device, "move_file", {"source": source, "destination": destination})
 
     # --------------------------------------------------------- command tools
 
-    if policy.commands_enabled:
+    @server.tool(annotations=_EXECUTE)
+    async def run_command(
+        command: str, cwd: str | None = None, timeout_seconds: float | None = None, device: str = LOCAL_DEVICE
+    ) -> dict[str, Any]:
+        """Run a command to completion and return exit code, stdout, and stderr.
+        Killed with its child processes if it exceeds timeout_seconds. Use start_process for
+        long-running or interactive programs."""
+        return await run(device, "run_command", {"command": command, "cwd": cwd, "timeout_seconds": timeout_seconds})
 
-        def report_exit(status: dict[str, Any]) -> None:
-            audit.record(
-                "exited",
-                tool="session",
-                success=status["exit_code"] == 0 and not status["timed_out"],
-                **{k: status[k] for k in ("session_id", "pid", "command", "exit_code", "timed_out", "runtime_seconds")},
-            )
+    @server.tool(annotations=_EXECUTE)
+    async def start_process(
+        command: str,
+        cwd: str | None = None,
+        timeout_seconds: float | None = None,
+        wait_seconds: float = 1.0,
+        device: str = LOCAL_DEVICE,
+    ) -> dict[str, Any]:
+        """Start a long-running or interactive command in the background and return its session_id
+        with the first output. stdout and stderr are combined."""
+        args = {"command": command, "cwd": cwd, "timeout_seconds": timeout_seconds, "wait_seconds": wait_seconds}
+        return await run(device, "start_process", args)
 
-        sessions = SessionManager(policy, on_exit=report_exit)
-        atexit.register(sessions.shutdown)
+    @server.tool(annotations=_READ_ONLY)
+    async def read_process_output(
+        session_id: str, wait_seconds: float = 0.0, device: str = LOCAL_DEVICE
+    ) -> dict[str, Any]:
+        """Return output a session produced since the last read, waiting up to wait_seconds for more."""
+        return await run(device, "read_process_output", {"session_id": session_id, "wait_seconds": wait_seconds})
 
-        @server.tool(annotations=_EXECUTE)
-        def run_command(command: str, cwd: str | None = None, timeout_seconds: float | None = None) -> dict[str, Any]:
-            """Run a command to completion and return exit code, stdout, and stderr.
-            Killed with its child processes if it exceeds timeout_seconds. Use start_process for
-            long-running or interactive programs."""
-            return _call(commands.run_command, policy, command, cwd=cwd, timeout_seconds=timeout_seconds)
+    @server.tool(annotations=_EXECUTE)
+    async def interact_with_process(
+        session_id: str,
+        input: str,
+        append_newline: bool = True,
+        wait_seconds: float = 1.0,
+        device: str = LOCAL_DEVICE,
+    ) -> dict[str, Any]:
+        """Send input to a running session's stdin and return the output that follows."""
+        args = {
+            "session_id": session_id,
+            "input": input,
+            "append_newline": append_newline,
+            "wait_seconds": wait_seconds,
+        }
+        return await run(device, "interact_with_process", args)
 
-        @server.tool(annotations=_EXECUTE)
-        def start_process(
-            command: str, cwd: str | None = None, timeout_seconds: float | None = None, wait_seconds: float = 1.0
-        ) -> dict[str, Any]:
-            """Start a long-running or interactive command in the background and return its session_id
-            with the first output. stdout and stderr are combined."""
-            return _call(
-                sessions.start, command, cwd=cwd, timeout_seconds=timeout_seconds, wait_seconds=wait_seconds
-            )
+    @server.tool(annotations=_WRITE)
+    async def force_terminate(session_id: str, device: str = LOCAL_DEVICE) -> dict[str, Any]:
+        """Kill a session and its child processes, returning any remaining output."""
+        return await run(device, "force_terminate", {"session_id": session_id})
 
-        @server.tool(annotations=_READ_ONLY)
-        def read_process_output(session_id: str, wait_seconds: float = 0.0) -> dict[str, Any]:
-            """Return output a session produced since the last read, waiting up to wait_seconds for more."""
-            return _call(sessions.read, session_id, wait_seconds=wait_seconds)
-
-        @server.tool(annotations=_EXECUTE)
-        def interact_with_process(
-            session_id: str, input: str, append_newline: bool = True, wait_seconds: float = 1.0
-        ) -> dict[str, Any]:
-            """Send input to a running session's stdin and return the output that follows."""
-            return _call(sessions.send, session_id, input, newline=append_newline, wait_seconds=wait_seconds)
-
-        @server.tool(annotations=_WRITE)
-        def force_terminate(session_id: str) -> dict[str, Any]:
-            """Kill a session and its child processes, returning any remaining output."""
-            return _call(sessions.terminate, session_id)
-
-        @server.tool(annotations=_READ_ONLY)
-        def list_sessions() -> dict[str, Any]:
-            """List sessions started through ContextBridge with their status."""
-            return {"sessions": _call(sessions.list)}
+    @server.tool(annotations=_READ_ONLY)
+    async def list_sessions(device: str = LOCAL_DEVICE) -> dict[str, Any]:
+        """List sessions started through ContextBridge on a device, with their status."""
+        return await run(device, "list_sessions", {})
 
     # ------------------------------------------------------- process tools
 
-    if policy.list_processes:
+    @server.tool(annotations=_READ_ONLY)
+    async def list_processes(
+        name_filter: str | None = None, limit: int = 200, device: str = LOCAL_DEVICE
+    ) -> dict[str, Any]:
+        """List running processes, optionally filtered by a substring of the name or command line."""
+        return await run(device, "list_processes", {"name_filter": name_filter, "limit": limit})
 
-        @server.tool(annotations=_READ_ONLY)
-        def list_processes(name_filter: str | None = None, limit: int = 200) -> dict[str, Any]:
-            """List running processes, optionally filtered by a substring of the name or command line."""
-            return _call(commands.list_processes, name_filter=name_filter, limit=max(1, min(limit, 1000)))
+    @server.tool(annotations=_WRITE)
+    async def kill_process(pid: int, force: bool = False, device: str = LOCAL_DEVICE) -> dict[str, Any]:
+        """Terminate a process by PID (force sends SIGKILL / TerminateProcess)."""
+        return await run(device, "kill_process", {"pid": pid, "force": force})
 
-    if policy.allow_kill:
-
-        @server.tool(annotations=_WRITE)
-        def kill_process(pid: int, force: bool = False) -> dict[str, Any]:
-            """Terminate a process by PID (force sends SIGKILL / TerminateProcess)."""
-            return _call(commands.kill_process, pid, force=force)
-
-    server.add_middleware(ComputerPolicyMiddleware(allowed, audit, authorize))
+    server.add_middleware(ComputerPolicyMiddleware(router, audit, authorize))
     return server
 
 
@@ -432,15 +527,6 @@ def advertised_tool_names(server: FastMCP) -> set[str]:
 
 
 # ------------------------------------------------------------------ startup
-
-
-def is_loopback(host: str) -> bool:
-    if host == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
 
 
 def load_scopes(cfg: dict[str, Any]) -> tuple[str, ...]:
@@ -469,8 +555,60 @@ def _require_token() -> str:
     return token
 
 
+def _path(base: Path, value: Any) -> Path | None:
+    if not value:
+        return None
+    path = Path(str(value)).expanduser()
+    return path if path.is_absolute() else base / path
+
+
+def _port(value: Any, where: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 < value < 65536:
+        raise SystemExit(f"{where} must be a TCP port number.")
+    return value
+
+
+class AgentListenerConfig:
+    """The ``agents`` section: where remote agents dial in."""
+
+    def __init__(self, cfg: dict[str, Any], base: Path, where: Path) -> None:
+        self.host = str(cfg.get("host", "127.0.0.1"))
+        self.port = _port(cfg.get("port"), f"{where}: agents.port")
+        self.tls_cert = _path(base, cfg.get("tls_cert"))
+        self.tls_key = _path(base, cfg.get("tls_key"))
+        self.registry = _path(base, cfg.get("registry"))
+        try:
+            self.heartbeat_seconds = float(cfg.get("heartbeat_seconds", 15))
+            self.call_timeout_seconds = float(cfg.get("call_timeout_seconds", 660))
+        except (TypeError, ValueError):
+            raise SystemExit(f"{where}: agents.heartbeat_seconds and call_timeout_seconds must be numbers.") from None
+        if not is_private_bind(self.host):
+            raise SystemExit(
+                f"{where}: agents.host must be a loopback, LAN, or overlay-network IP address; "
+                f"{self.host} could be public."
+            )
+        if bool(self.tls_cert) != bool(self.tls_key):
+            raise SystemExit(f"{where}: agents.tls_cert and agents.tls_key must be set together.")
+        if not is_loopback(self.host) and not self.tls_cert:
+            raise SystemExit(f"{where}: agents.tls_cert/tls_key are required when agents.host is not loopback.")
+        if self.registry is None:
+            raise SystemExit(f"{where}: agents.registry is required.")
+        if not 1 <= self.heartbeat_seconds <= 300 or self.call_timeout_seconds <= 0:
+            raise SystemExit(f"{where}: agents.heartbeat_seconds must be 1-300 and call_timeout_seconds positive.")
+
+    def ssl_context(self):
+        if self.tls_cert is None or self.tls_key is None:
+            return None
+        from ..remote.tls import server_context
+
+        try:
+            return server_context(self.tls_cert, self.tls_key)
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"cannot load agent TLS certificate/key: {exc}") from None
+
+
 def main(argv: list[str] | None = None) -> None:
-    ap = argparse.ArgumentParser(description="ContextBridge computer route (HTTP on loopback only)")
+    ap = argparse.ArgumentParser(description="ContextBridge computer route (MCP over HTTP on loopback only)")
     ap.add_argument("--config", required=True)
     args = ap.parse_args(argv)
 
@@ -479,53 +617,96 @@ def main(argv: list[str] | None = None) -> None:
     config_path = Path(args.config).expanduser().resolve()
     with config_path.open(encoding="utf-8") as fh:
         cfg = yaml.safe_load(fh) or {}
+    base = config_path.parent
     serve = cfg.get("serve") or {}
 
     host = str(serve.get("host", "127.0.0.1"))
     if not is_loopback(host):
         raise SystemExit(f"{config_path}: serve.host must be a loopback address; {host} is not.")
-    port = serve.get("port")
-    if not isinstance(port, int) or not 0 < port < 65536:
-        raise SystemExit(f"{config_path}: serve.port must be a TCP port number.")
-    if not serve.get("audit_log"):
+    port = _port(serve.get("port"), f"{config_path}: serve.port")
+    audit_path = _path(base, serve.get("audit_log"))
+    if audit_path is None:
         raise SystemExit(f"{config_path}: serve.audit_log is required.")
-    audit_path = Path(serve["audit_log"]).expanduser()
-    if not audit_path.is_absolute():
-        audit_path = config_path.parent / audit_path
+
+    agents_cfg = cfg.get("agents") or {}
+    listener = AgentListenerConfig(agents_cfg, base, config_path) if agents_cfg.get("enabled") else None
+    # The local device may never read the gateway's TLS key or device registry, nor rewrite its config.
+    hidden: list[Path] = []
+    protected: list[Path] = [config_path, audit_path]
+    if listener is not None:
+        hidden += [listener.registry, listener.registry.with_name(listener.registry.name + ".lock")]
+        if listener.tls_key and listener.tls_cert:
+            hidden.append(listener.tls_key)
+            protected.append(listener.tls_cert)
 
     try:
         scopes = load_scopes(cfg)
-        policy = load_policy(cfg, protected=(config_path, audit_path))
+        policy = (
+            load_policy(cfg, protected=tuple(protected), hidden=tuple(hidden)) if "filesystem" in cfg else None
+        )
     except PolicyError as exc:
         raise SystemExit(f"{config_path}: {exc}") from None
+    if policy is None and listener is None:
+        raise SystemExit(f"{config_path}: configure a local device (filesystem) and/or enable agents.")
+    ssl_context = listener.ssl_context() if listener else None
     try:
         audit = ComputerAuditLog(audit_path)
     except AuditError as exc:
         raise SystemExit(str(exc)) from None
 
-    server = create_computer_server(policy, audit=audit, name=cfg.get("name", "ContextBridge Computer"))
-    expected = computer_tool_names(policy)
+    hub = None
+    if listener is not None:
+        from ..remote.hub import AgentHub
+        from ..remote.registry import DeviceRegistry, RegistryError
+
+        try:
+            registry = DeviceRegistry(listener.registry)
+            registry.refresh()
+        except (RegistryError, OSError) as exc:
+            raise SystemExit(str(exc)) from None
+        hub = AgentHub(
+            registry,
+            audit,
+            heartbeat_seconds=listener.heartbeat_seconds,
+            call_timeout_seconds=listener.call_timeout_seconds,
+        )
+
+    server = create_computer_server(policy, audit=audit, hub=hub, name=cfg.get("name", "ContextBridge Computer"))
     advertised = advertised_tool_names(server)
-    if advertised != expected:
-        raise SystemExit(f"Computer tool surface mismatch: expected {set(expected)!r}, got {advertised!r}")
+    if advertised != SERVER_TOOLS:
+        raise SystemExit(f"Computer tool surface mismatch: expected {set(SERVER_TOOLS)!r}, got {advertised!r}")
 
     try:
         audit.record(
             "service_started",
             host=host,
             port=port,
-            tools=sorted(expected),
             scopes=list(scopes),
-            policy=policy.summary(),
+            local_tools=sorted(available_tools(policy)) if policy else None,
+            policy=policy.summary() if policy else None,
+            agents=f"{'wss' if ssl_context else 'ws'}://{listener.host}:{listener.port}" if listener else None,
         )
     except AuditError as exc:
         raise SystemExit(str(exc)) from None
 
     server.auth = StaticTokenVerifier({token: {"client_id": CLIENT_ID, "scopes": list(scopes)}})
+    local = f"commands={policy.command_mode}, writable={policy.can_write}" if policy else "no local device"
     print(
-        f"[computer] serving {len(expected)} tools on http://{host}:{port}/mcp "
-        f"(commands={policy.command_mode}, writable={policy.can_write}, scopes={','.join(scopes)})",
+        f"[computer] MCP on http://{host}:{port}/mcp ({local}, scopes={','.join(scopes)})",
         file=sys.stderr,
         flush=True,
     )
-    server.run(transport="http", host=host, port=port, show_banner=False)
+
+    async def serve_all() -> None:
+        if hub is not None:
+            await hub.start(listener.host, listener.port, ssl_context)
+            scheme = "wss" if ssl_context else "ws"
+            print(f"[computer] agents on {scheme}://{listener.host}:{hub.port}", file=sys.stderr, flush=True)
+        try:
+            await server.run_async(transport="http", host=host, port=port, show_banner=False)
+        finally:
+            if hub is not None:
+                with contextlib.suppress(Exception):
+                    await hub.close()
+
+    anyio.run(serve_all)
