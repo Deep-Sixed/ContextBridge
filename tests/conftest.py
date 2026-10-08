@@ -58,7 +58,7 @@ def workspace(tmp_path: Path) -> Path:
     """A readable root containing a writable subdirectory and some denied files."""
     root = tmp_path / "root"
     (root / "docs").mkdir(parents=True)
-    (root / "docs" / "notes.md").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+    (root / "docs" / "notes.md").write_bytes(b"alpha\nbeta\ngamma\n")  # LF on every OS; reads return it verbatim
     (root / "src").mkdir()
     (root / "src" / "app.py").write_text("def main():\n    return 'hello'\n", encoding="utf-8")
     (root / ".ssh").mkdir()

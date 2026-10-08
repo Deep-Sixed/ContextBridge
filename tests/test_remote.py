@@ -469,11 +469,12 @@ def test_agent_reconnects_after_gateway_restart(tmp_path, workspace):
 
 def test_remote_session_exit_reaches_the_gateway_audit(tmp_path, workspace):
     async def scenario():
-        async with gateway(tmp_path) as gw, connected_agent(
-            tmp_path, workspace, gw, commands={"mode": "unrestricted"}
-        ):
-            session = await gw.hub.call(DEVICE, "start_process", {"command": "exit 3", "wait_seconds": 2}, None)
-            await wait_for(lambda: any(e["event"] == "exited" for e in events(tmp_path / "gateway-audit.jsonl")))
+        async with gateway(tmp_path) as gw, connected_agent(tmp_path, workspace, gw):
+            exit_3 = {"command": python_cmd("import sys; sys.exit(3)"), "wait_seconds": 2}
+            session = await gw.hub.call(DEVICE, "start_process", exit_3, None)
+            await wait_for(
+                lambda: any(e["event"] == "exited" for e in events(tmp_path / "gateway-audit.jsonl")), timeout=15
+            )
             return session
 
     session = asyncio.run(scenario())
