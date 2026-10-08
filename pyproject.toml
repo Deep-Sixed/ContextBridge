@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "contextbridge"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Read-only authenticated MCP gateway for approved project context"
 requires-python = ">=3.11"
 # fastmcp 4 removed fastmcp.tools.tool; anyio 4.1 added abandon_on_cancel.
@@ -12,9 +12,10 @@ dependencies = ["fastmcp>=3,<4", "mcp>=1.24,<2", "anyio>=4.1", "pyyaml", "starle
 
 [project.optional-dependencies]
 test = ["pytest"]
-
-[project.optional-dependencies]
 docs = ["reportlab>=4.0"]
+
+[tool.setuptools.dynamic]
+version = { attr = "uga.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
