@@ -29,6 +29,15 @@ Every request is written as one JSON line to stderr and, if `UGA_AUDIT_LOG` (or 
 
 This standalone gateway does not depend on Authentik. It does **not** include an OAuth proxy, public HTTPS listener, or ChatGPT/Claude Web OAuth discovery. To expose it to remote AI clients, use a separate authenticated TLS/OAuth access layer. Do not directly forward port 8790 to the internet.
 
+## Documentation
+
+`docs/desktop-commander-inventory.pdf` lists the Desktop Commander functionality ContextBridge targets, with an implementation checklist. To rebuild it after editing `scripts/build-inventory-pdf.py` (requires the DejaVu fonts):
+
+```sh
+python3 -m pip install -e '.[docs]'
+./scripts/build-inventory-pdf.py
+```
+
 ## Status
 
 Standalone extraction from an archived UGA implementation. Authentication-front/sidecar deployments and systemd services intentionally excluded. The code is not yet production-validated.
