@@ -30,7 +30,8 @@ def registry(tmp_path):
 
 def test_registry_file_is_private_and_has_gateway_id(registry):
     assert registry.gateway_id.startswith("gw_")
-    assert stat.S_IMODE(os.stat(registry.path).st_mode) == 0o600
+    if os.name != "nt":  # the registry lives on the Linux gateway; Windows has no mode bits
+        assert stat.S_IMODE(os.stat(registry.path).st_mode) == 0o600
 
 
 def test_enrollment_code_is_single_use_and_case_insensitive(registry):
@@ -122,7 +123,8 @@ def test_device_signature_verification(registry):
 def test_self_signed_certificate(tmp_path):
     cert, key = tmp_path / "tls" / "gw.crt", tmp_path / "tls" / "gw.key"
     fingerprint = generate_self_signed(cert, key, hostnames=["friday"], ips=["127.0.0.1"])
-    assert stat.S_IMODE(os.stat(key).st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(os.stat(key).st_mode) == 0o600
     assert normalize_fingerprint(fingerprint.lower().replace("sha256:", "")) == fingerprint
     assert fingerprint == fingerprint_der(ssl.PEM_cert_to_DER_cert(cert.read_text()))
     with pytest.raises(ValueError):

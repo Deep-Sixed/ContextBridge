@@ -6,6 +6,7 @@ import time
 
 import psutil
 import pytest
+from helpers import PY, python_cmd
 
 from contextbridge.computer import commands
 from contextbridge.computer.commands import BoundedCapture, CommandError, SessionManager
@@ -139,3 +140,85 @@ def test_kill_process_terminates_child():
     finally:
         proc.kill()
         proc.wait()
+
+
+# ------------------------------------------------- cross-platform (Linux + Windows)
+# These use this Python interpreter as the command, so they run identically on Thanatos.
+
+_SPAWN_GRANDCHILD = (
+    "import subprocess, sys, time; "
+    "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)']); "
+    "print(p.pid, flush=True); time.sleep(120)"
+)
+
+
+def _wait_gone(pid: int, timeout: float = 10.0) -> bool:
+    try:
+        psutil.Process(pid).wait(timeout=timeout)
+    except psutil.NoSuchProcess:
+        return True
+    except psutil.TimeoutExpired:
+        return False
+    return True
+
+
+def test_python_command_runs_with_exit_code(policy):
+    ok = commands.run_command(policy, python_cmd("print('hi')"))
+    assert ok["exit_code"] == 0 and ok["stdout"].strip() == "hi" and ok["pid"] > 0
+    failed = commands.run_command(policy, python_cmd("import sys; sys.exit(3)"))
+    assert failed["exit_code"] == 3 and failed["timed_out"] is False
+
+
+def test_timeout_kills_grandchildren_on_every_platform(make_policy):
+    policy = make_policy(commands={"max_timeout_seconds": 3})
+    started = time.monotonic()
+    result = commands.run_command(policy, python_cmd(_SPAWN_GRANDCHILD), timeout_seconds=3)
+    assert result["timed_out"] is True
+    assert time.monotonic() - started < 15
+    grandchild = int(result["stdout"].split()[0])
+    assert _wait_gone(grandchild), "the grandchild survived the timeout"
+
+
+def test_output_is_bounded_on_every_platform(make_policy):
+    policy = make_policy(commands={"max_output_bytes": 1000})
+    result = commands.run_command(policy, python_cmd("import sys; sys.stdout.write('x' * 200000)"))
+    assert result["stdout_truncated"] is True and "bytes omitted" in result["stdout"]
+    assert len(result["stdout"]) < 1200
+
+
+def test_gateway_tokens_never_reach_commands(policy, monkeypatch):
+    monkeypatch.setenv("MCP_AUTH_TOKEN", "super-secret-value")
+    monkeypatch.setenv("CONTEXTBRIDGE_COMPUTER_TOKEN", "other-secret-value")
+    result = commands.run_command(policy, python_cmd("import os; print(sorted(os.environ))"))
+    assert "MCP_AUTH_TOKEN" not in result["stdout"] and "CONTEXTBRIDGE_COMPUTER_TOKEN" not in result["stdout"]
+
+
+def test_interactive_session_on_every_platform(policy):
+    sessions = SessionManager(policy)
+    echo_loop = "import sys\nfor line in sys.stdin:\n    print('got ' + line.strip(), flush=True)"
+    started = sessions.start(python_cmd(echo_loop), wait_seconds=0.2)
+    sid = started["session_id"]
+    try:
+        reply = sessions.send(sid, "ping", wait_seconds=5)
+        for _ in range(20):
+            if "got ping" in reply["output"]:
+                break
+            reply = sessions.read(sid, wait_seconds=0.5)
+        assert "got ping" in reply["output"]
+    finally:
+        final = sessions.terminate(sid)
+    assert final["running"] is False
+
+
+def test_session_lifetime_kills_grandchildren(policy):
+    sessions = SessionManager(policy)
+    started = sessions.start(python_cmd(_SPAWN_GRANDCHILD), timeout_seconds=2, wait_seconds=5)
+    output = started["output"] or sessions.read(started["session_id"], wait_seconds=5)["output"]
+    grandchild = int(output.split()[0])
+    result = sessions.read(started["session_id"], wait_seconds=10)
+    assert result["running"] is False and result["timed_out"] is True
+    assert _wait_gone(grandchild), "the grandchild survived the session lifetime"
+
+
+def test_allowlist_names_this_interpreter(policy):
+    assert PY in policy.command_allow

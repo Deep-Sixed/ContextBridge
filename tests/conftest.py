@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from helpers import PY
 
 from contextbridge.computer.policy import ComputerPolicy, load_policy
 
@@ -73,7 +74,7 @@ def make_policy(workspace: Path):
     def _make(**overrides: Any) -> ComputerPolicy:
         cfg: dict[str, Any] = {
             "filesystem": {"roots": [str(workspace)], "writable_roots": [str(workspace / "work")]},
-            "commands": {"mode": "allowlist", "allow": ["echo", "ls", "sleep", "cat", "env"]},
+            "commands": {"mode": "allowlist", "allow": ["echo", "ls", "sleep", "cat", "env", PY]},
             "processes": {"list": True, "allow_kill": False},
         }
         for section, values in overrides.items():

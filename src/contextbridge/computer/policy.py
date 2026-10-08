@@ -10,10 +10,22 @@ from __future__ import annotations
 import fnmatch
 import os
 import shlex
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from .oscompat import (
+    IS_WINDOWS,
+    SHELL_PRESETS,
+    WINDOWS_EXECUTABLE_EXTENSIONS,
+    has_path_part,
+    is_shell_operator,
+    program_name,
+    resolve_program,
+    shell_invocation,
+    split_command,
+    windows_path_problem,
+)
 
 COMMAND_MODES = ("disabled", "allowlist", "unrestricted")
 
@@ -39,6 +51,21 @@ DEFAULT_DENY: tuple[str, ...] = (
     "id_ed25519*",
 )
 
+# Added on Windows: registry hives, DPAPI keys and credential stores, browser
+# secrets, PuTTY keys, cloud CLI credentials.
+WINDOWS_DEFAULT_DENY: tuple[str, ...] = (
+    "NTUSER.DAT*",
+    "UsrClass.dat*",
+    "Credentials",
+    "Protect",
+    "Vault",
+    "Login Data",
+    "Cookies",
+    "Local State",
+    "*.ppk",
+    ".azure",
+)
+
 DEFAULT_ENV_STRIP: tuple[str, ...] = (
     "*TOKEN*",
     "*SECRET*",
@@ -53,8 +80,7 @@ DEFAULT_ENV_STRIP: tuple[str, ...] = (
 # Gateway credentials are never passed to child processes, whatever env_strip says.
 ALWAYS_STRIPPED_ENV: frozenset[str] = frozenset({"MCP_AUTH_TOKEN", "CONTEXTBRIDGE_COMPUTER_TOKEN"})
 
-# Tokens that only make sense to a shell; allowlist mode runs without one.
-_SHELL_OPERATOR_CHARS = frozenset("();<>|&")
+_UNQUOTED_OPERATORS = frozenset("|&<>")
 
 
 class PolicyError(ValueError):
@@ -76,13 +102,17 @@ def _within(path: Path, roots: tuple[Path, ...]) -> Path | None:
     return None
 
 
-def _default_shell() -> list[str]:
-    if os.name == "nt":
-        return ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"]
-    for candidate in ("/bin/bash", "/bin/sh"):
-        if os.path.exists(candidate):
-            return [candidate, "-c"]
-    return ["sh", "-c"]
+def _has_unquoted_operator(command: str) -> bool:
+    """Windows: a pipe, redirect, or & outside double quotes."""
+    in_quotes = False
+    backslashes = 0
+    for ch in command:
+        if ch == '"' and backslashes % 2 == 0:
+            in_quotes = not in_quotes
+        elif not in_quotes and ch in _UNQUOTED_OPERATORS:
+            return True
+        backslashes = backslashes + 1 if ch == "\\" else 0
+    return False
 
 
 @dataclass(frozen=True)
@@ -98,7 +128,7 @@ class ComputerPolicy:
     max_search_seconds: float = 10.0
     command_mode: str = "disabled"
     command_allow: frozenset[str] = frozenset()
-    shell: tuple[str, ...] = ()
+    shell: str | tuple[str, ...] = ""
     default_timeout_seconds: float = 30.0
     max_timeout_seconds: float = 600.0
     max_output_bytes: int = 64 * 1024
@@ -107,6 +137,7 @@ class ComputerPolicy:
     env_strip: tuple[str, ...] = DEFAULT_ENV_STRIP
     list_processes: bool = True
     allow_kill: bool = False
+    windows: bool = IS_WINDOWS
 
     # ------------------------------------------------------------------ paths
 
@@ -129,6 +160,10 @@ class ComputerPolicy:
         """
         if not isinstance(raw, str) or not raw.strip() or "\x00" in raw:
             raise PolicyViolation("A non-empty path is required.")
+        if self.windows:
+            problem = windows_path_problem(raw.strip())
+            if problem:
+                raise PolicyViolation(f"{raw}: {problem}.")
         candidate = Path(raw.strip()).expanduser()
         if not candidate.is_absolute():
             candidate = self.roots[0] / candidate
@@ -167,42 +202,48 @@ class ComputerPolicy:
     def commands_enabled(self) -> bool:
         return self.command_mode != "disabled"
 
-    def command_argv(self, command: str) -> list[str]:
-        """Translate ``command`` into an argv list permitted by the command policy."""
+    def command_argv(self, command: str) -> list[str] | str:
+        """Translate ``command`` into what to execute: an argv list, or for cmd.exe a raw command line."""
         if not isinstance(command, str) or not command.strip() or "\x00" in command:
             raise PolicyViolation("A non-empty command is required.")
         if self.command_mode == "disabled":
             raise PolicyViolation("Command execution is disabled on this computer.")
         if self.command_mode == "unrestricted":
-            return [*(self.shell or _default_shell()), command]
+            return shell_invocation(self.shell or None, command, windows=self.windows)
         return self._allowlisted_argv(command)
 
     def _allowlisted_argv(self, command: str) -> list[str]:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
-        lexer.whitespace_split = True
+        operators = "Shell operators (pipes, redirects, ;, &&) are not available in allowlist mode. "
         try:
-            tokens = list(lexer)
-            argv = shlex.split(command, posix=os.name != "nt")
+            argv = split_command(command, windows=self.windows)
+            if self.windows:
+                has_operator = _has_unquoted_operator(command) or any(is_shell_operator(t) for t in argv)
+            else:
+                lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+                lexer.whitespace_split = True
+                has_operator = any(is_shell_operator(t) for t in lexer)
         except ValueError as exc:
             raise PolicyViolation(f"Could not parse command: {exc}") from None
-        if any(tok and set(tok) <= _SHELL_OPERATOR_CHARS for tok in tokens):
-            raise PolicyViolation(
-                "Shell operators (pipes, redirects, ;, &&) are not available in allowlist mode. "
-                "Run one program per call."
-            )
+        if has_operator:
+            raise PolicyViolation(operators + "Run one program per call.")
         if not argv:
             raise PolicyViolation("A non-empty command is required.")
         program = argv[0]
-        if os.sep in program or (os.altsep and os.altsep in program):
+        if has_path_part(program, windows=self.windows):
+            # A path names one exact file, which must itself be on the allowlist.
             if program not in self.command_allow:
                 raise PolicyViolation(f"Program {program!r} is not on this computer's command allowlist.")
+            if self.windows and not program.lower().endswith(WINDOWS_EXECUTABLE_EXTENSIONS):
+                raise PolicyViolation(f"Program {program!r} must be an .exe or .com file.")
             return argv
-        name = program[:-4] if os.name == "nt" and program.lower().endswith(".exe") else program
-        if name not in self.command_allow:
+        name = program_name(program, windows=self.windows)
+        allowed = {program_name(p, windows=self.windows) for p in self.command_allow}
+        if name not in allowed:
             raise PolicyViolation(f"Program {name!r} is not on this computer's command allowlist.")
-        executable = shutil.which(program)
+        executable = resolve_program(program, windows=self.windows)
         if executable is None:
-            raise PolicyViolation(f"Program {program!r} was not found on PATH.")
+            kind = " as an .exe or .com file" if self.windows else ""
+            raise PolicyViolation(f"Program {program!r} was not found on PATH{kind}.")
         return [executable, *argv[1:]]
 
     def child_env(self) -> dict[str, str]:
@@ -265,7 +306,11 @@ def _str_list(section: dict[str, Any], key: str, default: tuple[str, ...] = ()) 
 
 
 def load_policy(
-    cfg: dict[str, Any], *, protected: tuple[str | Path, ...] = (), hidden: tuple[str | Path, ...] = ()
+    cfg: dict[str, Any],
+    *,
+    protected: tuple[str | Path, ...] = (),
+    hidden: tuple[str | Path, ...] = (),
+    windows: bool = IS_WINDOWS,
 ) -> ComputerPolicy:
     """Build a :class:`ComputerPolicy` from the ``filesystem``/``commands``/``processes`` sections.
 
@@ -302,7 +347,13 @@ def load_policy(
     allow = _str_list(cmds, "allow")
     if mode == "allowlist" and not allow:
         raise PolicyError("commands.allow must list at least one program in allowlist mode")
-    shell = _str_list(cmds, "shell")
+    shell_cfg = cmds.get("shell", "")
+    if isinstance(shell_cfg, str):
+        if shell_cfg and shell_cfg not in SHELL_PRESETS:
+            raise PolicyError(f"commands.shell must be one of {', '.join(SHELL_PRESETS)} or an argv list")
+        shell: str | tuple[str, ...] = shell_cfg
+    else:
+        shell = _str_list(cmds, "shell")
     max_timeout = _positive(cmds, "max_timeout_seconds", 600.0, kind=float)
     if "default_timeout_seconds" in cmds:
         default_timeout = _positive(cmds, "default_timeout_seconds", 30.0, kind=float)
@@ -314,7 +365,7 @@ def load_policy(
     policy = ComputerPolicy(
         roots=tuple(roots),
         writable_roots=tuple(writable),
-        deny=_str_list(fs, "deny", DEFAULT_DENY),
+        deny=_str_list(fs, "deny", DEFAULT_DENY + (WINDOWS_DEFAULT_DENY if windows else ())),
         protected=frozenset(_real(p) for p in (*protected, *hidden) if p),
         hidden=frozenset(_real(p) for p in hidden if p),
         max_read_bytes=_positive(fs, "max_read_bytes", 1024 * 1024),
@@ -332,5 +383,6 @@ def load_policy(
         env_strip=_str_list(cmds, "env_strip", DEFAULT_ENV_STRIP),
         list_processes=bool(procs.get("list", True)),
         allow_kill=bool(procs.get("allow_kill", False)),
+        windows=windows,
     )
     return policy

@@ -9,89 +9,27 @@ no npx, nothing from Desktop Commander.
 from __future__ import annotations
 
 import json
-import os
 import re
-import socket
 import subprocess
 import sys
 import time
 import tomllib
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 
 import anyio
 import httpx
 import pytest
 import yaml
-from fastmcp import Client
-from fastmcp.client.auth import BearerAuth
 from fastmcp.exceptions import ToolError
+from helpers import IS_WINDOWS, PY, REPO, call, cli, free_port, isolated_env, python_cmd, serve
 
 from contextbridge.computer.server import main as computer_main
 
-REPO = Path(__file__).resolve().parents[1]
 FIXTURE = REPO / "tests" / "fixtures" / "datacore" / "datacore.fetch.v1.jsonl"
 COMPUTER_TOKEN = "computer-" + "c" * 40
 KNOWLEDGE_TOKEN = "knowledge-" + "k" * 40
 
-pytestmark = pytest.mark.skipif(os.name == "nt", reason="acceptance suite targets the Linux host")
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-def _isolated_env(**extra: str) -> dict[str, str]:
-    """Minimal environment: this Python, system binaries, and nothing else."""
-    return {
-        "PATH": os.pathsep.join([str(Path(sys.executable).parent), "/usr/bin", "/bin"]),
-        "PYTHONPATH": str(REPO / "src"),
-        "HOME": os.environ.get("HOME", "/tmp"),
-        "LANG": "C.UTF-8",
-        **extra,
-    }
-
-
-@contextmanager
-def serve(module: str, config: Path, port: int, env: dict[str, str]) -> Iterator[str]:
-    proc = subprocess.Popen(
-        [sys.executable, "-m", module, "--config", str(config)],
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    try:
-        deadline = time.monotonic() + 30
-        while True:
-            if proc.poll() is not None:
-                raise AssertionError(f"{module} exited early:\n{proc.stderr.read()}")
-            try:
-                with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-                    break
-            except OSError:
-                if time.monotonic() > deadline:
-                    raise AssertionError(f"{module} did not start listening on {port}") from None
-                time.sleep(0.1)
-        yield f"http://127.0.0.1:{port}/mcp"
-    finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-
-
-def call(url: str, token: str | None, fn):
-    async def inner():
-        async with Client(url, auth=BearerAuth(token) if token else None) as client:
-            return await fn(client)
-
-    return anyio.run(inner)
+posix_only = pytest.mark.skipif(IS_WINDOWS, reason="uses POSIX utilities (ls, echo, sleep, sh)")
 
 
 def _computer_config(tmp_path: Path, workspace: Path, port: int, scopes: list[str] | None = None) -> Path:
@@ -120,10 +58,10 @@ def _requests(audit_log: Path) -> dict[str, list[dict]]:
 
 
 def test_knowledge_gateway_serves_search_and_fetch(tmp_path):
-    port = _free_port()
+    port = free_port()
     config = tmp_path / "contextbridge.yaml"
     config.write_text(f"name: ContextBridge\nserve:\n  host: 127.0.0.1\n  port: {port}\n", encoding="utf-8")
-    env = _isolated_env(MCP_AUTH_TOKEN=KNOWLEDGE_TOKEN, UGA_DATACORE_JSONL=str(FIXTURE))
+    env = isolated_env(MCP_AUTH_TOKEN=KNOWLEDGE_TOKEN, UGA_DATACORE_JSONL=str(FIXTURE))
     with serve("uga.gateway", config, port, env) as url:
 
         async def use(client):
@@ -148,13 +86,14 @@ def test_knowledge_gateway_serves_search_and_fetch(tmp_path):
 
 @pytest.fixture
 def computer(tmp_path, workspace):
-    port = _free_port()
+    port = free_port()
     config = _computer_config(tmp_path, workspace, port)
-    env = _isolated_env(CONTEXTBRIDGE_COMPUTER_TOKEN=COMPUTER_TOKEN)
+    env = isolated_env(CONTEXTBRIDGE_COMPUTER_TOKEN=COMPUTER_TOKEN)
     with serve("contextbridge.computer", config, port, env) as url:
         yield url, tmp_path / "audit" / "computer.jsonl"
 
 
+@posix_only
 def test_computer_gateway_starts_and_serves_authorized_requests(computer, workspace):
     url, audit_log = computer
 
@@ -189,6 +128,7 @@ def test_computer_gateway_requires_its_own_credential(computer):
         assert err.value.response.status_code == 401
 
 
+@posix_only
 def test_computer_gateway_rejects_traversal_and_unlisted_commands(computer, workspace):
     url, audit_log = computer
     attempts = [
@@ -218,8 +158,9 @@ def test_computer_gateway_rejects_traversal_and_unlisted_commands(computer, work
     assert lifecycles == [["requested", "denied"]] * len(attempts)
 
 
+@posix_only
 def test_computer_gateway_bounds_time_and_output(tmp_path, workspace):
-    port = _free_port()
+    port = free_port()
     cfg = {
         "serve": {"host": "127.0.0.1", "port": port, "audit_log": str(tmp_path / "audit.jsonl")},
         "filesystem": {"roots": [str(workspace)]},
@@ -227,7 +168,7 @@ def test_computer_gateway_bounds_time_and_output(tmp_path, workspace):
     }
     config = tmp_path / "computer.yaml"
     config.write_text(yaml.safe_dump(cfg), encoding="utf-8")
-    env = _isolated_env(CONTEXTBRIDGE_COMPUTER_TOKEN=COMPUTER_TOKEN)
+    env = isolated_env(CONTEXTBRIDGE_COMPUTER_TOKEN=COMPUTER_TOKEN)
     with serve("contextbridge.computer", config, port, env) as url:
 
         async def use(client):
@@ -245,9 +186,9 @@ def test_computer_gateway_bounds_time_and_output(tmp_path, workspace):
 
 
 def test_scopes_are_enforced_at_execution_time(tmp_path, workspace):
-    port = _free_port()
+    port = free_port()
     config = _computer_config(tmp_path, workspace, port, scopes=["computer:read"])
-    env = _isolated_env(CONTEXTBRIDGE_COMPUTER_TOKEN=COMPUTER_TOKEN)
+    env = isolated_env(CONTEXTBRIDGE_COMPUTER_TOKEN=COMPUTER_TOKEN)
     with serve("contextbridge.computer", config, port, env) as url:
 
         async def use(client):
@@ -339,15 +280,11 @@ def test_no_desktop_commander_dependency():
 # ------------------------------------------------------- Phase 3: remote agents
 
 
-def _cli(module: str, *args: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [sys.executable, "-m", module, *args], env=env, capture_output=True, text=True, timeout=60, check=False
-    )
 
 
 def test_remote_agent_end_to_end(tmp_path, workspace):
     """Pair, enroll, and serve a remote device over TLS using only the shipped CLIs, then revoke it."""
-    mcp_port, agent_port = _free_port(), _free_port()
+    mcp_port, agent_port = free_port(), free_port()
     gateway_config = tmp_path / "gateway.yaml"
     gateway_config.write_text(
         yaml.safe_dump(
@@ -366,13 +303,13 @@ def test_remote_agent_end_to_end(tmp_path, workspace):
         ),
         encoding="utf-8",
     )
-    env = _isolated_env()
+    env = isolated_env()
     admin = ("contextbridge.remote.admin", "--config", str(gateway_config))
 
-    tls = _cli(*admin, "tls-init", "--hostname", "localhost", "--ip", "127.0.0.1", env=env)
+    tls = cli(*admin, "tls-init", "--hostname", "localhost", "--ip", "127.0.0.1", env=env)
     assert tls.returncode == 0, tls.stderr
     fingerprint = re.search(r"fingerprint: (sha256:[0-9A-F:]+)", tls.stdout).group(1)
-    pair = _cli(*admin, "pair", "thanatos", env=env)
+    pair = cli(*admin, "pair", "thanatos", env=env)
     assert pair.returncode == 0, pair.stderr
     code = re.search(r"Enrollment code for thanatos: (\S+)", pair.stdout).group(1)
     assert fingerprint in pair.stdout
@@ -386,18 +323,18 @@ def test_remote_agent_end_to_end(tmp_path, workspace):
                 "identity": "agent-state/identity.json",
                 "audit_log": "audit/agent.jsonl",
                 "filesystem": {"roots": [str(workspace)], "writable_roots": [str(workspace / "work")]},
-                "commands": {"mode": "allowlist", "allow": ["echo", "ls"]},
+                "commands": {"mode": "allowlist", "allow": [PY]},
             }
         ),
         encoding="utf-8",
     )
     agent = ("contextbridge.remote.agent",)
 
-    gateway_env = _isolated_env(CONTEXTBRIDGE_COMPUTER_TOKEN=COMPUTER_TOKEN)
+    gateway_env = isolated_env(CONTEXTBRIDGE_COMPUTER_TOKEN=COMPUTER_TOKEN)
     with serve("contextbridge.computer", gateway_config, mcp_port, gateway_env) as url:
-        enrolled = _cli(*agent, "enroll", "--config", str(agent_config), "--code", code, env=env)
+        enrolled = cli(*agent, "enroll", "--config", str(agent_config), "--code", code, env=env)
         assert enrolled.returncode == 0, enrolled.stderr
-        reused = _cli(
+        reused = cli(
             *agent, "enroll", "--config", str(agent_config), "--code", code, env=env
         )  # identity exists → refused locally
         assert reused.returncode != 0
@@ -423,7 +360,9 @@ def test_remote_agent_end_to_end(tmp_path, workspace):
             async def use(client):
                 devices = await wait_online(client)
                 text = await client.call_tool("read_file", {"path": "docs/notes.md", "device": "thanatos"})
-                echoed = await client.call_tool("run_command", {"command": "echo remote", "device": "thanatos"})
+                echoed = await client.call_tool(
+                    "run_command", {"command": python_cmd("print('remote')"), "device": "thanatos"}
+                )
                 with pytest.raises(ToolError, match="Denied by policy"):
                     await client.call_tool("read_file", {"path": "../outside.txt", "device": "thanatos"})
                 with pytest.raises(ToolError, match="Denied by policy"):
@@ -433,10 +372,10 @@ def test_remote_agent_end_to_end(tmp_path, workspace):
             devices, text, echoed = call(url, COMPUTER_TOKEN, use)
             assert devices[0]["device"] == "thanatos" and devices[0]["info"]["platform"]
             assert text["content"] == "alpha\nbeta\ngamma\n"
-            assert echoed["stdout"] == "remote\n"
+            assert echoed["stdout"].strip() == "remote" and echoed["exit_code"] == 0
             assert not (workspace / "pwned").exists()
 
-            revoked = _cli(*admin, "revoke", "thanatos", env=env)
+            revoked = cli(*admin, "revoke", "thanatos", env=env)
             assert revoked.returncode == 0, revoked.stderr
             assert agent_proc.wait(timeout=15) != 0
             assert "revoked" in agent_proc.stderr.read()
@@ -461,4 +400,9 @@ def test_remote_agent_end_to_end(tmp_path, workspace):
     agent_ids = {e["request_id"] for e in agent_events if "request_id" in e}
     assert remote_ids & agent_ids  # the same request is traceable on both machines
     identity = tmp_path / "agent-state" / "identity.json"
-    assert oct(identity.stat().st_mode & 0o777) == "0o600"
+    if IS_WINDOWS:
+        acl = subprocess.run(["icacls", str(identity)], capture_output=True, text=True, check=True).stdout
+        assert "(I)" not in acl  # no inherited access
+        assert "NT AUTHORITY\\SYSTEM" in acl
+    else:
+        assert oct(identity.stat().st_mode & 0o777) == "0o600"

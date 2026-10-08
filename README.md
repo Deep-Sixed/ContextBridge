@@ -15,7 +15,7 @@ Being able to read knowledge never grants computer access. The computer route wo
 
 ```sh
 python3 -m pip install -e '.[test]'
-python3 -m pytest        # includes tests/test_acceptance.py, which launches both gateways over HTTP
+python3 -m pytest        # includes acceptance tests that launch the gateways and an agent as real processes
 ```
 
 ContextBridge requires FastMCP 3.x (`fastmcp>=3,<4`). It has no runtime dependency on Desktop Commander, Node, or npx, and the acceptance tests run both gateways in an environment without them.
@@ -169,6 +169,50 @@ Pairing is deliberately an admin CLI on the gateway host and not an MCP tool, so
   - **Gateway events.** The gateway's log also records `device_enrolled`, `device_connected`, `device_disconnected`, `device_auth_failed`, `device_revoked`, and `device_heartbeat_lost`.
   - **`started` comes from the agent.** The agent reports `started` only after its own checks pass and its own log has recorded it.
 
+### Windows devices (Thanatos)
+
+The agent runs natively on Windows 10/11 with Python 3.11+. No WSL and no Node are needed.
+
+```powershell
+git clone https://github.com/Deep-Sixed/ContextBridge C:\ContextBridge
+cd C:\ContextBridge
+py -3 -m venv .venv
+.venv\Scripts\python -m pip install -e .
+copy configs\agent.windows.yaml configs\agent.yaml     # then set name, gateway.url, gateway.fingerprint, policy
+.\scripts\run-agent.ps1 enroll -Code ABCD-EFGH-IJKL-MNOP   # once
+.\scripts\install-agent.ps1                                # elevated PowerShell; or -AtLogOn without elevation
+```
+
+**Running as a scheduled task.** `install-agent.ps1` registers a scheduled task that runs the agent as *your* account, never SYSTEM, so commands have exactly your permissions within the agent's policy.
+- **Default:** starts at boot whether or not you are signed in. It uses S4U, so no password is stored, but registering it needs an elevated shell.
+- **`-AtLogOn`:** starts at sign-in instead, and needs no elevation.
+- **Either way:** the task restarts the agent if it exits.
+- **Logs:** go to `audit\agent.log`, plus the agent's audit log.
+- **Removal:** `-Uninstall`.
+
+**What changes on Windows:**
+- **Process trees.** Every command runs inside a Windows Job Object. A timeout, `force_terminate`, or `kill` ends the command and everything it started. When a command exits, anything it left running in the background is ended too. If the agent itself is stopped, even by Task Scheduler, every process it started goes with it. Commands run without a console window.
+- **Allowlist mode.** Programs must be `.exe`/`.com` files found on `PATH`. The current directory is never searched. Names are case-insensitive (`git` matches `Git.EXE`).
+  - **Not programs:** `cmd.exe` built-ins (`dir`, `type`, `echo`) aren't programs, so they can't be allowlisted.
+  - **Refused:** `.bat`/`.cmd` scripts, because `cmd.exe` re-parses their arguments, which allows command injection.
+  - **Quoting:** command lines are split with Windows rules, so `git -C "C:\Program Files\repo" status` works as written.
+- **Unrestricted mode.** `commands.shell` picks the shell: `powershell` (the default), `pwsh`, or `cmd`.
+  - **PowerShell:** scripts are passed with `-EncodedCommand`, so quoting is never mangled, and output is forced to UTF-8.
+  - **cmd:** receives the command line verbatim.
+- **Paths.** Windows silently reinterprets some names, and those could slip past deny patterns, so they are refused:
+  - alternate data streams (`notes.md:secret`, `.env::$DATA`);
+  - device names (`CON`, `NUL`, `COM1`, …);
+  - names ending in a dot or space (`.env.` opens `.env`);
+  - `\\?\` / `\\.\` device paths;
+  - drive-relative paths (`C:file`).
+
+  Deny patterns ignore case. Windows adds its own defaults: registry hives, DPAPI and credential stores (`Protect`, `Credentials`, `Vault`), browser secrets, `*.ppk`, and `.azure`.
+- **Text files.** UTF-16 files (what Windows PowerShell's `>` writes) and UTF-8 files with a BOM are read, searched, and edited as text. Edits keep the file's encoding and BOM. Command output that isn't UTF-8 is decoded with the console code page.
+- **Identity key.** The enrolled key file's ACL is reduced to your account and SYSTEM, with inherited access removed. If that fails, enrollment stops instead of leaving the key readable.
+- **Processes.** `kill_process` refuses critical Windows processes (`lsass`, `csrss`, `winlogon`, …), even with `allow_kill: true`.
+
+CI runs the whole suite on `windows-latest` as well as Ubuntu. That includes the gateway-and-agent tests and the CLI end-to-end test, plus Windows-only tests for job objects, alternate data streams, `.bat` refusal, ACLs, and the PowerShell and cmd shells.
+
 ## Network exposure
 
 Neither route includes an OAuth server or a public HTTPS listener, and neither depends on Authentik.
@@ -183,7 +227,7 @@ Do not forward ports 8790, 8791, or 8792 to the internet.
 1. ~~Independent local filesystem and terminal tools~~
 2. ~~Local policy enforcement, execution limits, tests~~
 3. ~~Remote agent transport and device registration (outbound agent connections, heartbeats, revocation)~~
-4. Windows agent for Thanatos (the agent and engine are written cross-platform but are only tested on Linux so far)
+4. ~~Windows agent for Thanatos (native agent, job-object process trees, scheduled-task install, Windows CI)~~
 5. Authenticated remote MCP endpoint for ChatGPT and Claude (OAuth front end, per-device permissions)
 6. Failover acceptance test with Desktop Commander fully stopped
 

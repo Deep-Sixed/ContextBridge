@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -15,6 +14,7 @@ import yaml
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
+from helpers import PY, python_cmd
 
 from contextbridge.computer.audit import ComputerAuditLog
 from contextbridge.computer.policy import PolicyError
@@ -26,8 +26,8 @@ from contextbridge.remote.protocol import encode
 from contextbridge.remote.registry import DeviceRegistry
 from contextbridge.remote.tls import PinMismatch, generate_self_signed, server_context
 
-pytestmark = pytest.mark.skipif(os.name == "nt", reason="exercises POSIX agents")
 DEVICE = "thanatos"
+HI = python_cmd("print('hi')")
 
 
 def allow_scopes(*scopes: str):
@@ -64,7 +64,7 @@ def write_agent_config(tmp_path: Path, workspace: Path, url: str, **overrides) -
         "identity": str(tmp_path / "agent-state" / "identity.json"),
         "audit_log": str(tmp_path / "agent-audit.jsonl"),
         "filesystem": {"roots": [str(workspace)], "writable_roots": [str(workspace / "work")]},
-        "commands": {"mode": "allowlist", "allow": ["echo", "ls"]},
+        "commands": {"mode": "allowlist", "allow": [PY]},
     }
     for key, value in overrides.items():
         cfg[key] = value
@@ -135,7 +135,7 @@ def test_enrolled_agent_serves_calls_through_the_gateway(tmp_path, workspace):
                 tools = {t.name for t in await client.list_tools()}
                 devices = (await client.call_tool("list_devices", {})).structured_content["devices"]
                 text = await client.call_tool("read_file", {"path": "docs/notes.md", "device": DEVICE})
-                echoed = await client.call_tool("run_command", {"command": "echo hi", "device": DEVICE})
+                echoed = await client.call_tool("run_command", {"command": HI, "device": DEVICE})
                 written = await client.call_tool(
                     "write_file", {"path": "work/remote.txt", "content": "from gateway", "device": DEVICE}
                 )
@@ -147,7 +147,7 @@ def test_enrolled_agent_serves_calls_through_the_gateway(tmp_path, workspace):
     assert [d["device"] for d in devices] == [DEVICE]
     assert devices[0]["online"] is True and "run_command" in devices[0]["tools"]
     assert text["content"] == "alpha\nbeta\ngamma\n"
-    assert echoed["stdout"] == "hi\n" and echoed["exit_code"] == 0
+    assert echoed["stdout"].strip() == "hi" and echoed["exit_code"] == 0
     assert (workspace / "work" / "remote.txt").read_text() == "from gateway"
 
     gateway_log = tmp_path / "gateway-audit.jsonl"
@@ -158,7 +158,7 @@ def test_enrolled_agent_serves_calls_through_the_gateway(tmp_path, workspace):
     assert lifecycle(gateway_log, request_id) == ["requested", "started", "completed"]
     assert lifecycle(agent_log, request_id) == ["requested", "started", "completed"]
     started = [e for e in events(gateway_log) if e.get("request_id") == request_id and e["event"] == "started"][0]
-    assert started["argv"][-1] == "hi"  # the agent's own view of what it ran
+    assert started["argv"][-1] == "print('hi')"  # the agent's own view of what it ran
     assert {"device_enrolled", "device_connected"} <= {e["event"] for e in events(gateway_log)}
 
 
@@ -234,7 +234,7 @@ def test_device_scopes_are_enforced_by_the_gateway(tmp_path, workspace):
             async with mcp(gw) as client:
                 await client.call_tool("read_file", {"path": "docs/notes.md", "device": DEVICE})
                 with pytest.raises(ToolError, match="not authorized for 'run_command'"):
-                    await client.call_tool("run_command", {"command": "echo hi", "device": DEVICE})
+                    await client.call_tool("run_command", {"command": HI, "device": DEVICE})
 
     asyncio.run(scenario())
     agent_tools = [e["tool"] for e in events(tmp_path / "agent-audit.jsonl") if e["event"] == "requested"]
@@ -246,7 +246,7 @@ def test_token_scopes_still_apply_to_remote_devices(tmp_path, workspace):
         async with gateway(tmp_path) as gw, connected_agent(tmp_path, workspace, gw):
             async with mcp(gw, scopes=["computer:read"]) as client:
                 with pytest.raises(ToolError, match="not authorized"):
-                    await client.call_tool("run_command", {"command": "echo hi", "device": DEVICE})
+                    await client.call_tool("run_command", {"command": HI, "device": DEVICE})
 
     asyncio.run(scenario())
 

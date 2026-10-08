@@ -45,9 +45,25 @@ def _kind(st: os.stat_result) -> str:
     return "other"
 
 
-def _is_binary(path: Path) -> bool:
+def _text_encoding(path: Path) -> str | None:
+    """The encoding to read ``path`` with, or None if it looks binary.
+
+    Recognizes byte-order marks, so UTF-16 files (what Windows PowerShell's ``>``
+    writes) and UTF-8 files with a BOM are text.
+    """
     with path.open("rb") as fh:
-        return b"\x00" in fh.read(_BINARY_SNIFF_BYTES)
+        head = fh.read(_BINARY_SNIFF_BYTES)
+    if head.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+    if head.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return "utf-16"
+    if b"\x00" in head:
+        return None
+    return "utf-8"
+
+
+def _is_binary(path: Path) -> bool:
+    return _text_encoding(path) is None
 
 
 def _require_file(path: Path, raw: str) -> None:
@@ -130,7 +146,8 @@ def read_file(
     _require_file(resolved, path)
     mark_started(path=str(resolved))
     size = resolved.stat().st_size
-    if _is_binary(resolved):
+    encoding = _text_encoding(resolved)
+    if encoding is None:
         raise FileOperationError(
             f"{path} looks like a binary file ({size} bytes); only text files can be read."
         )
@@ -138,7 +155,7 @@ def read_file(
     used = 0
     truncated = False
     total_lines = 0
-    with resolved.open("r", encoding="utf-8", errors="replace", newline="") as fh:
+    with resolved.open("r", encoding=encoding, errors="replace", newline="") as fh:
         if offset < 0:
             tail: deque[str] = deque(maxlen=-offset)
             for line in fh:
@@ -171,6 +188,7 @@ def read_file(
                 lines.append(line)
     return {
         "path": str(resolved),
+        "encoding": encoding,
         "content": "".join(lines),
         "start_line": start,
         "lines_returned": len(lines),
@@ -197,9 +215,11 @@ def get_file_info(policy: ComputerPolicy, path: str) -> dict[str, Any]:
         "writable_by_policy": _writable(policy, resolved),
     }
     if resolved.is_file() and st.st_size <= policy.max_read_bytes:
-        info["binary"] = _is_binary(resolved)
-        if not info["binary"]:
-            with resolved.open("rb") as fh:
+        encoding = _text_encoding(resolved)
+        info["binary"] = encoding is None
+        if encoding is not None:
+            info["encoding"] = encoding
+            with resolved.open("r", encoding=encoding, errors="replace", newline="") as fh:
                 info["line_count"] = sum(1 for _ in fh)
     return info
 
@@ -302,9 +322,12 @@ def search_code(
         try:
             if not candidate.is_file():  # never open FIFOs or devices
                 continue
-            if candidate.stat().st_size > policy.max_read_bytes or _is_binary(candidate):
+            if candidate.stat().st_size > policy.max_read_bytes:
                 continue
-            with candidate.open("r", encoding="utf-8", errors="replace") as fh:
+            encoding = _text_encoding(candidate)
+            if encoding is None:
+                continue
+            with candidate.open("r", encoding=encoding, errors="replace") as fh:
                 lines = fh.read().splitlines()
         except OSError:
             continue
@@ -334,8 +357,8 @@ def search_code(
 # ------------------------------------------------------------------ writing
 
 
-def _encode_for_write(policy: ComputerPolicy, content: str) -> bytes:
-    data = content.encode("utf-8")
+def _encode_for_write(policy: ComputerPolicy, content: str, encoding: str = "utf-8") -> bytes:
+    data = content.encode(encoding)
     if len(data) > policy.max_write_bytes:
         raise FileOperationError(
             f"Content is {len(data)} bytes; the limit is {policy.max_write_bytes} bytes per write."
@@ -384,9 +407,10 @@ def edit_block(
         raise FileOperationError("expected_replacements must be at least 1.")
     resolved = policy.resolve(path, write=True)
     _require_file(resolved, path)
-    if resolved.stat().st_size > policy.max_read_bytes or _is_binary(resolved):
+    encoding = _text_encoding(resolved)
+    if resolved.stat().st_size > policy.max_read_bytes or encoding is None:
         raise FileOperationError(f"{path} is binary or larger than the read limit; it cannot be edited.")
-    with resolved.open("r", encoding="utf-8", newline="") as fh:
+    with resolved.open("r", encoding=encoding, newline="") as fh:
         original = fh.read()
     found = original.count(old_string)
     if found != expected_replacements:
@@ -395,7 +419,7 @@ def edit_block(
             f"Expected {expected_replacements} occurrence(s) of old_string in {path}, found {found}.{hint}"
         )
     updated = original.replace(old_string, new_string)
-    data = _encode_for_write(policy, updated)
+    data = _encode_for_write(policy, updated, encoding)  # keeps the file's encoding and BOM
     mark_started(path=str(resolved), replacements=found)
     _atomic_write(resolved, data)
     return {"path": str(resolved), "replacements": found}

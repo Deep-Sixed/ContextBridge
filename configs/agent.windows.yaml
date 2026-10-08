@@ -1,0 +1,36 @@
+# ContextBridge agent for a Windows machine (e.g. Thanatos). Copy to configs/agent.yaml and edit.
+# This file is the machine's own policy: the gateway cannot widen it.
+# Paths: forward slashes work everywhere; with backslashes, use single quotes ('C:\Users\me').
+name: thanatos             # must match the name used with `contextbridge-admin pair`
+
+gateway:
+  url: wss://100.101.102.103:8792   # the gateway's agents.host/port (e.g. its Tailscale IP)
+  fingerprint: sha256:REPLACE-WITH-THE-FINGERPRINT-FROM-contextbridge-admin-pair
+
+identity: ../state/agent-identity.json   # written by `enroll`; ACL limited to you and SYSTEM; hidden from file tools
+audit_log: ../audit/agent.audit.jsonl    # required; this machine's own record of every call
+max_concurrent_calls: 8
+
+filesystem:
+  roots:
+    - "~"                  # C:/Users/<you>
+  writable_roots: []       # e.g. "~/Projects" to allow edits there
+  # Built-in deny list (always applied unless you set `deny`): .ssh, .env*, *.pem, *.key, *.kdbx, plus on
+  # Windows NTUSER.DAT*, DPAPI/credential stores (Protect, Credentials, Vault), browser secrets
+  # (Login Data, Cookies, Local State), *.ppk, .azure.
+
+commands:
+  mode: allowlist
+  # Allowlist mode runs one .exe/.com program per call, found on PATH (never in the current directory).
+  # cmd.exe built-ins (dir, type, echo) are not programs, and .bat/.cmd scripts are refused because
+  # cmd.exe would re-parse their arguments. Adding a shell or interpreter (powershell, cmd, python)
+  # makes allowlist mode equivalent to unrestricted.
+  allow: [git, where, whoami, hostname, ipconfig, systeminfo, tasklist]
+  # To run PowerShell or cmd commands, switch to unrestricted and pick the shell:
+  # mode: unrestricted
+  # shell: powershell      # powershell (default) | pwsh | cmd
+  max_timeout_seconds: 600
+
+processes:
+  list: true
+  allow_kill: false        # critical Windows processes (lsass, csrss, winlogon, ...) are refused regardless

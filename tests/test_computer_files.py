@@ -4,6 +4,7 @@ import os
 import stat
 
 import pytest
+from helpers import symlink_or_skip
 
 from contextbridge.computer import files
 from contextbridge.computer.files import FileOperationError
@@ -102,7 +103,7 @@ def test_search_code_literal_regex_and_context(policy, workspace):
 
 
 def test_search_code_skips_symlinks_out_of_roots(policy, workspace):
-    (workspace / "docs" / "leak.txt").symlink_to(workspace.parent / "outside.txt")
+    symlink_or_skip(workspace / "docs" / "leak.txt", workspace.parent / "outside.txt")
     assert files.search_code(policy, str(workspace), "outside")["matches"] == []
 
 
@@ -113,7 +114,8 @@ def test_write_file_rewrite_and_append(policy, workspace):
     os.chmod(target, 0o640)
     files.write_file(policy, "work/out.txt", "two\n")
     assert target.read_text() == "two\n"
-    assert stat.S_IMODE(target.stat().st_mode) == 0o640
+    if os.name != "nt":  # POSIX mode bits survive the atomic rewrite
+        assert stat.S_IMODE(target.stat().st_mode) == 0o640
     files.write_file(policy, "work/out.txt", "three\n", mode="append")
     assert target.read_text() == "two\nthree\n"
     assert not [p for p in (workspace / "work").iterdir() if p.name.endswith(".cbtmp")]
@@ -132,7 +134,7 @@ def test_write_file_limits(make_policy, workspace):
 
 
 def test_write_through_symlink_out_of_writable_root_is_denied(policy, workspace):
-    (workspace / "work" / "notes-link.md").symlink_to(workspace / "docs" / "notes.md")
+    symlink_or_skip(workspace / "work" / "notes-link.md", workspace / "docs" / "notes.md")
     with pytest.raises(PolicyViolation, match="writable"):
         files.write_file(policy, "work/notes-link.md", "x")
     assert (workspace / "docs" / "notes.md").read_text() == "alpha\nbeta\ngamma\n"
@@ -209,3 +211,27 @@ def test_move_refuses_roots_and_protected_ancestors(workspace):
     with pytest.raises(PolicyViolation, match="configured root"):
         files.move_file(policy, "work/inner", "work/elsewhere")
     assert config.exists()
+
+
+def test_utf16_files_from_powershell_are_text(policy, workspace):
+    """Windows PowerShell's `>` writes UTF-16 with a BOM; it must read, search, and edit as text."""
+    target = workspace / "work" / "ps.log"
+    target.write_bytes("first line\r\nzweite Zeile ü\r\n".encode("utf-16"))
+    read = files.read_file(policy, "work/ps.log")
+    assert read["content"] == "first line\r\nzweite Zeile ü\r\n" and read["encoding"] == "utf-16"
+    hits = files.search_code(policy, str(workspace / "work"), "zweite")["matches"]
+    assert [(h["line"], h["text"]) for h in hits] == [(2, "zweite Zeile ü")]
+    info = files.get_file_info(policy, "work/ps.log")
+    assert info["binary"] is False and info["line_count"] == 2
+    files.edit_block(policy, "work/ps.log", "zweite", "second")
+    raw = target.read_bytes()
+    assert raw[:2] in (b"\xff\xfe", b"\xfe\xff")  # still UTF-16 with its BOM
+    assert raw.decode("utf-16") == "first line\r\nsecond Zeile ü\r\n"
+
+
+def test_utf8_bom_is_preserved_on_edit(policy, workspace):
+    target = workspace / "work" / "bom.txt"
+    target.write_bytes(b"\xef\xbb\xbfhello\r\n")
+    assert files.read_file(policy, "work/bom.txt")["content"] == "hello\r\n"
+    files.edit_block(policy, "work/bom.txt", "hello", "bye")
+    assert target.read_bytes() == b"\xef\xbb\xbfbye\r\n"

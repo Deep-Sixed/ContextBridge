@@ -3,14 +3,14 @@
 Commands run without an intermediate shell in allowlist mode, with credentials
 stripped from the environment, inside a readable root, under a hard timeout,
 and with bounded output capture. Timed-out commands are killed with their whole
-process tree.
+process tree (see :mod:`.proctree`). On Windows, nothing a command starts
+outlives it.
 """
 
 from __future__ import annotations
 
 import itertools
 import os
-import signal
 import subprocess
 import sys
 import threading
@@ -22,7 +22,9 @@ from typing import IO, Any
 import psutil
 
 from .audit import mark_started
+from .oscompat import decode_output
 from .policy import ComputerPolicy, PolicyViolation
+from .proctree import IS_WINDOWS, ProcessTree
 
 _READ_CHUNK = 65536
 _MAX_WAIT_SECONDS = 30.0
@@ -34,32 +36,10 @@ class CommandError(ValueError):
     """Raised when a command or session request cannot be fulfilled."""
 
 
-def _popen_kwargs() -> dict[str, Any]:
-    if os.name == "nt":
-        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-    return {"start_new_session": True}
-
-
-def kill_tree(proc: subprocess.Popen[bytes]) -> None:
-    """Kill ``proc`` and every descendant it started."""
-    try:
-        children = psutil.Process(proc.pid).children(recursive=True)
-    except psutil.Error:
-        children = []
-    if os.name != "nt":
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except OSError:
-            pass
-    for child in children:
-        try:
-            child.kill()
-        except psutil.Error:
-            pass
-    try:
-        proc.kill()
-    except OSError:
-        pass
+# Processes that must never be signalled; killing them crashes or locks Windows.
+_WINDOWS_CRITICAL = frozenset(
+    {"system", "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe", "services.exe", "lsass.exe", "lsaiso.exe"}
+)
 
 
 def _resolve_cwd(policy: ComputerPolicy, cwd: str | None) -> Path:
@@ -95,8 +75,8 @@ class BoundedCapture:
         return self.total > len(self._head) + len(self._tail)
 
     def text(self) -> str:
-        head = self._head.decode("utf-8", errors="replace")
-        tail = self._tail.decode("utf-8", errors="replace")
+        head = decode_output(bytes(self._head))
+        tail = decode_output(bytes(self._tail))
         if not self.truncated:
             return head + tail
         dropped = self.total - len(self._head) - len(self._tail)
@@ -131,17 +111,17 @@ def run_command(
     mark_started(argv=argv, cwd=str(directory), timeout_seconds=timeout)
     started = time.monotonic()
     try:
-        proc = subprocess.Popen(
+        tree = ProcessTree(
             argv,
             cwd=directory,
             env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            **_popen_kwargs(),
         )
     except OSError as exc:
         raise CommandError(f"Could not start command: {exc}") from None
+    proc = tree.proc
     readers = [
         threading.Thread(target=_pump, args=(proc.stdout, stdout.feed), daemon=True),
         threading.Thread(target=_pump, args=(proc.stderr, stderr.feed), daemon=True),
@@ -153,12 +133,13 @@ def run_command(
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
-        kill_tree(proc)
+        tree.kill()
         proc.wait()
     finally:
         if proc.poll() is None:
-            kill_tree(proc)
+            tree.kill()
             proc.wait()
+        tree.release()
     drain_deadline = time.monotonic() + _JOIN_SECONDS
     for reader in readers:
         reader.join(max(0.0, drain_deadline - time.monotonic()))
@@ -189,14 +170,15 @@ class _Session:
         session_id: str,
         command: str,
         cwd: Path,
-        proc: subprocess.Popen[bytes],
+        tree: ProcessTree,
         cap: int,
         on_exit: ExitCallback | None = None,
     ) -> None:
         self.id = session_id
         self.command = command
         self.cwd = cwd
-        self.proc = proc
+        self.tree = tree
+        self.proc = proc = tree.proc
         self.started = time.time()
         self.cap = cap
         self.buffer = bytearray()
@@ -211,6 +193,8 @@ class _Session:
 
     def _wait_for_exit(self) -> None:
         self.proc.wait()
+        self.reader.join(_SESSION_DRAIN_SECONDS)
+        self.tree.release()
         if self._on_exit is None:
             return
         try:
@@ -251,7 +235,7 @@ class _Session:
             self.cursor = self.end
         return {
             **self.status(),
-            "output": data.decode("utf-8", errors="replace"),
+            "output": decode_output(data),
             "dropped_bytes": dropped,
         }
 
@@ -311,14 +295,13 @@ class SessionManager:
             env = self._policy.child_env()
             mark_started(argv=argv, cwd=str(directory), lifetime_seconds=lifetime)
             try:
-                proc = subprocess.Popen(
+                tree = ProcessTree(
                     argv,
                     cwd=directory,
                     env=env,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    **_popen_kwargs(),
                 )
             except OSError as exc:
                 raise CommandError(f"Could not start command: {exc}") from None
@@ -326,7 +309,7 @@ class SessionManager:
                 f"s{next(self._ids)}",
                 command,
                 directory,
-                proc,
+                tree,
                 self._policy.max_output_bytes * 4,
                 on_exit=self._on_exit,
             )
@@ -341,7 +324,7 @@ class SessionManager:
     def _expire(self, session: _Session) -> None:
         if session.running():
             session.timed_out = True
-            kill_tree(session.proc)
+            session.tree.kill()
 
     def read(self, session_id: str, *, wait_seconds: float = 0.0) -> dict[str, Any]:
         session = self._get(session_id)
@@ -352,7 +335,8 @@ class SessionManager:
         session = self._get(session_id)
         if not session.running() or session.proc.stdin is None:
             raise CommandError(f"Session {session_id} is no longer running.")
-        payload = (text + ("\n" if newline else "")).encode("utf-8")
+        line_end = "\r\n" if IS_WINDOWS else "\n"
+        payload = (text + (line_end if newline else "")).encode("utf-8")
         mark_started(session_id=session_id, pid=session.proc.pid, input_bytes=len(payload))
         try:
             session.proc.stdin.write(payload)
@@ -365,7 +349,7 @@ class SessionManager:
         session = self._get(session_id)
         mark_started(session_id=session_id, pid=session.proc.pid)
         if session.running():
-            kill_tree(session.proc)
+            session.tree.kill()
             try:
                 session.proc.wait(timeout=_JOIN_SECONDS)
             except subprocess.TimeoutExpired:
@@ -383,7 +367,7 @@ class SessionManager:
             sessions = list(self._sessions.values())
         for session in sessions:
             if session.running():
-                kill_tree(session.proc)
+                session.tree.kill()
 
 
 # ---------------------------------------------------------------- processes
@@ -427,6 +411,8 @@ def kill_process(pid: int, *, force: bool = False) -> dict[str, Any]:
     try:
         proc = psutil.Process(pid)
         name = proc.name()
+        if IS_WINDOWS and name.lower() in _WINDOWS_CRITICAL:
+            raise PolicyViolation(f"Process {pid} ({name}) is critical to Windows and cannot be signalled.")
         mark_started(pid=pid, name=name, signal="kill" if force else "terminate")
         if force:
             proc.kill()

@@ -4,8 +4,11 @@ import os
 from pathlib import Path
 
 import pytest
+from helpers import symlink_or_skip
 
 from contextbridge.computer.policy import PolicyError, PolicyViolation, load_policy
+
+posix_only = pytest.mark.skipif(os.name == "nt", reason="uses POSIX programs and shells")
 
 
 def test_relative_paths_resolve_against_first_root(policy, workspace):
@@ -21,7 +24,7 @@ def test_paths_outside_roots_are_denied(policy, workspace):
 
 def test_symlink_cannot_escape_roots(policy, workspace):
     link = workspace / "docs" / "escape.txt"
-    link.symlink_to(workspace.parent / "outside.txt")
+    symlink_or_skip(link, workspace.parent / "outside.txt")
     with pytest.raises(PolicyViolation, match="outside"):
         policy.resolve(str(link))
     assert not policy.is_visible(link)
@@ -89,6 +92,7 @@ def test_defaults_are_read_only_without_commands(workspace):
         policy.command_argv("echo hi")
 
 
+@posix_only
 def test_allowlist_resolves_program_on_path(policy):
     argv = policy.command_argv("echo 'hello world'")
     assert Path(argv[0]).name == "echo"
@@ -104,6 +108,7 @@ def test_allowlist_rejects_unlisted_programs(policy, command):
         policy.command_argv(command)
 
 
+@posix_only  # Windows operators are covered in test_oscompat.py
 @pytest.mark.parametrize(
     "command", ["ls | sh", "echo a; rm x", "echo a && echo b", "echo a > f", "cat < f", "echo $(id) &"]
 )
@@ -112,6 +117,7 @@ def test_allowlist_rejects_shell_operators(policy, command):
         policy.command_argv(command)
 
 
+@posix_only  # Windows shells are covered in test_oscompat.py
 def test_unrestricted_mode_uses_a_shell(make_policy):
     policy = make_policy(commands={"mode": "unrestricted"})
     argv = policy.command_argv("echo a | cat")

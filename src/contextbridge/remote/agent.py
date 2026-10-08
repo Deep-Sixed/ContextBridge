@@ -22,6 +22,7 @@ import random
 import signal
 import socket
 import ssl
+import subprocess
 import sys
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -75,6 +76,46 @@ class AgentError(RuntimeError):
 
 class FatalAgentError(RuntimeError):
     """The agent must stop: revoked, unknown, misconfigured, or the gateway identity is wrong."""
+
+
+# ------------------------------------------------------------------ file ACLs
+
+
+def _system32(program: str) -> str:
+    return os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", program)
+
+
+def _current_user_sid() -> str:
+    out = subprocess.run(
+        [_system32("whoami.exe"), "/user", "/fo", "csv", "/nh"],
+        capture_output=True,
+        text=True,
+        check=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    ).stdout
+    sid = out.strip().rsplit(",", 1)[-1].strip().strip('"')
+    if not sid.startswith("S-1-"):
+        raise OSError(f"could not determine the current user's SID from {out!r}")
+    return sid
+
+
+def restrict_to_owner(path: Path) -> None:
+    """Make ``path`` readable only by the current user (and SYSTEM on Windows).
+
+    POSIX: mode 0600. Windows: inherited ACEs are removed and only the current
+    user and LocalSystem keep access.
+    """
+    if os.name != "nt":
+        os.chmod(path, 0o600)
+        return
+    sid = _current_user_sid()
+    subprocess.run(
+        [_system32("icacls.exe"), str(path), "/inheritance:r", "/grant:r", f"*{sid}:F", "*S-1-5-18:F"],
+        capture_output=True,
+        text=True,
+        check=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
 
 
 # --------------------------------------------------------------------- config
@@ -161,9 +202,16 @@ class Identity:
         )
         data = {"device_id": self.device_id, "name": self.name, "gateway_id": self.gateway_id, "private_key": b64e(raw)}
         path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2)
+        # Create the file empty, lock it down, and only then write the key into it.
+        os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        try:
+            restrict_to_owner(path)
+            with path.open("w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            with contextlib.suppress(OSError):
+                path.unlink()
+            raise FatalAgentError(f"could not store the device key securely at {path}: {exc}") from None
 
     @classmethod
     def load(cls, path: Path) -> Identity:
@@ -474,7 +522,13 @@ def main(argv: list[str] | None = None) -> None:
     enroll_cmd.add_argument("--code", required=True, help="one-time code from `contextbridge-admin pair`")
     run_cmd = sub.add_parser("run", help="connect to the gateway and serve tool calls")
     run_cmd.add_argument("--config", required=True)
+    run_cmd.add_argument("--log-file", help="append diagnostics here (for services with no console)")
     args = ap.parse_args(argv)
+
+    if getattr(args, "log_file", None):
+        log_path = Path(args.log_file).expanduser()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        sys.stderr = log_path.open("a", buffering=1, encoding="utf-8")
 
     try:
         config = load_agent_config(args.config)
@@ -511,6 +565,8 @@ def main(argv: list[str] | None = None) -> None:
         asyncio.run(serve())
     except FatalAgentError as exc:
         raise SystemExit(f"[agent] stopped: {exc}") from None
+    except KeyboardInterrupt:
+        print("[agent] stopped", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":
