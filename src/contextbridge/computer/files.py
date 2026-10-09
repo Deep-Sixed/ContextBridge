@@ -14,11 +14,13 @@ import shutil
 import stat
 import tempfile
 import time
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .audit import mark_started
+from .matcher import RegexWorker, RegexWorkerError
 from .policy import ComputerPolicy, PolicyViolation
 
 _BINARY_SNIFF_BYTES = 8192
@@ -331,7 +333,10 @@ def search_code(
     context_lines: int = 0,
     max_results: int | None = None,
 ) -> dict[str, Any]:
-    """Search text file contents under ``path``; binary and oversized files are skipped."""
+    """Search text file contents under ``path``; binary and oversized files are skipped.
+
+    The whole search, regex matching included, ends at ``max_search_seconds``.
+    """
     root = policy.resolve(path)
     if not pattern:
         raise FileOperationError("A search pattern is required.")
@@ -356,38 +361,57 @@ def search_code(
     matches: list[dict[str, Any]] = []
     files_scanned = 0
     truncated = False
-    for candidate, is_dir in candidates:
-        if is_dir:
-            continue
-        if time.monotonic() > deadline or truncated:
-            break
-        if file_glob and not fnmatch.fnmatchcase(candidate.name.casefold(), file_glob):
-            continue
-        try:
-            if not candidate.is_file():  # never open FIFOs or devices
+    worker: RegexWorker | None = None  # started on the first file a regex search reads
+    try:
+        for candidate, is_dir in candidates:
+            if is_dir:
                 continue
-            if candidate.stat().st_size > policy.max_read_bytes:
-                continue
-            encoding = _text_encoding(candidate)
-            if encoding is None:
-                continue
-            with candidate.open("r", encoding=encoding, errors="replace") as fh:
-                lines = fh.read().splitlines()
-        except OSError:
-            continue
-        files_scanned += 1
-        for index, line in enumerate(lines):
-            if not matcher.search(line):
-                continue
-            if len(matches) >= limit:
-                truncated = True
+            if time.monotonic() > deadline or truncated:
                 break
-            hit: dict[str, Any] = {"path": str(candidate), "line": index + 1, "text": _clip(line)}
-            if context_lines:
-                lo = max(0, index - context_lines)
-                hit["before"] = [_clip(x) for x in lines[lo:index]]
-                hit["after"] = [_clip(x) for x in lines[index + 1 : index + 1 + context_lines]]
-            matches.append(hit)
+            if file_glob and not fnmatch.fnmatchcase(candidate.name.casefold(), file_glob):
+                continue
+            try:
+                if not candidate.is_file():  # never open FIFOs or devices
+                    continue
+                if candidate.stat().st_size > policy.max_read_bytes:
+                    continue
+                encoding = _text_encoding(candidate)
+                if encoding is None:
+                    continue
+                with candidate.open("r", encoding=encoding, errors="replace") as fh:
+                    text = fh.read(policy.max_read_bytes + 1)
+            except OSError:
+                continue
+            if len(text) > policy.max_read_bytes:  # it grew past the limit after the size check
+                continue
+            lines = text.splitlines()
+            if regex:
+                # Caller patterns can backtrack exponentially while holding the GIL: match them
+                # in a child process that is killed at the deadline (see .matcher).
+                if worker is None:
+                    worker = RegexWorker(pattern, flags, env=policy.child_env())
+                hits: Iterable[int] | None = worker.search(text, limit - len(matches) + 1, deadline)
+                if hits is None:
+                    break
+            else:
+                hits = (index for index, line in enumerate(lines) if matcher.search(line))
+            files_scanned += 1
+            for index in hits:
+                if len(matches) >= limit:
+                    truncated = True
+                    break
+                line = lines[index]
+                hit: dict[str, Any] = {"path": str(candidate), "line": index + 1, "text": _clip(line)}
+                if context_lines:
+                    lo = max(0, index - context_lines)
+                    hit["before"] = [_clip(x) for x in lines[lo:index]]
+                    hit["after"] = [_clip(x) for x in lines[index + 1 : index + 1 + context_lines]]
+                matches.append(hit)
+    except RegexWorkerError as exc:
+        raise FileOperationError(f"Regular-expression search failed: {exc}.") from None
+    finally:
+        if worker is not None:
+            worker.close()
     timed_out = time.monotonic() > deadline
     return {
         "path": str(root),

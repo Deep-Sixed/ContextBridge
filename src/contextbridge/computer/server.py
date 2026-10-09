@@ -439,8 +439,9 @@ def create_computer_server(
         max_results: int | None = None,
         device: str = LOCAL_DEVICE,
     ) -> dict[str, Any]:
-        """Search text file contents under path. Literal match unless regex is true.
-        file_pattern filters file names by glob (e.g. *.py). context_lines adds up to 5 surrounding lines."""
+        """Search text file contents under path. Literal match unless regex is true (Python re syntax).
+        file_pattern filters file names by glob (e.g. *.py). context_lines adds up to 5 surrounding lines.
+        The search stops at the device's time limit (timed_out) and returns what it found so far."""
         args = {
             "path": path,
             "pattern": pattern,

@@ -3,13 +3,17 @@ from __future__ import annotations
 import io
 import os
 import stat
+import threading
+import time
 import tracemalloc
 
+import psutil
 import pytest
 from helpers import symlink_or_skip
 
 from contextbridge.computer import files
 from contextbridge.computer.files import FileOperationError
+from contextbridge.computer.matcher import WORKER_TAG
 from contextbridge.computer.policy import PolicyViolation, load_policy
 
 
@@ -175,6 +179,52 @@ def test_search_code_literal_regex_and_context(policy, workspace):
     assert files.search_code(policy, str(workspace), "PRIVATE")["matches"] == []
     with pytest.raises(FileOperationError, match="regular expression"):
         files.search_code(policy, str(workspace), "(", regex=True)
+
+
+def _worker_processes():
+    rows = []
+    for proc in psutil.Process().children(recursive=True):
+        try:
+            if WORKER_TAG in " ".join(proc.cmdline()):
+                rows.append(proc)
+        except psutil.Error:
+            continue
+    return rows
+
+
+def test_search_code_catastrophic_regex_neither_hangs_nor_stalls_other_threads(make_policy, workspace):
+    (workspace / "docs" / "a_quick.txt").write_text("aaa\n", encoding="utf-8")
+    (workspace / "docs" / "b_slow.txt").write_text("a" * 26 + "b\n", encoding="utf-8")  # ~10 s in-process
+    policy = make_policy(filesystem={"max_search_seconds": 1})
+    ticks: list[float] = []
+    done = threading.Event()
+
+    def tick():
+        while not done.is_set():
+            ticks.append(time.monotonic())
+            time.sleep(0.01)
+
+    ticker = threading.Thread(target=tick)
+    ticker.start()
+    try:
+        started = time.monotonic()
+        result = files.search_code(policy, str(workspace / "docs"), r"^(a+)+$", regex=True)
+        elapsed = time.monotonic() - started
+    finally:
+        done.set()
+        ticker.join()
+    assert result["timed_out"] and result["truncated"]
+    assert [(os.path.basename(m["path"]), m["line"]) for m in result["matches"]] == [("a_quick.txt", 1)]
+    assert elapsed < 4
+    assert max(b - a for a, b in zip(ticks, ticks[1:])) < 1.0  # the GIL was never held for the match
+    assert _worker_processes() == []  # killed at the deadline, not left running
+
+
+def test_search_code_regex_worker_exits_after_a_normal_search(policy, workspace):
+    result = files.search_code(policy, str(workspace), r"^def \w+\(", regex=True)
+    assert [m["line"] for m in result["matches"]] == [1]
+    assert not result["timed_out"]
+    assert _worker_processes() == []
 
 
 def test_search_code_skips_symlinks_out_of_roots(policy, workspace):
