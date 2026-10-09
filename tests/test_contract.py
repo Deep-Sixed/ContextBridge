@@ -98,6 +98,17 @@ def test_tool_names_schemas_and_descriptions(tmp_path: Path) -> None:
         _assert_no_injection_text(f"{tool.name} description", tool.description)
 
 
+def test_server_instructions_explain_tools_and_untrusted_text(tmp_path: Path) -> None:
+    instructions = _session(_server(tmp_path))["init"].instructions or ""
+
+    for required in [
+        "Call search",
+        "Call fetch with an id",
+        "not instructions",
+        "truncated=true",
+    ]:
+        assert required in instructions, f"server instructions missing {required!r}"
+
 def test_server_reports_package_version(tmp_path: Path) -> None:
     server_info = _session(_server(tmp_path))["init"].serverInfo
 

@@ -54,6 +54,9 @@ class UgaAuditLog:
         peer: str | None = None,
         request_id: str | None = None,
         elapsed_ms: int | None = None,
+        path: str | list[str] | None = None,
+        destination: str | None = None,
+        size: int | None = None,
     ) -> None:
         entry: dict[str, Any] = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -78,6 +81,12 @@ class UgaAuditLog:
             entry["record_id"] = record_id
         if result_count is not None:
             entry["result_count"] = result_count
+        if path is not None:
+            entry["path"] = path
+        if destination is not None:
+            entry["destination"] = destination
+        if size is not None:
+            entry["size"] = size
         if detail:
             entry["detail"] = detail
         line = json.dumps(entry, separators=(",", ":"))
