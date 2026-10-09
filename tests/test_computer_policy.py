@@ -30,6 +30,21 @@ def test_symlink_cannot_escape_roots(policy, workspace):
     assert not policy.is_visible(link)
 
 
+def test_unfollowed_final_component_cannot_be_dotdot(policy, workspace):
+    (workspace / "work" / "sub").mkdir()
+    for raw in ("work/sub/..", "work/sub/../", str(workspace / "work" / ".."), ".."):
+        with pytest.raises(PolicyViolation, match="must end in a file or directory name"):
+            policy.resolve(raw, write=True, follow_symlinks=False)
+    assert policy.resolve("work/sub/../sub", write=True, follow_symlinks=False) == workspace / "work" / "sub"
+
+
+def test_unfollowed_resolution_names_the_symlink_itself(policy, workspace):
+    link = symlink_or_skip(workspace / "work" / "notes-link.md", workspace / "docs" / "notes.md")
+    assert policy.resolve(str(link), write=True, follow_symlinks=False) == link
+    with pytest.raises(PolicyViolation, match="writable"):
+        policy.resolve(str(link), write=True)
+
+
 def test_denied_patterns_apply_to_every_path_component(policy, workspace):
     for raw in (".ssh/id_ed25519", ".ssh", ".env", "docs/server.pem"):
         with pytest.raises(PolicyViolation, match="denied"):

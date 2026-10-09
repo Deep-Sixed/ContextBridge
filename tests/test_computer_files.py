@@ -225,6 +225,43 @@ def test_move_refuses_roots_and_protected_ancestors(workspace):
     assert config.exists()
 
 
+def test_move_refuses_a_trailing_dotdot(policy, workspace):
+    (workspace / "work" / "a" / "b").mkdir(parents=True)
+    (workspace / "work" / "a" / "f.txt").write_text("x", encoding="utf-8")
+    with pytest.raises(PolicyViolation, match="file or directory name"):
+        files.move_file(policy, "work/a/b/..", "work/moved")
+    with pytest.raises(PolicyViolation, match="file or directory name"):
+        files.move_file(policy, "work/a/f.txt", "work/a/b/..")
+    assert (workspace / "work" / "a" / "f.txt").exists()
+    assert not (workspace / "work" / "moved").exists()
+
+
+def test_move_refuses_a_hidden_ancestor_spelled_with_dotdot(workspace):
+    state = workspace / "work" / "state"
+    (state / "tls").mkdir(parents=True)
+    registry = state / "devices.json"
+    registry.write_text("{}", encoding="utf-8")
+    policy = load_policy(
+        {"filesystem": {"roots": [str(workspace)], "writable_roots": [str(workspace / "work")]}},
+        hidden=(registry,),
+    )
+    with pytest.raises(PolicyViolation, match="protected"):
+        files.move_file(policy, "work/state", "work/moved")
+    with pytest.raises(PolicyViolation):
+        files.move_file(policy, "work/state/tls/..", "work/moved")
+    assert registry.read_text(encoding="utf-8") == "{}"
+    assert (state / "tls").is_dir()
+    assert not (workspace / "work" / "moved").exists()
+
+
+def test_move_renames_a_symlink_not_its_target(policy, workspace):
+    link = symlink_or_skip(workspace / "work" / "notes-link.md", workspace / "docs" / "notes.md")
+    files.move_file(policy, str(link), "work/renamed.md")
+    renamed = workspace / "work" / "renamed.md"
+    assert renamed.is_symlink() and not os.path.lexists(link)
+    assert renamed.read_bytes() == (workspace / "docs" / "notes.md").read_bytes() == b"alpha\nbeta\ngamma\n"
+
+
 def test_utf16_files_from_powershell_are_text(policy, workspace):
     """Windows PowerShell's `>` writes UTF-16 with a BOM; it must read, search, and edit as text."""
     target = workspace / "work" / "ps.log"
