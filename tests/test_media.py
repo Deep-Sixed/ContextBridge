@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -11,7 +12,7 @@ def test_media_inventory_denied_by_default():
 
 
 def test_linux_media_inventory_never_starts_capture():
-    with patch("contextbridge.computer.media.os.name", "posix"):
+    with patch("contextbridge.computer.media.os", SimpleNamespace(name="posix")):
         report = media_inventory(authorized=True)
     assert report["stream_access"] is False
     assert report["recording_active"] is False
