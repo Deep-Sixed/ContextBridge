@@ -27,6 +27,7 @@ docs = ["reportlab>=4.0"]
 contextbridge-computer = "contextbridge.computer.server:main"
 contextbridge-agent = "contextbridge.remote.agent:main"
 contextbridge-admin = "contextbridge.remote.admin:main"
+contextbridge-failover = "contextbridge.failover:main"
 
 [tool.setuptools.dynamic]
 version = { attr = "contextbridge.__version__" }

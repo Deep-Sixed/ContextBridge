@@ -305,6 +305,97 @@ contextbridge-admin --config configs/computer.yaml oauth-unlock               # 
 - **Keep remote clients read-only** unless you need more, and prefer `allowlist` mode.
 - **Device names are visible.** The consent page shows the names of the devices you allow remotely to anyone who starts an authorization.
 
+## Failover: running with Desktop Commander stopped
+
+This is what ContextBridge exists for: if Desktop Commander goes away, or loses its permissions, its functions stay available through ContextBridge's own gateway, agents, permissions, and transport.
+
+### The failover drill
+
+Run the drill on the gateway host (Friday) after stopping Desktop Commander everywhere: its MCP server entry in your AI clients, its remote agent on each machine, and anything started with `npx @wonderwhy-er/desktop-commander`. Keep the ContextBridge gateway and the Thanatos agent running.
+
+```sh
+export CONTEXTBRIDGE_COMPUTER_TOKEN=...                                      # the local listener's token
+contextbridge-failover --config configs/computer.yaml                        # read-only probes
+contextbridge-failover --config configs/computer.yaml --write                # plus a write round trip
+contextbridge-failover --config configs/computer.yaml --device thanatos --json
+```
+
+It prints PASS, FAIL, or skip for each check:
+
+1. **Desktop Commander is not running.** No process on the gateway host has a command line naming it. While one does, the drill reports NOT READY.
+2. **The gateway answers.** It serves the computer tool surface over MCP, using your token.
+3. **Every device is online and working.** By default that is `local` plus each enrolled agent; `--device` limits it. On each device the drill runs:
+   - **Read checks:** system info, a directory listing, a file-name search, and a file read.
+   - **Commands:** a harmless command (the first of `hostname`, `whoami`, `uname`, `pwd`, `date` the device's policy allows), run once directly and once as a session.
+   - **Processes:** a process listing.
+   - **Writes (`--write` only):** create, write, edit, move, read back, file info, and content search, all inside `<first writable root>/.contextbridge-failover/`.
+
+Nothing is deleted and no process is killed. The exit status is `0` for READY, `1` for NOT READY, and `2` if the drill could not run.
+
+### What CI proves
+
+`tests/test_failover.py` runs the whole deployment from its shipped entry points on Ubuntu and Windows: the knowledge gateway, the computer gateway with its agent and OAuth listeners, and an agent standing in for Thanatos. Everything runs inside a jail that models Desktop Commander being gone:
+
+- **Tripwires:** `npx`, `node`, and `desktop-commander` programs come first on `PATH` and record any call.
+- **Network jail:** `tests/failover_jail/sitecustomize.py` refuses and records every network destination off the machine, so no hosted relay, registry, or update check can be reached.
+- **No permissions:** Desktop Commander's config directory exists but is unreadable.
+- **A Desktop Commander process:** one runs at first, and the drill must report NOT READY until it is killed.
+
+Then the test checks each of these:
+- **Drill:** passes on both devices, including `--write`.
+- **Parity:** every Desktop Commander tool with a ContextBridge counterpart works on both devices.
+- **Remote client:** a Claude/ChatGPT-style OAuth client reads from both devices and is refused anything it wasn't granted.
+- **Knowledge route:** `search` and `fetch` work.
+- **Restart:** after a gateway restart, the agent reconnects on its own and the OAuth token still works.
+- **Audit:** both machines' audit logs show the same requests.
+- **Isolation:** nothing touched a tripwire or the network.
+
+### Desktop Commander parity
+
+All 31 Desktop Commander tools in `docs/desktop-commander-inventory.pdf`, with their ContextBridge counterparts. This map is `DESKTOP_COMMANDER_PARITY` in `src/contextbridge/failover.py`. The failover test fails if a tool is missing from it, or if a mapped tool isn't exercised on both devices.
+
+| Desktop Commander | ContextBridge | Coverage | Notes |
+|---|---|---|---|
+| `read_file` | `read_file` | same tool | offset, negative offset (tail), and length |
+| `read_multiple_files` | `read_file` | equivalent | one read_file call per file |
+| `write_file` | `write_file` | same tool | atomic rewrite or append |
+| `edit_block` | `edit_block` | same tool | exact replacement; refuses an unexpected match count |
+| `create_directory` | `create_directory` | same tool |  |
+| `list_directory` | `list_directory` | same tool | recursive to depth 5 |
+| `move_file` | `move_file` | same tool |  |
+| `get_file_info` | `get_file_info` | same tool |  |
+| `start_search` | `search_files`, `search_code` | equivalent | synchronous, capped by result count and time |
+| `get_more_search_results` | `search_files`, `search_code` | equivalent | raise max_results or narrow the path |
+| `stop_search` | — | not a tool, by design | searches finish within max_search_seconds; nothing runs in the background |
+| `list_searches` | — | not a tool, by design | no background searches exist |
+| `start_process` | `start_process`, `run_command` | same tool | run_command for one-shot commands |
+| `read_process_output` | `read_process_output` | same tool |  |
+| `interact_with_process` | `interact_with_process` | same tool |  |
+| `force_terminate` | `force_terminate` | same tool | kills the whole process tree |
+| `list_sessions` | `list_sessions` | same tool |  |
+| `list_processes` | `list_processes` | same tool |  |
+| `kill_process` | `kill_process` | same tool | only where the device's policy sets allow_kill |
+| `write_pdf` | — | **gap** | no PDF, Excel, or Word tools; text formats are read and edited as text |
+| `list_devices` | `list_devices` | same tool | online state, last seen, tools, and policy |
+| `ping` | `list_devices` | equivalent | online state from heartbeats |
+| `shutdown` | — | not a tool, by design | on the host: contextbridge-admin revoke, or stop the agent's service |
+| `who_am_i` | — | **gap** | the caller's client id is recorded in the audit log, not returned |
+| `get_config` | `get_system_info`, `list_devices` | equivalent | each device's policy summary |
+| `set_config_value` | — | not a tool, by design | policy changes only on the host, so a client cannot widen its own access |
+| `get_usage_stats` | — | not a tool, by design | the host's JSONL audit log records every call |
+| `get_recent_tool_calls` | — | not a tool, by design | the host's JSONL audit log records every call |
+| `get_tool_result` | — | not a tool, by design | calls complete within call_timeout_seconds; none is left pending |
+| `list_remote_tool_calls` | — | not a tool, by design | calls complete within call_timeout_seconds; none is left pending |
+| `give_feedback_to_desktop_commander` | — | not a tool, by design | Desktop Commander product feedback |
+
+Beyond individual tools, the inventory's checklist also lists capabilities ContextBridge does not have yet:
+- a native file **delete** with safeguards;
+- **document** tools (Excel, PDF, Word);
+- **asynchronous, paged search** sessions;
+- the **synchronization** layer (transfer, sync, checksums, conflicts).
+
+Until those exist, deletions and document work go through allowlisted commands on the device.
+
 ## Network exposure
 
 Neither route depends on Authentik.
@@ -323,7 +414,7 @@ Do not forward ports 8790, 8791, or 8792 to the internet. Publish 8793 only thro
 3. ~~Remote agent transport and device registration (outbound agent connections, heartbeats, revocation)~~
 4. ~~Windows agent for Thanatos (native agent, job-object process trees, scheduled-task install, Windows CI)~~
 5. ~~Authenticated remote MCP endpoint for ChatGPT and Claude (OAuth front end, per-device permissions)~~
-6. Failover acceptance test with Desktop Commander fully stopped
+6. ~~Failover acceptance test with Desktop Commander fully stopped (drill + jailed CI test)~~
 
 ## Documentation
 
