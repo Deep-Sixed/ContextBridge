@@ -151,6 +151,51 @@ def test_http_auth_and_failures_are_audited(tmp_path: Path) -> None:
     assert init["peer"] == "testclient"
 
 
+def test_fetch_truncates_long_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("UGA_MCP_FETCH_MAX_CHARS", "10")
+    store = DatacoreStore.from_jsonl(
+        write_jsonl(tmp_path / "d.jsonl", [record("long", text="x" * 25), record("short", text="tiny")])
+    )
+    server = create_uga_server(store=store, token=TOKEN, audit=UgaAuditLog(None))
+
+    long = _call(server, "fetch", {"id": "long"}).structured_content
+    short = _call(server, "fetch", {"id": "short"}).structured_content
+
+    assert (long["text"], long["truncated"], long["text_length"]) == ("x" * 10, True, 25)
+    assert short["text"] == "tiny"
+    assert "truncated" not in short and "text_length" not in short
+
+
+def test_fetch_cap_defaults_to_100k_chars(tmp_path: Path) -> None:
+    text = "y" * 100_001
+    store = DatacoreStore.from_jsonl(write_jsonl(tmp_path / "d.jsonl", [record("big", text=text)]))
+    server = create_uga_server(store=store, token=TOKEN, audit=UgaAuditLog(None))
+
+    payload = _call(server, "fetch", {"id": "big"}).structured_content
+
+    assert len(payload["text"]) == 100_000
+    assert payload["text_length"] == 100_001
+
+
+def test_status_route_requires_token(tmp_path: Path) -> None:
+    audit_path = tmp_path / "audit.jsonl"
+    audit = UgaAuditLog(audit_path)
+    server = create_uga_server(
+        name="ContextBridge", store=_store(tmp_path), token=TOKEN, audit=audit
+    )
+
+    with TestClient(server.http_app(middleware=http_middleware(audit))) as client:
+        anonymous = client.get("/")
+        wrong = client.get("/", headers={"Authorization": "Bearer " + "w" * 40})
+        ok = client.get("/", headers={"Authorization": f"Bearer {TOKEN}"})
+
+    assert (anonymous.status_code, wrong.status_code, ok.status_code) == (401, 401, 200)
+    assert anonymous.headers["www-authenticate"].startswith("Bearer")
+    assert "tools" not in anonymous.json() and "service" not in anonymous.json()
+    assert ok.json() == {"service": "ContextBridge", "mcp_path": "/mcp", "tools": ["fetch", "search"]}
+    auth = [e["detail"] for e in read_audit(audit_path) if e["tool"] == "auth"]
+    assert auth == ["missing_token", "invalid_token"]
+
 def test_datacore_path_is_required(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="No datacore export configured"):
         _datacore_path({}, config_path=tmp_path / "c.yaml")

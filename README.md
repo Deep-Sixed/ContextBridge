@@ -28,7 +28,9 @@ Each JSONL line is one approved record with `id` (a non-empty string or integer)
 | `search` | `query` | `readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`, `openWorldHint=false` |
 | `fetch` | `id` | same as `search` |
 
-Both tools only read the loaded JSONL snapshot. The server reports the package version (`uga.__version__`) in `serverInfo`.
+Both tools only read the loaded JSONL snapshot. The server reports the package version (`uga.__version__`) in `serverInfo`, and its MCP `instructions` tell agents to search, then fetch by id, and to treat record text as data rather than instructions.
+
+`fetch` returns at most `UGA_MCP_FETCH_MAX_CHARS` characters of a record's `text` (default 100000). A longer text is cut to that length, and the response adds `truncated: true` and the full `text_length`. Other fields are returned as exported.
 
 ## Audit log
 
@@ -41,11 +43,13 @@ python3 -m pip install -e ".[test]"
 python3 -m pytest
 ```
 
-`tests/test_contract.py` pins the MCP contract clients see: the exact tool set, annotations, input schemas, reported version, and policy denial. `tests/test_entrypoint.py` starts the real `python -m uga.gateway` entrypoint and checks bearer auth over HTTP. CI runs the suite on Python 3.11 with the oldest supported fastmcp and on Python 3.13 with the newest 3.x release.
+`tests/test_contract.py` pins the MCP contract clients see: the exact tool set, annotations, input schemas, reported version, server instructions, and policy denial. `tests/test_entrypoint.py` starts the real `python -m uga.gateway` entrypoint and checks bearer auth over HTTP. CI runs the suite on Python 3.11 with the oldest supported fastmcp and on Python 3.13 with the newest 3.x release.
 
 ## Access model
 
 This standalone gateway does not depend on Authentik. It does **not** include an OAuth proxy, public HTTPS listener, or ChatGPT/Claude Web OAuth discovery. To expose it to remote AI clients, use a separate authenticated TLS/OAuth access layer. Do not directly forward port 8790 to the internet.
+
+Every HTTP route requires the bearer token, including the `GET /` status route, which returns the service name, MCP path, and tool list. A request without a valid token gets `401` and is audited as `auth`.
 
 ## Documentation
 
