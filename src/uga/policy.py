@@ -10,7 +10,6 @@ UGA_FORBIDDEN_TOOL_EXAMPLES: frozenset[str] = frozenset(
     {
         "shell",
         "list_directory",
-        "desktop-commander",
         "filesystem",
         "docker",
         "systemctl",
@@ -22,7 +21,6 @@ UGA_FORBIDDEN_TOOL_EXAMPLES: frozenset[str] = frozenset(
 
 
 # The filesystem route (uga.fs_gateway) is a separate server with its own allowlist.
-# Names follow Desktop Commander's so clients can switch over; delete_file is new.
 FS_READ_TOOLS: frozenset[str] = frozenset(
     {"read_file", "read_multiple_files", "list_directory", "get_file_info"}
 )
