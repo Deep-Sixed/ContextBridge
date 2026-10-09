@@ -188,7 +188,7 @@ copy configs\agent.windows.yaml configs\agent.yaml     # then set name, gateway.
 
 **Running as a scheduled task.** `install-agent.ps1` registers a scheduled task that runs the agent as *your* account, never SYSTEM, so commands have exactly your permissions within the agent's policy.
 - **Default:** starts at boot whether or not you are signed in. It uses S4U, so no password is stored, but registering it needs an elevated shell.
-- **`-AtLogOn`:** starts at sign-in instead, and needs no elevation.
+- **`-AtLogOn`:** starts at sign-in instead, and needs no elevation. The agent must then run without a window, so the script refuses a venv whose `pythonw.exe` opens a console, as venvs made by uv do: closing that window would stop the agent. Create the venv with `py -3 -m venv .venv` as above.
 - **Either way:** a second trigger repeats every minute from installation on, so an agent that exits is relaunched within a minute; a running one is left alone. To keep the agent stopped, disable the task (`Disable-ScheduledTask`); stopping it lasts only until the next repeat.
 - **Logs:** go to `audit\agent.log`, plus the agent's audit log.
 - **Removal:** `-Uninstall`.

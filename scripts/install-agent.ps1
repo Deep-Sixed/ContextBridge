@@ -37,6 +37,19 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Test-ConsoleProgram([string]$Path) {
+    # The Subsystem field of the PE optional header: 2 is a windowless (GUI) program, 3 opens a console.
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $reader = New-Object System.IO.BinaryReader($stream)
+        $stream.Position = 0x3C
+        $stream.Position = $reader.ReadInt32() + 0x5C
+        $reader.ReadUInt16() -eq 3
+    } finally {
+        $stream.Dispose()
+    }
+}
+
 if ($Uninstall) {
     if ($DryRun) {
         Write-Output "Would remove scheduled task '$TaskName'."
@@ -61,14 +74,23 @@ if (-not $Python) {
 }
 $pythonPath = (Resolve-Path $Python).Path
 
+# pythonw.exe normally has no console, so no window appears when the task starts. A venv made by uv has a
+# console pythonw.exe instead; at logon its window would sit on the desktop, and closing it stops the agent.
+# (The default S4U task runs without a desktop, so no window appears either way.)
+$pythonw = Join-Path (Split-Path $pythonPath) 'pythonw.exe'
+$executable = if (Test-Path $pythonw) { $pythonw } else { $pythonPath }
+if ($AtLogOn -and (Test-ConsoleProgram $executable)) {
+    $message = "$executable opens a console window (venvs made by uv do), and closing it would stop the agent. " +
+        "Recreate the venv with 'py -3 -m venv .venv' and reinstall ContextBridge into it, " +
+        'or install without -AtLogOn from an elevated PowerShell.'
+    throw $message
+}
+
 & $pythonPath -c 'import contextbridge.remote.agent'
 if ($LASTEXITCODE -ne 0) {
     throw "ContextBridge is not installed for $pythonPath. Run: & '$pythonPath' -m pip install -e '$root'"
 }
 
-# pythonw.exe has no console, so no window appears when the task starts.
-$pythonw = Join-Path (Split-Path $pythonPath) 'pythonw.exe'
-$executable = if (Test-Path $pythonw) { $pythonw } else { $pythonPath }
 $logFile = Join-Path $root 'audit\agent.log'
 $arguments = "-m contextbridge.remote.agent run --config `"$configPath`" --log-file `"$logFile`""
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -140,3 +141,19 @@ def test_agent_task_relaunches_an_agent_that_exits(trigger):
         capture_output=True, text=True, timeout=120, check=True,
     ).stdout
     assert re.search(r"^Repeat\s*:\s*PT1M\s*$", plan, re.MULTILINE), plan
+
+
+def test_logon_task_refuses_a_pythonw_that_opens_a_console(tmp_path):
+    # A venv made by uv ships a console pythonw.exe: at logon its window sits on the desktop, and closing it
+    # stops the agent. Rebuild that layout from a standard venv.
+    venv = tmp_path / "venv"
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(venv)], check=True, timeout=120)
+    shutil.copyfile(venv / "Scripts" / "python.exe", venv / "Scripts" / "pythonw.exe")
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-File", str(REPO / "scripts" / "install-agent.ps1"),
+         "-Config", str(REPO / "configs" / "agent.windows.yaml"), "-Python", str(venv / "Scripts" / "python.exe"),
+         "-AtLogOn", "-DryRun"],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode != 0
+    assert "opensaconsolewindow" in re.sub(r"\s", "", result.stderr), result.stderr  # PowerShell wraps long errors
