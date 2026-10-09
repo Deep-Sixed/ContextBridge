@@ -316,6 +316,7 @@ class Agent:
         self._last_seq = 0
         self._tasks: set[asyncio.Task[None]] = set()
         self._stopping = asyncio.Event()
+        self._backoff = 1.0
 
     def stop(self) -> None:
         self._stopping.set()
@@ -329,12 +330,11 @@ class Agent:
     async def run(self) -> None:
         """Stay connected until stopped; raises FatalAgentError when the gateway refuses us for good."""
         self._loop = asyncio.get_running_loop()
-        delay = 1.0
+        self._backoff = 1.0
         try:
             while not self._stopping.is_set():
                 try:
                     await self._session()
-                    delay = 1.0
                 except FatalAgentError:
                     raise
                 except PinMismatch as exc:
@@ -344,8 +344,8 @@ class Agent:
                 if self._stopping.is_set():
                     break
                 with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(self._stopping.wait(), delay * random.uniform(0.5, 1.0))
-                delay = min(delay * 2, MAX_BACKOFF_SECONDS)
+                    await asyncio.wait_for(self._stopping.wait(), self._backoff * random.uniform(0.5, 1.0))
+                self._backoff = min(self._backoff * 2, MAX_BACKOFF_SECONDS)
         finally:
             self.engine.shutdown()
 
@@ -371,6 +371,8 @@ class Agent:
 
             self._ws = ws
             self._last_seq = 0
+            # However the session ends, its loss is a fresh outage, not more of an earlier one.
+            self._backoff = 1.0
             self.connected.set()
             self._log("gateway_connected", gateway=self.config.gateway_url, tools=sorted(self.engine.tools))
             beat = asyncio.create_task(self._heartbeats(ws, heartbeat))
