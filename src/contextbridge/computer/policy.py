@@ -10,6 +10,7 @@ from __future__ import annotations
 import fnmatch
 import os
 import shlex
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -82,6 +83,9 @@ ALWAYS_STRIPPED_ENV: frozenset[str] = frozenset({"MCP_AUTH_TOKEN", "CONTEXTBRIDG
 
 _UNQUOTED_OPERATORS = frozenset("|&<>")
 
+# A junction's reparse tag. stat.IO_REPARSE_TAG_MOUNT_POINT exists only on Windows builds.
+_IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003
+
 
 class PolicyError(ValueError):
     """Raised when a policy configuration is invalid."""
@@ -93,6 +97,18 @@ class PolicyViolation(PermissionError):
 
 def _real(path: str | Path) -> Path:
     return Path(os.path.realpath(Path(path).expanduser()))
+
+
+def _is_plain_entry(path: Path) -> bool:
+    """True when ``path`` exists and is neither a symlink nor a Windows junction."""
+    try:
+        st = os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return False
+    # os.path.islink misses junctions; lstat reports them by reparse tag.
+    return getattr(st, "st_reparse_tag", 0) != _IO_REPARSE_TAG_MOUNT_POINT
 
 
 def _within(path: Path, roots: tuple[Path, ...]) -> Path | None:
@@ -158,7 +174,10 @@ class ComputerPolicy:
         """Resolve ``raw`` and verify it is inside the readable (or writable) roots.
 
         Relative paths are taken relative to the first readable root. Symlinks are
-        followed before the check, so a link cannot escape the roots.
+        followed before the check, so a link cannot escape the roots. With
+        ``follow_symlinks=False`` a final component that is a symlink or junction is
+        kept as named, so the link itself can be moved; any other existing final
+        component is resolved to its real name, and ``..`` is refused.
         """
         if not isinstance(raw, str) or not raw.strip() or "\x00" in raw:
             raise PolicyViolation("A non-empty path is required.")
@@ -172,7 +191,16 @@ class ComputerPolicy:
         if follow_symlinks:
             resolved = _real(candidate)
         else:
+            # An unresolved trailing ".." passes the lexical root, hidden, and
+            # protected checks while naming the directory above. (pathlib drops
+            # "." components; an empty name is a filesystem root.)
+            if candidate.name in ("", ".."):
+                raise PolicyViolation(f"{raw} must end in a file or directory name.")
             resolved = _real(candidate.parent) / candidate.name
+            if _is_plain_entry(resolved):
+                # Nothing to keep unresolved. On Windows the name may be an 8.3
+                # alias (DEVICE~1.JSO for devices.json) that the checks would miss.
+                resolved = _real(resolved)
         roots = self.writable_roots if write else self.roots
         if _within(resolved, roots) is None:
             kind = "writable" if write else "readable"

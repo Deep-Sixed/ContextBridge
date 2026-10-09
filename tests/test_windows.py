@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
 import re
 import shutil
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import psutil
 import pytest
@@ -15,7 +17,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from helpers import REPO, python_cmd
 
 from contextbridge.computer import commands, files
-from contextbridge.computer.policy import PolicyViolation
+from contextbridge.computer.policy import PolicyViolation, load_policy
 from contextbridge.computer.proctree import ProcessTree
 from contextbridge.remote.agent import Identity
 
@@ -99,6 +101,70 @@ def test_deny_patterns_ignore_case(policy):
     for raw in (".SSH/id_ed25519", ".Env"):
         with pytest.raises(PolicyViolation):
             files.read_file(policy, raw)
+
+
+def _short_name(path: Path) -> str | None:
+    buf = ctypes.create_unicode_buffer(1024)
+    if not 0 < ctypes.windll.kernel32.GetShortPathNameW(str(path), buf, len(buf)) < len(buf):
+        return None
+    alias = os.path.basename(buf.value)
+    return alias if alias.lower() != path.name.lower() else None
+
+
+def _short_alias(path: Path, fallback: str) -> str:
+    """``path``'s 8.3 name; set with fsutil (needs admin) when the volume generated none."""
+    alias = _short_name(path)
+    if alias is None:
+        subprocess.run(["fsutil", "file", "setshortname", str(path), fallback], capture_output=True)
+        alias = _short_name(path)
+    if alias is None:
+        pytest.skip(f"cannot give {path.name} an 8.3 short name on this volume")
+    return alias
+
+
+def test_moves_by_short_name_cannot_reach_hidden_or_denied_files(workspace):
+    state = workspace / "work" / "statefolder"
+    state.mkdir()
+    registry = state / "devices.json"
+    registry.write_text("{}", encoding="utf-8")
+    secret = workspace / "work" / ".env"
+    secret.write_text("SECRET=1\n", encoding="utf-8")
+    state_alias = _short_alias(state, "STATEF~1")
+    registry_alias = _short_alias(registry, "DEVICE~1.JSO")
+    secret_alias = _short_alias(secret, "ENV~1")
+    policy = load_policy(
+        {"filesystem": {"roots": [str(workspace)], "writable_roots": [str(workspace / "work")]}},
+        hidden=(registry,),
+    )
+    with pytest.raises(PolicyViolation, match="denied"):
+        files.move_file(policy, f"work/statefolder/{registry_alias}", "work/moved.json")
+    with pytest.raises(PolicyViolation, match="protected"):
+        files.move_file(policy, f"work/{state_alias}", "work/moved")
+    with pytest.raises(PolicyViolation, match="denied"):
+        files.move_file(policy, f"work/{secret_alias}", "work/moved.txt")
+    assert registry.read_text(encoding="utf-8") == "{}"
+    assert secret.read_text(encoding="utf-8") == "SECRET=1\n"
+
+
+def test_moves_by_short_name_report_the_real_name(policy, workspace):
+    plain = workspace / "work" / "longfilename.txt"
+    plain.write_text("x", encoding="utf-8")
+    alias = _short_alias(plain, "LONGFI~1.TXT")
+    result = files.move_file(policy, f"work/{alias}", "work/renamed.txt")
+    assert Path(result["source"]).name == "longfilename.txt"
+    assert (workspace / "work" / "renamed.txt").read_text(encoding="utf-8") == "x"
+
+
+def test_moving_a_junction_moves_the_link_not_its_target(policy, workspace):
+    target = workspace / "work" / "target"
+    target.mkdir()
+    (target / "f.txt").write_text("x", encoding="utf-8")
+    junction = workspace / "work" / "junction"
+    subprocess.run(["cmd", "/c", "mklink", "/J", str(junction), str(target)], check=True, capture_output=True)
+    files.move_file(policy, "work/junction", "work/moved")
+    assert not os.path.lexists(junction)
+    assert (target / "f.txt").read_text(encoding="utf-8") == "x"
+    assert (workspace / "work" / "moved" / "f.txt").read_text(encoding="utf-8") == "x"
 
 
 def test_powershell_commands_and_utf8_output(make_policy):
