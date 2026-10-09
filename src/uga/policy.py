@@ -10,7 +10,6 @@ UGA_FORBIDDEN_TOOL_EXAMPLES: frozenset[str] = frozenset(
     {
         "shell",
         "list_directory",
-        "desktop-commander",
         "filesystem",
         "docker",
         "systemctl",
