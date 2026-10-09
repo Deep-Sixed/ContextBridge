@@ -188,7 +188,12 @@ def test_new_files_get_normal_permissions(policy, workspace):
     finally:
         os.umask(previous_umask)
     mode = stat.S_IMODE((workspace / "work" / "fresh.txt").stat().st_mode)
-    assert mode == 0o644
+    if os.name == "nt":
+        # Windows stat mode is a synthesized DOS read/write view, not POSIX
+        # group/other permission bits; NTFS authorization is enforced by ACLs.
+        assert mode & 0o666 == 0o666
+    else:
+        assert mode == 0o644
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs FIFOs")
