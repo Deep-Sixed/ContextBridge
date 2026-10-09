@@ -158,7 +158,9 @@ class ComputerPolicy:
         """Resolve ``raw`` and verify it is inside the readable (or writable) roots.
 
         Relative paths are taken relative to the first readable root. Symlinks are
-        followed before the check, so a link cannot escape the roots.
+        followed before the check, so a link cannot escape the roots. With
+        ``follow_symlinks=False`` the final component is left unresolved, so a link
+        itself can be named; it must then be a real name, never ``..``.
         """
         if not isinstance(raw, str) or not raw.strip() or "\x00" in raw:
             raise PolicyViolation("A non-empty path is required.")
@@ -172,6 +174,11 @@ class ComputerPolicy:
         if follow_symlinks:
             resolved = _real(candidate)
         else:
+            # An unresolved trailing ".." passes the lexical root, hidden, and
+            # protected checks while naming the directory above. (pathlib drops
+            # "." components; an empty name is a filesystem root.)
+            if candidate.name in ("", ".."):
+                raise PolicyViolation(f"{raw} must end in a file or directory name.")
             resolved = _real(candidate.parent) / candidate.name
         roots = self.writable_roots if write else self.roots
         if _within(resolved, roots) is None:
