@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import time
+import uuid
 
 import psutil
 import pytest
@@ -121,6 +123,30 @@ def test_session_rejects_unlisted_program(policy):
 def test_list_processes_includes_self():
     result = commands.list_processes(name_filter="python")
     assert any(row["pid"] == os.getpid() for row in result["processes"])
+
+
+def test_list_processes_hides_command_lines_unless_asked():
+    secret = f"--password=cb-{uuid.uuid4().hex}"
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", secret])
+    try:
+        deadline = time.monotonic() + 10
+        while True:
+            shown = commands.list_processes(name_filter=secret, include_cmdline=True)
+            if any(row["pid"] == child.pid for row in shown["processes"]) or time.monotonic() > deadline:
+                break
+            time.sleep(0.05)
+        assert shown["cmdline_included"]
+        row = next(row for row in shown["processes"] if row["pid"] == child.pid)
+        assert secret in row["cmdline"]
+
+        hidden = commands.list_processes()
+        assert not hidden["cmdline_included"]
+        assert hidden["processes"] and all("cmdline" not in row for row in hidden["processes"])
+        # The filter cannot be used to probe command lines one guess at a time.
+        assert commands.list_processes(name_filter=secret)["matched"] == 0
+    finally:
+        child.kill()
+        child.wait()
 
 
 def test_kill_process_refuses_protected_pids():

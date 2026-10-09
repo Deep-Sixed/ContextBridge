@@ -251,6 +251,22 @@ def test_token_scopes_still_apply_to_remote_devices(tmp_path, workspace):
     asyncio.run(scenario())
 
 
+def test_remote_devices_show_command_lines_only_with_the_process_scope(tmp_path, workspace):
+    async def scenario():
+        async with gateway(tmp_path) as gw, connected_agent(tmp_path, workspace, gw):
+            results = []
+            for scopes in (["computer:read"], ALL_SCOPES):
+                async with mcp(gw, scopes=scopes) as client:
+                    args = {"limit": 1000, "device": DEVICE}
+                    results.append((await client.call_tool("list_processes", args)).structured_content)
+            return results
+
+    read_only, owner = asyncio.run(scenario())
+    assert not read_only["cmdline_included"]
+    assert all("cmdline" not in row for row in read_only["processes"])
+    assert owner["cmdline_included"] and all("cmdline" in row for row in owner["processes"])
+
+
 def test_unknown_and_offline_devices(tmp_path, workspace):
     async def scenario():
         async with gateway(tmp_path) as gw:

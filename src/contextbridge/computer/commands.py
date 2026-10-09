@@ -373,15 +373,22 @@ class SessionManager:
 # ---------------------------------------------------------------- processes
 
 
-def list_processes(*, name_filter: str | None = None, limit: int = 200) -> dict[str, Any]:
+def list_processes(
+    *, name_filter: str | None = None, limit: int = 200, include_cmdline: bool = False
+) -> dict[str, Any]:
+    """List processes. Command lines often carry secrets (tokens, passwords, connection strings),
+    so they are read, matched by ``name_filter``, and returned only when ``include_cmdline`` is set;
+    the gateway sets it for callers holding ``computer:process``."""
     needle = (name_filter or "").casefold()
-    mark_started(name_filter=name_filter)
+    mark_started(name_filter=name_filter, include_cmdline=include_cmdline)
     rows: list[dict[str, Any]] = []
-    attrs = ["pid", "ppid", "name", "username", "status", "create_time", "memory_info", "cmdline"]
+    attrs = ["pid", "ppid", "name", "username", "status", "create_time", "memory_info"]
+    if include_cmdline:
+        attrs.append("cmdline")
     total = 0
     for proc in psutil.process_iter(attrs):
         info = proc.info
-        cmdline = " ".join(info.get("cmdline") or [])
+        cmdline = " ".join(info.get("cmdline") or []) if include_cmdline else ""
         name = info.get("name") or ""
         if needle and needle not in name.casefold() and needle not in cmdline.casefold():
             continue
@@ -389,19 +396,19 @@ def list_processes(*, name_filter: str | None = None, limit: int = 200) -> dict[
         if len(rows) >= limit:
             continue
         memory = info.get("memory_info")
-        rows.append(
-            {
-                "pid": info["pid"],
-                "ppid": info.get("ppid"),
-                "name": name,
-                "user": info.get("username"),
-                "status": info.get("status"),
-                "rss_bytes": memory.rss if memory else None,
-                "started": round(info["create_time"]) if info.get("create_time") else None,
-                "cmdline": cmdline[:300],
-            }
-        )
-    return {"processes": rows, "matched": total, "truncated": total > len(rows)}
+        row: dict[str, Any] = {
+            "pid": info["pid"],
+            "ppid": info.get("ppid"),
+            "name": name,
+            "user": info.get("username"),
+            "status": info.get("status"),
+            "rss_bytes": memory.rss if memory else None,
+            "started": round(info["create_time"]) if info.get("create_time") else None,
+        }
+        if include_cmdline:
+            row["cmdline"] = cmdline[:300]
+        rows.append(row)
+    return {"processes": rows, "matched": total, "truncated": total > len(rows), "cmdline_included": include_cmdline}
 
 
 def kill_process(pid: int, *, force: bool = False) -> dict[str, Any]:

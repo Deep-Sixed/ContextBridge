@@ -550,12 +550,23 @@ def create_computer_server(
 
     # ------------------------------------------------------- process tools
 
+    def holds(tool: str) -> bool:
+        try:
+            authorize(tool)
+        except AuthorizationError:
+            return False
+        return True
+
     @server.tool(annotations=_READ_ONLY)
     async def list_processes(
         name_filter: str | None = None, limit: int = 200, device: str = LOCAL_DEVICE
     ) -> dict[str, Any]:
-        """List running processes, optionally filtered by a substring of the name or command line."""
-        return await run(device, "list_processes", {"name_filter": name_filter, "limit": limit})
+        """List running processes, optionally filtered by a substring of the name. Callers with
+        computer:process also get each command line, and name_filter searches it too."""
+        # Command lines often carry secrets, so computer:read alone (the default for remote
+        # clients) sees names only. The scope that may kill a process may also see its command line.
+        args = {"name_filter": name_filter, "limit": limit, "include_cmdline": holds(PROCESS_KILL_TOOL)}
+        return await run(device, "list_processes", args)
 
     @server.tool(annotations=_WRITE)
     async def kill_process(pid: int, force: bool = False, device: str = LOCAL_DEVICE) -> dict[str, Any]:

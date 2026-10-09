@@ -200,8 +200,12 @@ def _list_sessions(engine: Any) -> dict[str, Any]:
 
 
 @_handler("list_processes")
-def _list_processes(engine: Any, name_filter: str | None = None, limit: int = 200) -> dict[str, Any]:
-    return commands.list_processes(name_filter=name_filter, limit=max(1, min(limit, 1000)))
+def _list_processes(
+    engine: Any, name_filter: str | None = None, limit: int = 200, include_cmdline: bool = False
+) -> dict[str, Any]:
+    return commands.list_processes(
+        name_filter=name_filter, limit=max(1, min(limit, 1000)), include_cmdline=include_cmdline
+    )
 
 
 @_handler("kill_process")

@@ -53,7 +53,7 @@ The computer route is an independent replacement for Desktop Commander's tools, 
 | `list_directory`, `read_file`, `get_file_info`, `search_files`, `search_code`, `get_system_info` | same names / `get_config` | always (read-only) |
 | `write_file`, `edit_block`, `create_directory`, `move_file` | same names | `filesystem.writable_roots` is non-empty |
 | `run_command`, `start_process`, `read_process_output`, `interact_with_process`, `force_terminate`, `list_sessions` | same names (`run_command` is a one-shot convenience) | `commands.mode` is not `disabled` |
-| `list_processes` | same | `processes.list: true` |
+| `list_processes` | same (command lines only for callers with `computer:process`) | `processes.list: true` |
 | `kill_process` | same | `processes.allow_kill: true` |
 | `list_devices` | remote device list | always |
 
@@ -79,7 +79,7 @@ There is no unauthenticated mode. Every MCP request is checked against the token
 
 These checks run on **every tool call**, at the moment it executes:
 
-1. **Token scope.** The bearer token must carry the tool's scope: `computer:read` (file reading, search, system info, process listing, `list_devices`), `computer:write` (file changes), `computer:execute` (commands and sessions), or `computer:process` (`kill_process`). `auth.scopes` in the config sets what the token carries. Tools outside those scopes are hidden from the tool list and refused if called anyway.
+1. **Token scope.** The bearer token must carry the tool's scope: `computer:read` (file reading, search, system info, process listing, `list_devices`), `computer:write` (file changes), `computer:execute` (commands and sessions), or `computer:process` (`kill_process`). Command lines often carry secrets, so `list_processes` includes them, and lets `name_filter` match them, only for callers that also hold `computer:process`. `auth.scopes` in the config sets what the token carries. Tools outside those scopes are hidden from the tool list and refused if called anyway.
 2. **Device.** A remote (OAuth) client may only use the devices its grant names. The local token reaches every device. The device must exist and be online. Its policy must enable the tool. A remote device must also have been granted the tool's scope when it was paired.
 3. **Policy checks.** The device's engine re-validates every path, command, working directory, and limit before acting. For a remote device, that's the agent on that machine, under its own policy.
 
@@ -288,6 +288,7 @@ contextbridge-admin --config configs/computer.yaml oauth-unlock               # 
 **Know the boundary.**
 - **Commands can reach the secrets.** Granting a remote client `computer:execute` on a device lets it run whatever that device's command policy allows. If that includes a shell, it can read the gateway's secrets the same way any command could.
 - **Keep remote clients read-only** unless you need more, and prefer `allowlist` mode.
+- **Read-only still sees processes.** `computer:read` includes `list_processes`, which shows every process's name, user, and memory use. Command lines are left out unless the client also holds `computer:process`. Set `processes.list: false` on a device to hide its processes from everyone.
 - **Device names are visible.** The consent page shows the names of the devices you allow remotely to anyone who starts an authorization.
 
 ## Network exposure

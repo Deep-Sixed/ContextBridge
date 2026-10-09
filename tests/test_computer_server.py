@@ -151,6 +151,19 @@ def test_scopes_are_enforced_per_call(policy, audit, audit_path, workspace):
     ]
 
 
+def test_process_command_lines_need_the_process_scope(policy, audit):
+    async def processes(client):
+        return (await client.call_tool("list_processes", {"limit": 1000})).structured_content
+
+    read_only = run(create_computer_server(policy, audit=audit, authorize=allow_scopes(SCOPE_READ)), processes)
+    assert not read_only["cmdline_included"]
+    assert read_only["processes"] and all("cmdline" not in row for row in read_only["processes"])
+    owner = run(create_computer_server(policy, audit=audit, authorize=allow_scopes(*ALL_SCOPES)), processes)
+    assert owner["cmdline_included"]
+    me = next(row for row in owner["processes"] if row["pid"] == os.getpid())
+    assert "pytest" in me["cmdline"]
+
+
 def test_tools_outside_policy_are_rejected(workspace, audit, audit_path):
     policy = load_policy({"filesystem": {"roots": [str(workspace)]}})
     server = create_computer_server(policy, audit=audit, authorize=allow_scopes(*ALL_SCOPES))
