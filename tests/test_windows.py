@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import time
@@ -10,7 +11,7 @@ import time
 import psutil
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from helpers import python_cmd
+from helpers import REPO, python_cmd
 
 from contextbridge.computer import commands, files
 from contextbridge.computer.policy import PolicyViolation
@@ -126,3 +127,16 @@ def test_critical_windows_processes_cannot_be_killed():
     lsass = next(p for p in psutil.process_iter(["name"]) if (p.info["name"] or "").lower() == "lsass.exe")
     with pytest.raises(PolicyViolation, match="critical"):
         commands.kill_process(lsass.pid)
+
+
+@pytest.mark.parametrize("trigger", [[], ["-AtLogOn"]], ids=["at-startup", "at-logon"])
+def test_agent_task_relaunches_an_agent_that_exits(trigger):
+    # Task Scheduler's restart-on-failure ignores a program that exits; only a repeating trigger brings it back.
+    script = REPO / "scripts" / "install-agent.ps1"
+    config = REPO / "configs" / "agent.windows.yaml"
+    plan = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-File", str(script),
+         "-Config", str(config), "-Python", sys.executable, "-DryRun", *trigger],
+        capture_output=True, text=True, timeout=120, check=True,
+    ).stdout
+    assert re.search(r"^Repeat\s*:\s*PT1M\s*$", plan, re.MULTILINE), plan
