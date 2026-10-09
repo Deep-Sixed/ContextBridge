@@ -513,10 +513,29 @@ def test_remote_sessions_belong_to_the_client_that_started_them(tmp_path, worksp
                 smuggled = {"session_id": sid, "caller": "local:alice"}
                 with pytest.raises(RemoteFailed, match="Unknown session"):
                     await gw.hub.call(DEVICE, "read_process_output", smuggled, as_bob)
+                as_bob_again = CallAudit(
+                    ComputerAuditLog(gw.audit_path, echo=False), "smuggled-2", "read_process_output", "bob",
+                    caller="remote:bob",
+                )
+                with pytest.raises(RemoteFailed, match="Unknown session"):
+                    await gw.hub.call(
+                        DEVICE, "read_process_output", {"session_id": sid, "all_sessions": True}, as_bob_again
+                    )
+                # The owner's full session access stops at the gateway's own machine: on a device,
+                # alice (the local listener) cannot use bob's session either.
+                bobs = (await bob.call_tool("start_process", sleeper)).structured_content["session_id"]
+                for tool, extra in (
+                    ("read_process_output", {}),
+                    ("interact_with_process", {"input": "hello"}),
+                    ("force_terminate", {}),
+                ):
+                    with pytest.raises(ToolError, match="Unknown session"):
+                        await alice.call_tool(tool, {"session_id": bobs, "device": DEVICE, **extra})
+                await bob.call_tool("force_terminate", {"session_id": bobs, "device": DEVICE})
                 mine = (await alice.call_tool("list_sessions", {"device": DEVICE})).structured_content["sessions"]
                 final = (await alice.call_tool("force_terminate", {"session_id": sid, "device": DEVICE})).structured_content
             await wait_for(
-                lambda: any(e["event"] == "exited" for e in events(tmp_path / "gateway-audit.jsonl")), timeout=15
+                lambda: sum(e["event"] == "exited" for e in events(tmp_path / "gateway-audit.jsonl")) >= 2, timeout=15
             )
             return sid, theirs, mine, final
 
@@ -526,11 +545,11 @@ def test_remote_sessions_belong_to_the_client_that_started_them(tmp_path, worksp
     assert final["running"] is False
     agent_log = events(tmp_path / "agent-audit.jsonl")
     started = [e for e in agent_log if e["event"] == "requested" and e["tool"] == "start_process"]
-    assert [e["caller"] for e in started] == ["local:alice"]
+    assert [e["caller"] for e in started] == ["local:alice", "remote:bob"]
     refused = [e for e in agent_log if e["event"] == "failed" and e.get("reason", "").startswith("Unknown session")]
-    assert len(refused) == 4
-    exited = [e for e in events(tmp_path / "gateway-audit.jsonl") if e["event"] == "exited"]
-    assert [(e["session_id"], e["caller"]) for e in exited] == [(sid, "local:alice")]
+    assert len(refused) == 8
+    exited = {e["session_id"]: e["caller"] for e in events(tmp_path / "gateway-audit.jsonl") if e["event"] == "exited"}
+    assert exited[sid] == "local:alice" and set(exited.values()) == {"local:alice", "remote:bob"}
 
 
 def test_missed_heartbeats_mark_the_device_offline_and_it_reconnects(tmp_path, workspace, monkeypatch):

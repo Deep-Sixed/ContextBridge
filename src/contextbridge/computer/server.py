@@ -79,6 +79,7 @@ KNOWLEDGE_TOKEN_ENV = "MCP_AUTH_TOKEN"
 CLIENT_ID = "contextbridge-computer"
 MIN_TOKEN_LENGTH = 32
 LOCAL_DEVICE = "local"
+OWNER_LISTENER = "local"  # accepts only the owner's static token
 LIST_DEVICES_TOOL = "list_devices"
 DEFAULT_REDIRECT_HOSTS = ("claude.ai", "claude.com", "chatgpt.com")
 
@@ -190,8 +191,9 @@ class DeviceRouter:
     async def call(self, device: str, tool: str, args: dict[str, Any]) -> dict[str, Any]:
         call = current_call()
         if device == LOCAL_DEVICE:
-            caller = call.caller if call is not None else None
-            return await anyio.to_thread.run_sync(functools.partial(self.local.execute, tool, args, caller=caller))
+            caller, all_sessions = (call.caller, call.all_sessions) if call is not None else (None, False)
+            run = functools.partial(self.local.execute, tool, args, caller=caller, all_sessions=all_sessions)
+            return await anyio.to_thread.run_sync(run)
         return await self.hub.call(device, tool, args, call)
 
     def describe(self, devices: frozenset[str] | None = None) -> list[dict[str, Any]]:
@@ -246,7 +248,7 @@ class ComputerPolicyMiddleware(Middleware):
         audit: ComputerAuditLog,
         authorize: Authorizer,
         devices: DeviceGrant = all_devices,
-        listener: str = "local",
+        listener: str = OWNER_LISTENER,
     ) -> None:
         self._router = router
         self._audit = audit
@@ -306,7 +308,15 @@ class ComputerPolicyMiddleware(Middleware):
             self._audit.record("failed", request_id=request_id, tool=name, device=device, reason=str(exc))
             raise ToolError(str(exc)) from exc
 
-        call = CallAudit(self._audit, request_id, name, client, device=device, caller=f"{self._listener}:{client}")
+        call = CallAudit(
+            self._audit,
+            request_id,
+            name,
+            client,
+            device=device,
+            caller=f"{self._listener}:{client}",
+            all_sessions=self._listener == OWNER_LISTENER,  # the owner may manage every client's sessions
+        )
         binding = bind_call(call)
         try:
             result = await call_next(context)
@@ -382,7 +392,7 @@ def create_computer_server(
     devices: DeviceGrant = all_devices,
     hub: Any | None = None,
     router: DeviceRouter | None = None,
-    listener: str = "local",
+    listener: str = OWNER_LISTENER,
     name: str = "ContextBridge Computer",
 ) -> FastMCP:
     """Build the MCP server. ``policy`` configures the ``local`` device (None for a gateway without one).
@@ -548,7 +558,8 @@ def create_computer_server(
 
     @server.tool(annotations=_READ_ONLY)
     async def list_sessions(device: str = LOCAL_DEVICE) -> dict[str, Any]:
-        """List the sessions this client started on a device, with their status."""
+        """List the sessions this client started on a device, with their status. On the gateway's own
+        machine, the owner's local token sees every client's sessions (started_by says whose)."""
         return await run(device, "list_sessions", {})
 
     # ------------------------------------------------------- process tools

@@ -260,6 +260,19 @@ def test_sessions_belong_to_the_caller_that_started_them(policy):
     assert final["running"] is False
 
 
+def test_all_sessions_reaches_every_clients_session(policy):
+    sessions = SessionManager(policy)
+    sid = sessions.start(_SLEEP, wait_seconds=0, owner="remote:alice")["session_id"]
+    try:
+        listed = sessions.list(caller="local:owner", all_sessions=True)
+        assert [(s["session_id"], s["started_by"]) for s in listed] == [(sid, "remote:alice")]
+        assert sessions.read(sid, caller="local:owner", all_sessions=True)["running"] is True
+        assert sessions.list(caller="local:owner") == []  # without the flag, the owner is like anyone else
+    finally:
+        final = sessions.terminate(sid, caller="local:owner", all_sessions=True)
+    assert final["running"] is False
+
+
 def test_engine_takes_the_session_owner_from_the_call_not_the_arguments(policy):
     engine = Engine(policy)
     try:
@@ -267,6 +280,8 @@ def test_engine_takes_the_session_owner_from_the_call_not_the_arguments(policy):
         sid = engine.execute("start_process", args, caller="remote:alice")["session_id"]
         with pytest.raises(CommandError, match="Unknown session"):
             engine.execute("read_process_output", {"session_id": sid, "caller": "remote:alice"}, caller="remote:bob")
+        with pytest.raises(CommandError, match="Unknown session"):
+            engine.execute("read_process_output", {"session_id": sid, "all_sessions": True}, caller="remote:bob")
         assert engine.execute("list_sessions", {"caller": "remote:alice"}, caller="remote:bob")["sessions"] == []
         assert [s["session_id"] for s in engine.execute("list_sessions", {}, caller="remote:alice")["sessions"]] == [sid]
     finally:

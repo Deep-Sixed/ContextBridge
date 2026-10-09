@@ -134,6 +134,9 @@ class CallAudit:
     caller: str | None = None
     """Owner of the sessions this call starts or uses: ``<listener>:<client id>`` on the gateway,
     which forwards it to agents. Never taken from the call's arguments."""
+    all_sessions: bool = False
+    """The caller may also use other clients' sessions on the gateway's own machine (the owner's
+    static token). Never forwarded to agents, where every caller reaches only its own sessions."""
 
     def emit(self, event: str, **fields: Any) -> None:
         self.log.record(

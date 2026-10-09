@@ -210,7 +210,9 @@ class AgentHub:
         conn.pending[request_id] = _Pending(future, call)
         message: dict[str, Any] = {"type": "call", "request_id": request_id, "tool": tool, "args": args}
         if call is not None and call.caller is not None:
-            message["caller"] = call.caller  # the agent binds sessions to it
+            # The agent binds sessions to it. all_sessions is not forwarded: on a remote device
+            # every caller, the owner's token included, reaches only its own sessions.
+            message["caller"] = call.caller
         try:
             await conn.send_call(message)
             reply = await asyncio.wait_for(future, self.call_timeout_seconds)

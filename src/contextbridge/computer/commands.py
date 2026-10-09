@@ -260,11 +260,12 @@ class SessionManager:
     """Long-running commands whose output is read incrementally.
 
     Each session belongs to the caller that started it (the ``owner`` passed to
-    :meth:`start`): only that caller can list, read, send to, or terminate it.
-    Anyone else gets the same "Unknown session" answer as for an id that never
-    existed. Several clients share one manager (the gateway's local and remote
-    listeners, or every client of one gateway on an agent), so this is what
-    keeps one client out of another's shell.
+    :meth:`start`): only that caller can list, read, send to, or terminate it,
+    unless the call carries ``all_sessions`` (the gateway sets it for the owner's
+    static token on its own machine). Anyone else gets the same "Unknown session"
+    answer as for an id that never existed. Several clients share one manager (the
+    gateway's local and remote listeners, or every client of one gateway on an
+    agent), so this is what keeps one client out of another's shell.
     """
 
     def __init__(self, policy: ComputerPolicy, *, on_exit: ExitCallback | None = None) -> None:
@@ -275,21 +276,22 @@ class SessionManager:
         self._ids = itertools.count(1)
 
     @staticmethod
-    def _permits(session: _Session, caller: str | None, action: str) -> bool:
-        """Whether ``caller`` may ``action`` ("list", "read", "send", "terminate") ``session``.
+    def _permits(session: _Session, caller: str | None, all_sessions: bool) -> bool:
+        """The ownership rule, for every action: the client that started it, or a caller with all_sessions."""
+        return all_sessions or session.owner == caller
 
-        The single ownership rule: only the client that started a session, for every
-        action. The owner's local token is no exception yet; if it should be, this is
-        the place to say so.
-        """
-        return session.owner == caller
-
-    def _get(self, session_id: str, caller: str | None, action: str) -> _Session:
+    def _get(self, session_id: str, caller: str | None, all_sessions: bool) -> _Session:
         with self._lock:
             session = self._sessions.get(session_id)
-        if session is None or not self._permits(session, caller, action):
+        if session is None or not self._permits(session, caller, all_sessions):
             raise CommandError(f"Unknown session: {session_id}")
         return session
+
+    @staticmethod
+    def _mark_started(session: _Session, caller: str | None, **fields: Any) -> None:
+        # When someone other than its starter uses a session, the audit says whose it was.
+        started_by = session.owner if session.owner != caller else None
+        mark_started(session_id=session.id, pid=session.proc.pid, started_by=started_by, **fields)
 
     def _evict_finished(self) -> None:
         finished = [s for s in self._sessions.values() if not s.running()]
@@ -353,9 +355,11 @@ class SessionManager:
             session.timed_out = True
             session.tree.kill()
 
-    def read(self, session_id: str, *, wait_seconds: float = 0.0, caller: str | None = None) -> dict[str, Any]:
-        session = self._get(session_id, caller, "read")
-        mark_started(session_id=session_id, pid=session.proc.pid)
+    def read(
+        self, session_id: str, *, wait_seconds: float = 0.0, caller: str | None = None, all_sessions: bool = False
+    ) -> dict[str, Any]:
+        session = self._get(session_id, caller, all_sessions)
+        self._mark_started(session, caller)
         return session.read(wait_seconds)
 
     def send(
@@ -366,13 +370,14 @@ class SessionManager:
         newline: bool = True,
         wait_seconds: float = 1.0,
         caller: str | None = None,
+        all_sessions: bool = False,
     ) -> dict[str, Any]:
-        session = self._get(session_id, caller, "send")
+        session = self._get(session_id, caller, all_sessions)
         if not session.running() or session.proc.stdin is None:
             raise CommandError(f"Session {session_id} is no longer running.")
         line_end = "\r\n" if IS_WINDOWS else "\n"
         payload = (text + (line_end if newline else "")).encode("utf-8")
-        mark_started(session_id=session_id, pid=session.proc.pid, input_bytes=len(payload))
+        self._mark_started(session, caller, input_bytes=len(payload))
         try:
             session.proc.stdin.write(payload)
             session.proc.stdin.flush()
@@ -380,9 +385,9 @@ class SessionManager:
             raise CommandError(f"Session {session_id} is not accepting input.") from None
         return session.read(wait_seconds)
 
-    def terminate(self, session_id: str, *, caller: str | None = None) -> dict[str, Any]:
-        session = self._get(session_id, caller, "terminate")
-        mark_started(session_id=session_id, pid=session.proc.pid)
+    def terminate(self, session_id: str, *, caller: str | None = None, all_sessions: bool = False) -> dict[str, Any]:
+        session = self._get(session_id, caller, all_sessions)
+        self._mark_started(session, caller)
         if session.running():
             session.tree.kill()
             try:
@@ -391,11 +396,11 @@ class SessionManager:
                 pass
         return session.read(0.0)
 
-    def list(self, *, caller: str | None = None) -> list[dict[str, Any]]:
+    def list(self, *, caller: str | None = None, all_sessions: bool = False) -> list[dict[str, Any]]:
         mark_started()
         with self._lock:
-            sessions = [s for s in self._sessions.values() if self._permits(s, caller, "list")]
-        return [s.status() for s in sessions]
+            sessions = [s for s in self._sessions.values() if self._permits(s, caller, all_sessions)]
+        return [{**s.status(), "started_by": s.owner} for s in sessions]
 
     def shutdown(self) -> None:
         with self._lock:

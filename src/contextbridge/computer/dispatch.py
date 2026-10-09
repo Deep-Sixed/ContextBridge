@@ -65,15 +65,21 @@ class Engine:
         self.tools = available_tools(policy)
         self.sessions = SessionManager(policy, on_exit=on_exit) if policy.commands_enabled else None
 
-    def execute(self, tool: str, args: dict[str, Any] | None, *, caller: str | None = None) -> dict[str, Any]:
-        """Run ``tool``. ``caller`` identifies the authenticated client, for session ownership;
-        the gateway (or, on an agent, the gateway's call frame) supplies it, never ``args``."""
+    def execute(
+        self, tool: str, args: dict[str, Any] | None, *, caller: str | None = None, all_sessions: bool = False
+    ) -> dict[str, Any]:
+        """Run ``tool``. ``caller`` identifies the authenticated client, for session ownership, and
+        ``all_sessions`` lets it use other clients' sessions too. The gateway (or, on an agent, the
+        gateway's call frame) supplies both, never ``args``."""
         if tool not in self.tools:
             raise PolicyViolation(f"Tool '{tool}' is not enabled on this computer.")
         handler = _HANDLERS[tool]
         kwargs = dict(args or {})
         if tool in SESSION_TOOLS:
-            kwargs["caller"] = caller  # overrides any 'caller' smuggled into the arguments
+            # These override anything smuggled into the arguments.
+            kwargs["caller"] = caller
+            if tool != "start_process":  # starting a session needs no access to anyone else's
+                kwargs["all_sessions"] = all_sessions
         try:
             return handler(self, **kwargs)
         except ValidationError as exc:
@@ -189,9 +195,9 @@ def _start_process(
 
 @_handler("read_process_output")
 def _read_process_output(
-    engine: Any, session_id: str, wait_seconds: float = 0.0, caller: str | None = None
+    engine: Any, session_id: str, wait_seconds: float = 0.0, caller: str | None = None, all_sessions: bool = False
 ) -> dict[str, Any]:
-    return engine.sessions.read(session_id, wait_seconds=wait_seconds, caller=caller)
+    return engine.sessions.read(session_id, wait_seconds=wait_seconds, caller=caller, all_sessions=all_sessions)
 
 
 @_handler("interact_with_process")
@@ -202,18 +208,23 @@ def _interact_with_process(
     append_newline: bool = True,
     wait_seconds: float = 1.0,
     caller: str | None = None,
+    all_sessions: bool = False,
 ) -> dict[str, Any]:
-    return engine.sessions.send(session_id, input, newline=append_newline, wait_seconds=wait_seconds, caller=caller)
+    return engine.sessions.send(
+        session_id, input, newline=append_newline, wait_seconds=wait_seconds, caller=caller, all_sessions=all_sessions
+    )
 
 
 @_handler("force_terminate")
-def _force_terminate(engine: Any, session_id: str, caller: str | None = None) -> dict[str, Any]:
-    return engine.sessions.terminate(session_id, caller=caller)
+def _force_terminate(
+    engine: Any, session_id: str, caller: str | None = None, all_sessions: bool = False
+) -> dict[str, Any]:
+    return engine.sessions.terminate(session_id, caller=caller, all_sessions=all_sessions)
 
 
 @_handler("list_sessions")
-def _list_sessions(engine: Any, caller: str | None = None) -> dict[str, Any]:
-    return {"sessions": engine.sessions.list(caller=caller)}
+def _list_sessions(engine: Any, caller: str | None = None, all_sessions: bool = False) -> dict[str, Any]:
+    return {"sessions": engine.sessions.list(caller=caller, all_sessions=all_sessions)}
 
 
 @_handler("list_processes")

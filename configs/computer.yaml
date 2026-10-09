@@ -71,6 +71,8 @@ commands:
   max_timeout_seconds: 600
   max_output_bytes: 65536
   max_sessions: 4
+  # Sessions belong to the client that started them. Remote (OAuth) clients reach only their own;
+  # the local token also reaches every remote client's sessions on this machine.
   max_session_seconds: 3600
   # env_strip: variables matching these globs are removed from child processes.
   # Omit for the built-in list (*TOKEN*, *SECRET*, *PASSWORD*, *API_KEY*, ...).

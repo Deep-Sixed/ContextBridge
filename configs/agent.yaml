@@ -19,6 +19,8 @@ filesystem:
   max_write_bytes: 1048576
 
 commands:
+  # Background sessions belong to the gateway client that started them; no other client of the
+  # gateway, the owner's local token included, can read, type into, or end them on this device.
   mode: allowlist
   allow: [git, ls, df, du, ps, uptime, whoami, hostname, uname, date, pwd]
   max_timeout_seconds: 600
