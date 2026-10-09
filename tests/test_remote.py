@@ -26,6 +26,19 @@ from contextbridge.remote.protocol import encode
 from contextbridge.remote.registry import DeviceRegistry
 from contextbridge.remote.tls import PinMismatch, generate_self_signed, server_context
 
+
+
+def test_agent_single_instance_lock(tmp_path: Path):
+    from contextbridge.remote.agent import FatalAgentError, single_agent_instance
+
+    identity = tmp_path / "agent-identity.json"
+    with single_agent_instance(identity):
+        with pytest.raises(FatalAgentError, match="already running"):
+            with single_agent_instance(identity):
+                pytest.fail("duplicate agent accepted")
+    with single_agent_instance(identity):
+        pass  # Lock is released on exit; no stale-lock enrollment barrier.
+
 DEVICE = "thanatos"
 HI = python_cmd("print('hi')")
 

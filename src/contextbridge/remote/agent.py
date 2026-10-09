@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+from contextlib import contextmanager
 import json
 import os
 import platform
@@ -511,6 +512,44 @@ class Agent:
             print(f"[agent] could not audit {event}: {exc}", file=sys.stderr, flush=True)
 
 
+@contextmanager
+def single_agent_instance(identity_path: Path):
+    """Prevent two CLI agents with the same identity competing for a gateway slot.
+
+    The lock is held for the full running lifetime, not just startup.
+    Its companion file is not an identity or a secret; stale files are safe.
+    """
+    lock_path = identity_path.with_name(identity_path.name + ".run.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                lock.seek(0)
+                if lock.read(1) == b"":
+                    lock.write(b"\0")
+                    lock.flush()
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise FatalAgentError(
+                f"another ContextBridge agent is already running with identity {identity_path}"
+            ) from exc
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 # ------------------------------------------------------------------------ CLI
 
 
@@ -562,7 +601,8 @@ def main(argv: list[str] | None = None) -> None:
         await agent.run()
 
     try:
-        asyncio.run(serve())
+        with single_agent_instance(config.identity_path):
+            asyncio.run(serve())
     except FatalAgentError as exc:
         raise SystemExit(f"[agent] stopped: {exc}") from None
     except KeyboardInterrupt:
