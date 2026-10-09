@@ -35,6 +35,7 @@ from .gateway import (
     _require_token,
     advertised_tool_names,
     http_middleware,
+    unauthenticated_response,
 )
 from .policy import FS_READ_TOOLS, FS_WRITE_TOOLS
 
@@ -216,7 +217,9 @@ def create_fs_server(
     )
 
     @server.custom_route("/", methods=["GET"])
-    async def root_status(_request: Request) -> JSONResponse:
+    async def root_status(request: Request) -> JSONResponse:
+        if (refused := unauthenticated_response(request)) is not None:
+            return refused
         return JSONResponse({"service": name, "mcp_path": "/mcp", "tools": sorted(allowed)})
 
     return server

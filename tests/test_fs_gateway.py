@@ -205,17 +205,19 @@ def test_http_requires_bearer_token(tmp_path: Path) -> None:
     server = create_fs_server(fs=Filesystem([FsRoot(ro)]), token=TOKEN, audit=audit)
     headers = {"Accept": "application/json, text/event-stream"}
 
+    auth = {"Authorization": f"Bearer {TOKEN}"}
+
     with TestClient(server.http_app(middleware=http_middleware(audit))) as client:
         missing = client.post("/mcp", json=_INITIALIZE, headers=headers)
-        ok = client.post(
-            "/mcp", json=_INITIALIZE, headers={**headers, "Authorization": f"Bearer {TOKEN}"}
-        )
-        status = client.get("/").json()
+        ok = client.post("/mcp", json=_INITIALIZE, headers={**headers, **auth})
+        status_missing = client.get("/")
+        status = client.get("/", headers=auth).json()
 
-    assert (missing.status_code, ok.status_code) == (401, 200)
+    assert (missing.status_code, ok.status_code, status_missing.status_code) == (401, 200, 401)
     assert status["tools"] == sorted(FS_READ_TOOLS)
     assert str(ro) not in str(status)
-    assert [e["detail"] for e in read_audit(audit_path) if e["tool"] == "auth"] == ["missing_token"]
+    auth_lines = [e["detail"] for e in read_audit(audit_path) if e["tool"] == "auth"]
+    assert auth_lines == ["missing_token", "missing_token"]
 
 
 def _write_config(tmp_path: Path, port: int, roots: str) -> Path:
@@ -296,7 +298,13 @@ def fs_gateway_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[s
                 if proc.poll() is not None:
                     pytest.fail(f"filesystem gateway exited early:\n{log.read_text()}")
                 try:
-                    if httpx.get(f"{base}/", timeout=1, trust_env=False).status_code == 200:
+                    status = httpx.get(
+                        f"{base}/",
+                        headers={"Authorization": f"Bearer {TOKEN}"},
+                        timeout=1,
+                        trust_env=False,
+                    )
+                    if status.status_code == 200:
                         break
                 except httpx.TransportError:
                     pass
