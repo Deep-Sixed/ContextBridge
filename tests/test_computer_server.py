@@ -4,6 +4,7 @@ import json
 import os
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import anyio
 import pytest
@@ -310,7 +311,8 @@ def test_scope_config_defaults_and_validation():
 def test_desktop_observe_requires_host_opt_in_and_explicit_client_scope(workspace, audit, monkeypatch):
     from contextbridge.computer import desktop
     monkeypatch.setattr(desktop, "_linux_windows", lambda: [{"id": "0x1", "title": "Editor"}])
-    monkeypatch.setattr(desktop.os, "name", "posix")
+    # Swap only desktop's view of the OS: patching os.name itself breaks pathlib on Windows.
+    monkeypatch.setattr(desktop, "os", SimpleNamespace(name="posix", environ=os.environ))
     policy = load_policy({"filesystem": {"roots": [str(workspace)]}, "desktop": {"observe": True}})
     assert "list_windows" in computer_tool_names(policy)
 
