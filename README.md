@@ -2,7 +2,7 @@
 
 A read-only MCP gateway that gives AI agents authenticated access to approved JSONL project context.
 
-**Security model:** exactly two operations (`search` and `fetch`), default-deny tool middleware, read-only annotations, audit logging, and a static bearer token (at least 32 characters) required at startup. Error details are masked from clients, and only allowlisted record fields are served. It binds only to the loopback interface by default.
+**Security model:** exactly two operations (`search` and `fetch`), default-deny policy for tools and every other MCP method, read-only annotations, audit logging, and a static bearer token (at least 32 characters) required at startup. Error details are masked from clients, and only allowlisted record fields are served. It binds only to the loopback interface by default.
 
 ## Installation
 
@@ -19,7 +19,7 @@ The data export is required: set `UGA_DATACORE_JSONL`, or `datacore_jsonl` in th
 
 ## Data format
 
-Each JSONL line is one approved record with `id` (a non-empty string or integer), `title`, `text`, and `url`, plus an optional `metadata` object. Of the other top-level keys, only the approved fields listed in `_OPTIONAL_TOP_LEVEL_FIELDS` in `src/uga/adapter.py` are kept; any other key is dropped at load time and is never served or searched. Search matches field values, not JSON key names.
+Each JSONL line is one approved record with `id` (a non-empty string or integer) and the strings `title`, `text`, and `url`, plus an optional `metadata` object. Other keys, at the top level or inside `metadata`, are kept only if they are approved fields listed in `_APPROVED_FIELDS` in `src/uga/adapter.py`; any other key is dropped at load time and is never served or searched. An approved field keeps its whole value, including nested objects. Search matches field values, not JSON key names, and never matches across two fields.
 
 ## Tools
 
@@ -30,9 +30,15 @@ Each JSONL line is one approved record with `id` (a non-empty string or integer)
 
 Both tools only read the loaded JSONL snapshot. The server reports the package version (`uga.__version__`) in `serverInfo`.
 
+Other MCP methods follow the same default-deny policy: `resources/list`, `resources/templates/list` and `prompts/list` return empty lists, `ping` is answered, and every other request (for example `resources/read`, `prompts/get`, `logging/setLevel`) is rejected.
+
 ## Audit log
 
-Every request is written as one JSON line to stderr and, if `UGA_AUDIT_LOG` (or `serve.audit_log` in the config) is set, to that file, which is created with mode `0600`. A tool call produces two lines (one from the policy middleware, one from the tool) that share a `request_id`. Rejected HTTP requests are logged as `tool: "auth"` with `missing_token` or `invalid_token`. Queries are recorded as a hash and length only; set `UGA_AUDIT_LOG_QUERY_TEXT=1` to also log the first 80 characters.
+Each MCP request except `ping` is written as one JSON line to stderr and, if `UGA_AUDIT_LOG` (or `serve.audit_log` in the config, resolved against the config file's directory) is set, to that file. The file is opened without following symlinks and set to mode `0600`, including when it already exists. Each line has a `request_id` that is unique per request. Denied tools and methods are logged with `detail: "policy_denied"`, and requests rejected by bearer auth as `tool: "auth"` with `missing_token` or `invalid_token`; methods the MCP SDK does not implement at all are rejected by the SDK and not logged. Client-supplied strings such as tool names and record ids are cut to 200 characters.
+
+Queries are recorded as a keyed hash and their length only; set `UGA_AUDIT_LOG_QUERY_TEXT=1` to also log the first 80 characters. Set `UGA_AUDIT_HASH_KEY` to a random secret to make the hash of the same query stable across restarts; without it a random key is used for each run, and the hash cannot be reversed by hashing guesses without the key.
+
+The `peer` field is the address of the TCP connection. `X-Forwarded-For` is ignored unless the proxy's address is listed in `serve.forwarded_allow_ips`. If you serve `create_uga_server().http_app()` with your own uvicorn, pass `proxy_headers=False` (uvicorn trusts the header from 127.0.0.1 by default).
 
 ## Development
 
