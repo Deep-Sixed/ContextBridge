@@ -411,7 +411,9 @@ def create_computer_server(
         path: str, offset: int = 0, length: int | None = None, device: str = LOCAL_DEVICE
     ) -> dict[str, Any]:
         """Read a text file. offset is the 0-based first line; a negative offset reads the last N lines.
-        length limits the number of lines returned. Large files are truncated at the read limit."""
+        length limits the number of lines returned. Output stops at the read limit (truncated); continue
+        with offset = start_line + lines_returned. A single line longer than the limit comes back clipped,
+        with a marker (line_clipped)."""
         return await run(device, "read_file", {"path": path, "offset": offset, "length": length})
 
     @server.tool(annotations=_READ_ONLY)
