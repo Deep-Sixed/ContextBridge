@@ -10,6 +10,7 @@ import pytest
 import yaml
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
+from helpers import python_cmd
 
 from contextbridge.computer.audit import AuditError, ComputerAuditLog
 from contextbridge.computer.policy import PolicyError, load_policy
@@ -23,6 +24,7 @@ from contextbridge.computer.server import (
     WRITE_TOOLS,
     AuthorizationError,
     advertised_tool_names,
+    build_router,
     computer_tool_names,
     create_computer_server,
     load_scopes,
@@ -259,6 +261,55 @@ def test_timed_out_command_is_completed_but_not_successful(make_policy, audit, a
     completed = events(audit_path)[-1]
     assert completed["event"] == "completed"
     assert completed["timed_out"] is True and completed["success"] is False
+
+
+def test_sessions_are_isolated_between_clients_and_listeners(policy, audit, audit_path):
+    router = build_router(policy, audit=audit)
+
+    def server(listener: str, client: str):
+        return create_computer_server(
+            None, audit=audit, router=router, authorize=lambda tool: client, listener=listener
+        )
+
+    owner = server("local", "contextbridge-computer")
+    other_client = server("remote", "client-b")
+    same_id_other_listener = server("remote", "contextbridge-computer")  # ids are namespaced by listener
+
+    async def scenario(a, b, c):
+        args = {"command": python_cmd("import time; time.sleep(30)"), "wait_seconds": 0}
+        sid = (await a.call_tool("start_process", args)).structured_content["session_id"]
+        for intruder in (b, c):
+            assert (await intruder.call_tool("list_sessions", {})).structured_content["sessions"] == []
+            for tool, extra in (
+                ("read_process_output", {}),
+                ("interact_with_process", {"input": "hello"}),
+                ("force_terminate", {}),
+            ):
+                with pytest.raises(ToolError, match="Unknown session"):
+                    await intruder.call_tool(tool, {"session_id": sid, **extra})
+        mine = (await a.call_tool("list_sessions", {})).structured_content["sessions"]
+        final = (await a.call_tool("force_terminate", {"session_id": sid})).structured_content
+        return sid, mine, final
+
+    async def inner():
+        async with Client(owner) as a, Client(other_client) as b, Client(same_id_other_listener) as c:
+            return await scenario(a, b, c)
+
+    try:
+        sid, mine, final = anyio.run(inner)
+    finally:
+        router.local.shutdown()
+    assert [s["session_id"] for s in mine] == [sid]
+    assert final["running"] is False
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not any(e["event"] == "exited" for e in events(audit_path)):
+        time.sleep(0.05)
+    exited = [e for e in events(audit_path) if e["event"] == "exited"]
+    assert [(e["session_id"], e["caller"]) for e in exited] == [(sid, "local:contextbridge-computer")]
+    # Refused session calls never touched the process.
+    refused = [e for e in events(audit_path) if e.get("reason", "").startswith("Unknown session")]
+    assert len(refused) == 6 and all(e["event"] == "failed" for e in refused)
+    assert {e["client"] for e in refused} == {"client-b", "contextbridge-computer"}
 
 
 @posix_only

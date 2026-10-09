@@ -274,10 +274,20 @@ class SessionManager:
         self._lock = threading.Lock()
         self._ids = itertools.count(1)
 
-    def _get(self, session_id: str, caller: str | None) -> _Session:
+    @staticmethod
+    def _permits(session: _Session, caller: str | None, action: str) -> bool:
+        """Whether ``caller`` may ``action`` ("list", "read", "send", "terminate") ``session``.
+
+        The single ownership rule: only the client that started a session, for every
+        action. The owner's local token is no exception yet; if it should be, this is
+        the place to say so.
+        """
+        return session.owner == caller
+
+    def _get(self, session_id: str, caller: str | None, action: str) -> _Session:
         with self._lock:
             session = self._sessions.get(session_id)
-        if session is None or session.owner != caller:
+        if session is None or not self._permits(session, caller, action):
             raise CommandError(f"Unknown session: {session_id}")
         return session
 
@@ -344,7 +354,7 @@ class SessionManager:
             session.tree.kill()
 
     def read(self, session_id: str, *, wait_seconds: float = 0.0, caller: str | None = None) -> dict[str, Any]:
-        session = self._get(session_id, caller)
+        session = self._get(session_id, caller, "read")
         mark_started(session_id=session_id, pid=session.proc.pid)
         return session.read(wait_seconds)
 
@@ -357,7 +367,7 @@ class SessionManager:
         wait_seconds: float = 1.0,
         caller: str | None = None,
     ) -> dict[str, Any]:
-        session = self._get(session_id, caller)
+        session = self._get(session_id, caller, "send")
         if not session.running() or session.proc.stdin is None:
             raise CommandError(f"Session {session_id} is no longer running.")
         line_end = "\r\n" if IS_WINDOWS else "\n"
@@ -371,7 +381,7 @@ class SessionManager:
         return session.read(wait_seconds)
 
     def terminate(self, session_id: str, *, caller: str | None = None) -> dict[str, Any]:
-        session = self._get(session_id, caller)
+        session = self._get(session_id, caller, "terminate")
         mark_started(session_id=session_id, pid=session.proc.pid)
         if session.running():
             session.tree.kill()
@@ -384,7 +394,7 @@ class SessionManager:
     def list(self, *, caller: str | None = None) -> list[dict[str, Any]]:
         mark_started()
         with self._lock:
-            sessions = [s for s in self._sessions.values() if s.owner == caller]
+            sessions = [s for s in self._sessions.values() if self._permits(s, caller, "list")]
         return [s.status() for s in sessions]
 
     def shutdown(self) -> None:
