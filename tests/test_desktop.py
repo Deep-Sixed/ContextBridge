@@ -1,4 +1,6 @@
 """Desktop capability is intentionally opt-in and read-only in Phase 2a."""
+import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -14,7 +16,7 @@ def test_default_denied_without_touching_desktop():
 
 
 def test_authorized_linux_window_inventory():
-    with patch("contextbridge.computer.desktop.os.name", "posix"):
+    with patch("contextbridge.computer.desktop.os", SimpleNamespace(name="posix", environ=os.environ)):
         with patch("contextbridge.computer.desktop._linux_windows", return_value=[{"id": "0x1", "title": "Editor"}]):
             assert list_windows(authorized=True) == {
                 "windows": [{"id": "0x1", "title": "Editor"}],
@@ -25,7 +27,7 @@ def test_authorized_linux_window_inventory():
 def test_headless_linux_refuses_capture(monkeypatch):
     monkeypatch.delenv("DISPLAY", raising=False)
     monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
-    with patch("contextbridge.computer.desktop.os.name", "posix"):
+    with patch("contextbridge.computer.desktop.os", SimpleNamespace(name="posix", environ=os.environ)):
         with pytest.raises(DesktopUnavailable, match="no graphical"):
             list_windows(authorized=True)
 
