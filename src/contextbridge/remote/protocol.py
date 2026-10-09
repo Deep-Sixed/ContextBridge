@@ -12,7 +12,7 @@ Session::
     agent   → {"type": "auth", "signature", "capabilities": {"tools", "policy", "info"}}
     gateway → {"type": "welcome", "heartbeat_seconds"}
 
-    gateway → {"type": "call", "seq", "request_id", "tool", "args"}
+    gateway → {"type": "call", "seq", "request_id", "tool", "args", "caller"?}
     agent   → {"type": "started", "request_id", "fields"}
     agent   → {"type": "result", "request_id", "ok", "result" | "error": {"kind", "message"}, "started"}
     agent   → {"type": "heartbeat"}
@@ -22,6 +22,9 @@ Session::
 The signature is Ed25519 over :func:`auth_payload`, binding the device, this
 gateway, and a fresh 32-byte nonce. ``seq`` increases strictly per connection
 and ``request_id`` is never reused, so an agent refuses replayed calls.
+``caller`` names the authenticated MCP client (``<listener>:<client id>``); the
+agent binds background sessions to it. A call without one (from an older
+gateway) shares sessions with every other such call.
 """
 
 from __future__ import annotations

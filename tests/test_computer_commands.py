@@ -12,6 +12,7 @@ from helpers import PY, python_cmd
 
 from contextbridge.computer import commands
 from contextbridge.computer.commands import BoundedCapture, CommandError, SessionManager
+from contextbridge.computer.dispatch import Engine
 from contextbridge.computer.policy import PolicyViolation
 
 posix_only = pytest.mark.skipif(os.name == "nt", reason="uses POSIX shell utilities")
@@ -234,6 +235,42 @@ def test_interactive_session_on_every_platform(policy):
     finally:
         final = sessions.terminate(sid)
     assert final["running"] is False
+
+
+_SLEEP = python_cmd("import time; time.sleep(30)")
+
+
+def test_sessions_belong_to_the_caller_that_started_them(policy):
+    sessions = SessionManager(policy)
+    sid = sessions.start(_SLEEP, wait_seconds=0, owner="remote:alice")["session_id"]
+    try:
+        for caller in ("remote:bob", "local:alice", None):
+            for action in (
+                lambda: sessions.read(sid, caller=caller),
+                lambda: sessions.send(sid, "ping", caller=caller),
+                lambda: sessions.terminate(sid, caller=caller),
+            ):
+                with pytest.raises(CommandError, match="Unknown session"):
+                    action()
+            assert sessions.list(caller=caller) == []
+        assert [s["session_id"] for s in sessions.list(caller="remote:alice")] == [sid]
+        assert sessions.read(sid, caller="remote:alice")["running"] is True
+    finally:
+        final = sessions.terminate(sid, caller="remote:alice")
+    assert final["running"] is False
+
+
+def test_engine_takes_the_session_owner_from_the_call_not_the_arguments(policy):
+    engine = Engine(policy)
+    try:
+        args = {"command": _SLEEP, "wait_seconds": 0, "caller": "remote:bob"}
+        sid = engine.execute("start_process", args, caller="remote:alice")["session_id"]
+        with pytest.raises(CommandError, match="Unknown session"):
+            engine.execute("read_process_output", {"session_id": sid, "caller": "remote:alice"}, caller="remote:bob")
+        assert engine.execute("list_sessions", {"caller": "remote:alice"}, caller="remote:bob")["sessions"] == []
+        assert [s["session_id"] for s in engine.execute("list_sessions", {}, caller="remote:alice")["sessions"]] == [sid]
+    finally:
+        engine.shutdown()
 
 
 def test_session_lifetime_kills_grandchildren(policy):

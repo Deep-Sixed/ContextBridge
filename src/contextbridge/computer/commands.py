@@ -173,8 +173,10 @@ class _Session:
         tree: ProcessTree,
         cap: int,
         on_exit: ExitCallback | None = None,
+        owner: str | None = None,
     ) -> None:
         self.id = session_id
+        self.owner = owner
         self.command = command
         self.cwd = cwd
         self.tree = tree
@@ -198,7 +200,7 @@ class _Session:
         if self._on_exit is None:
             return
         try:
-            self._on_exit(self.status())
+            self._on_exit({**self.status(), "caller": self.owner})
         except Exception as exc:  # an exit report must never crash the waiter thread
             print(f"[computer] could not report exit of session {self.id}: {exc}", file=sys.stderr, flush=True)
 
@@ -255,7 +257,15 @@ class _Session:
 
 
 class SessionManager:
-    """Long-running commands whose output is read incrementally."""
+    """Long-running commands whose output is read incrementally.
+
+    Each session belongs to the caller that started it (the ``owner`` passed to
+    :meth:`start`): only that caller can list, read, send to, or terminate it.
+    Anyone else gets the same "Unknown session" answer as for an id that never
+    existed. Several clients share one manager (the gateway's local and remote
+    listeners, or every client of one gateway on an agent), so this is what
+    keeps one client out of another's shell.
+    """
 
     def __init__(self, policy: ComputerPolicy, *, on_exit: ExitCallback | None = None) -> None:
         self._policy = policy
@@ -264,10 +274,10 @@ class SessionManager:
         self._lock = threading.Lock()
         self._ids = itertools.count(1)
 
-    def _get(self, session_id: str) -> _Session:
+    def _get(self, session_id: str, caller: str | None) -> _Session:
         with self._lock:
             session = self._sessions.get(session_id)
-        if session is None:
+        if session is None or session.owner != caller:
             raise CommandError(f"Unknown session: {session_id}")
         return session
 
@@ -278,7 +288,13 @@ class SessionManager:
             self._sessions.pop(finished.pop(0).id, None)
 
     def start(
-        self, command: str, *, cwd: str | None = None, timeout_seconds: float | None = None, wait_seconds: float = 1.0
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        timeout_seconds: float | None = None,
+        wait_seconds: float = 1.0,
+        owner: str | None = None,
     ) -> dict[str, Any]:
         argv = self._policy.command_argv(command)
         directory = _resolve_cwd(self._policy, cwd)
@@ -312,6 +328,7 @@ class SessionManager:
                 tree,
                 self._policy.max_output_bytes * 4,
                 on_exit=self._on_exit,
+                owner=owner,
             )
             self._sessions[session.id] = session
         watchdog = threading.Timer(lifetime, self._expire, args=(session,))
@@ -326,13 +343,21 @@ class SessionManager:
             session.timed_out = True
             session.tree.kill()
 
-    def read(self, session_id: str, *, wait_seconds: float = 0.0) -> dict[str, Any]:
-        session = self._get(session_id)
+    def read(self, session_id: str, *, wait_seconds: float = 0.0, caller: str | None = None) -> dict[str, Any]:
+        session = self._get(session_id, caller)
         mark_started(session_id=session_id, pid=session.proc.pid)
         return session.read(wait_seconds)
 
-    def send(self, session_id: str, text: str, *, newline: bool = True, wait_seconds: float = 1.0) -> dict[str, Any]:
-        session = self._get(session_id)
+    def send(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        newline: bool = True,
+        wait_seconds: float = 1.0,
+        caller: str | None = None,
+    ) -> dict[str, Any]:
+        session = self._get(session_id, caller)
         if not session.running() or session.proc.stdin is None:
             raise CommandError(f"Session {session_id} is no longer running.")
         line_end = "\r\n" if IS_WINDOWS else "\n"
@@ -345,8 +370,8 @@ class SessionManager:
             raise CommandError(f"Session {session_id} is not accepting input.") from None
         return session.read(wait_seconds)
 
-    def terminate(self, session_id: str) -> dict[str, Any]:
-        session = self._get(session_id)
+    def terminate(self, session_id: str, *, caller: str | None = None) -> dict[str, Any]:
+        session = self._get(session_id, caller)
         mark_started(session_id=session_id, pid=session.proc.pid)
         if session.running():
             session.tree.kill()
@@ -356,10 +381,10 @@ class SessionManager:
                 pass
         return session.read(0.0)
 
-    def list(self) -> list[dict[str, Any]]:
+    def list(self, *, caller: str | None = None) -> list[dict[str, Any]]:
         mark_started()
         with self._lock:
-            sessions = list(self._sessions.values())
+            sessions = [s for s in self._sessions.values() if s.owner == caller]
         return [s.status() for s in sessions]
 
     def shutdown(self) -> None:

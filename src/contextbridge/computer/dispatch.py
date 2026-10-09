@@ -25,6 +25,8 @@ WRITE_TOOLS = frozenset({"write_file", "edit_block", "create_directory", "move_f
 COMMAND_TOOLS = frozenset(
     {"run_command", "start_process", "read_process_output", "interact_with_process", "force_terminate", "list_sessions"}
 )
+SESSION_TOOLS = COMMAND_TOOLS - {"run_command"}
+"""Tools that act on background sessions, which belong to the caller that started them."""
 PROCESS_LIST_TOOL = "list_processes"
 PROCESS_KILL_TOOL = "kill_process"
 ENGINE_TOOLS = READ_TOOLS | WRITE_TOOLS | COMMAND_TOOLS | {PROCESS_LIST_TOOL, PROCESS_KILL_TOOL}
@@ -63,12 +65,17 @@ class Engine:
         self.tools = available_tools(policy)
         self.sessions = SessionManager(policy, on_exit=on_exit) if policy.commands_enabled else None
 
-    def execute(self, tool: str, args: dict[str, Any] | None) -> dict[str, Any]:
+    def execute(self, tool: str, args: dict[str, Any] | None, *, caller: str | None = None) -> dict[str, Any]:
+        """Run ``tool``. ``caller`` identifies the authenticated client, for session ownership;
+        the gateway (or, on an agent, the gateway's call frame) supplies it, never ``args``."""
         if tool not in self.tools:
             raise PolicyViolation(f"Tool '{tool}' is not enabled on this computer.")
         handler = _HANDLERS[tool]
+        kwargs = dict(args or {})
+        if tool in SESSION_TOOLS:
+            kwargs["caller"] = caller  # overrides any 'caller' smuggled into the arguments
         try:
-            return handler(self, **(args or {}))
+            return handler(self, **kwargs)
         except ValidationError as exc:
             problems = "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors())
             raise InvalidArguments(f"Invalid arguments for '{tool}': {problems}") from None
@@ -173,30 +180,40 @@ def _start_process(
     cwd: str | None = None,
     timeout_seconds: float | None = None,
     wait_seconds: float = 1.0,
+    caller: str | None = None,
 ) -> dict[str, Any]:
-    return engine.sessions.start(command, cwd=cwd, timeout_seconds=timeout_seconds, wait_seconds=wait_seconds)
+    return engine.sessions.start(
+        command, cwd=cwd, timeout_seconds=timeout_seconds, wait_seconds=wait_seconds, owner=caller
+    )
 
 
 @_handler("read_process_output")
-def _read_process_output(engine: Any, session_id: str, wait_seconds: float = 0.0) -> dict[str, Any]:
-    return engine.sessions.read(session_id, wait_seconds=wait_seconds)
+def _read_process_output(
+    engine: Any, session_id: str, wait_seconds: float = 0.0, caller: str | None = None
+) -> dict[str, Any]:
+    return engine.sessions.read(session_id, wait_seconds=wait_seconds, caller=caller)
 
 
 @_handler("interact_with_process")
 def _interact_with_process(
-    engine: Any, session_id: str, input: str, append_newline: bool = True, wait_seconds: float = 1.0
+    engine: Any,
+    session_id: str,
+    input: str,
+    append_newline: bool = True,
+    wait_seconds: float = 1.0,
+    caller: str | None = None,
 ) -> dict[str, Any]:
-    return engine.sessions.send(session_id, input, newline=append_newline, wait_seconds=wait_seconds)
+    return engine.sessions.send(session_id, input, newline=append_newline, wait_seconds=wait_seconds, caller=caller)
 
 
 @_handler("force_terminate")
-def _force_terminate(engine: Any, session_id: str) -> dict[str, Any]:
-    return engine.sessions.terminate(session_id)
+def _force_terminate(engine: Any, session_id: str, caller: str | None = None) -> dict[str, Any]:
+    return engine.sessions.terminate(session_id, caller=caller)
 
 
 @_handler("list_sessions")
-def _list_sessions(engine: Any) -> dict[str, Any]:
-    return {"sessions": engine.sessions.list()}
+def _list_sessions(engine: Any, caller: str | None = None) -> dict[str, Any]:
+    return {"sessions": engine.sessions.list(caller=caller)}
 
 
 @_handler("list_processes")

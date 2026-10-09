@@ -208,8 +208,11 @@ class AgentHub:
         request_id = call.request_id if call is not None else uuid.uuid4().hex[:16]
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         conn.pending[request_id] = _Pending(future, call)
+        message: dict[str, Any] = {"type": "call", "request_id": request_id, "tool": tool, "args": args}
+        if call is not None and call.caller is not None:
+            message["caller"] = call.caller  # the agent binds sessions to it
         try:
-            await conn.send_call({"type": "call", "request_id": request_id, "tool": tool, "args": args})
+            await conn.send_call(message)
             reply = await asyncio.wait_for(future, self.call_timeout_seconds)
         except TimeoutError:
             raise RemoteFailed(
@@ -367,7 +370,7 @@ class AgentHub:
                 if pending is not None and not pending.future.done():
                     pending.future.set_result(msg)
             elif kind == "event" and msg.get("event") == "exited":
-                fields = {k: msg.get(k) for k in ("session_id", "pid", "command", "exit_code", "timed_out")}
+                fields = {k: msg.get(k) for k in ("session_id", "pid", "command", "exit_code", "timed_out", "caller")}
                 self._log("exited", tool="session", device=conn.device.name, success=msg.get("success"), **fields)
             else:
                 await conn.reject("protocol", f"unexpected message {kind!r}")

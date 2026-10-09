@@ -131,6 +131,9 @@ class CallAudit:
     device: str | None = None
     on_started: Callable[[dict[str, Any]], None] | None = None
     started: bool = False
+    caller: str | None = None
+    """Owner of the sessions this call starts or uses: ``<listener>:<client id>`` on the gateway,
+    which forwards it to agents. Never taken from the call's arguments."""
 
     def emit(self, event: str, **fields: Any) -> None:
         self.log.record(

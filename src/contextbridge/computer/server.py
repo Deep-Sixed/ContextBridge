@@ -188,9 +188,11 @@ class DeviceRouter:
             raise AuthorizationError(f"Tool '{tool}' is not enabled on device '{device}'.")
 
     async def call(self, device: str, tool: str, args: dict[str, Any]) -> dict[str, Any]:
+        call = current_call()
         if device == LOCAL_DEVICE:
-            return await anyio.to_thread.run_sync(self.local.execute, tool, args)
-        return await self.hub.call(device, tool, args, current_call())
+            caller = call.caller if call is not None else None
+            return await anyio.to_thread.run_sync(functools.partial(self.local.execute, tool, args, caller=caller))
+        return await self.hub.call(device, tool, args, call)
 
     def describe(self, devices: frozenset[str] | None = None) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -304,7 +306,7 @@ class ComputerPolicyMiddleware(Middleware):
             self._audit.record("failed", request_id=request_id, tool=name, device=device, reason=str(exc))
             raise ToolError(str(exc)) from exc
 
-        call = CallAudit(self._audit, request_id, name, client, device=device)
+        call = CallAudit(self._audit, request_id, name, client, device=device, caller=f"{self._listener}:{client}")
         binding = bind_call(call)
         try:
             result = await call_next(context)
@@ -364,6 +366,7 @@ def build_router(policy: ComputerPolicy | None, *, audit: ComputerAuditLog, hub:
             tool="session",
             device=LOCAL_DEVICE,
             success=status["exit_code"] == 0 and not status["timed_out"],
+            caller=status.get("caller"),
             **{k: status[k] for k in ("session_id", "pid", "command", "exit_code", "timed_out", "runtime_seconds")},
         )
 
@@ -545,7 +548,7 @@ def create_computer_server(
 
     @server.tool(annotations=_READ_ONLY)
     async def list_sessions(device: str = LOCAL_DEVICE) -> dict[str, Any]:
-        """List sessions started through ContextBridge on a device, with their status."""
+        """List the sessions this client started on a device, with their status."""
         return await run(device, "list_sessions", {})
 
     # ------------------------------------------------------- process tools
