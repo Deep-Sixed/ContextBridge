@@ -87,7 +87,13 @@ def gateway(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Gateway]:
                 if proc.poll() is not None:
                     pytest.fail(f"gateway exited early:\n{log.read_text()}")
                 try:
-                    if httpx.get(f"{base}/", timeout=1, trust_env=False).status_code == 200:
+                    status = httpx.get(
+                        f"{base}/",
+                        headers={"Authorization": f"Bearer {TOKEN}"},
+                        timeout=1,
+                        trust_env=False,
+                    )
+                    if status.status_code == 200:
                         break
                 except httpx.TransportError:
                     pass
