@@ -39,6 +39,21 @@ EXPECTED_INPUTS = {
     "create_directory": {"path"},
     "move_file": {"source", "destination"},
     "delete_file": {"path", "recursive"},
+    "start_search": {
+        "path",
+        "pattern",
+        "search_type",
+        "file_pattern",
+        "ignore_case",
+        "literal",
+        "include_hidden",
+        "context_lines",
+        "max_results",
+        "timeout_ms",
+    },
+    "get_more_search_results": {"search_id", "offset", "length"},
+    "stop_search": {"search_id"},
+    "list_searches": set(),
 }
 
 # readOnlyHint, destructiveHint, idempotentHint; openWorldHint is always false.
@@ -52,6 +67,10 @@ EXPECTED_HINTS = {
     "create_directory": (False, False, True),
     "move_file": (False, False, False),
     "delete_file": (False, True, False),
+    "start_search": (True, False, False),
+    "get_more_search_results": (True, False, True),
+    "stop_search": (True, False, True),
+    "list_searches": (True, False, True),
 }
 
 _INITIALIZE = {
@@ -181,6 +200,39 @@ def test_audit_records_paths_sizes_and_denials(tmp_path: Path) -> None:
     assert calls == entries
     ids = [e["request_id"] for e in lines]
     assert all(ids.count(e["request_id"]) == 1 for e in calls)
+
+
+def test_search_over_mcp_is_audited_without_the_pattern(tmp_path: Path) -> None:
+    audit_path = tmp_path / "audit.jsonl"
+    server = _server(tmp_path, writable=False, audit_path=audit_path)
+    ro = str(Path(os.path.realpath(tmp_path / "ro")))
+
+    async def go() -> tuple[Any, Any, Any]:
+        async with Client(server) as client:
+            started = await client.call_tool(
+                "start_search", {"path": ro, "pattern": "hel+o", "search_type": "content"}
+            )
+            search_id = started.structured_content["search_id"]
+            more = await client.call_tool("get_more_search_results", {"search_id": search_id})
+            listed = await client.call_tool("list_searches", {})
+            with pytest.raises(ToolError, match="search not found"):
+                await client.call_tool("stop_search", {"search_id": "nope"})
+        return started.structured_content, more.structured_content, listed.structured_content
+
+    started, more, listed = anyio.run(go)
+
+    assert started["status"] == "completed"
+    assert [(r["path"], r["line"], r["text"]) for r in started["results"]] == [
+        (f"{ro}/notes.txt", 1, "hello")
+    ]
+    assert more["results"] == started["results"]
+    assert [s["search_id"] for s in listed["searches"]] == [started["search_id"]]
+    entries = [e for e in read_audit(audit_path) if "search_id" in e or e.get("detail") == "not_found"]
+    start, page, missing = entries
+    assert (start["tool"], start["path"], start["result_count"]) == ("start_search", ro, 1)
+    assert start["query_len"] == 5 and "hel+o" not in str(start)
+    assert (page["tool"], page["search_id"]) == ("get_more_search_results", started["search_id"])
+    assert (missing["tool"], missing["success"]) == ("stop_search", False)
 
 
 def test_unexpected_errors_are_masked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -320,8 +372,9 @@ def fs_gateway_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[s
                 if time.monotonic() > deadline:
                     pytest.fail(f"filesystem gateway did not start:\n{log.read_text()}")
                 time.sleep(0.2)
-            assert "serving 9 tools over 1 root(s) (1 writable)" in log.read_text()
+            assert "serving 13 tools over 1 root(s) (1 writable)" in log.read_text()
             yield base, Path(os.path.realpath(tmp / "work")), tmp / "fs-audit.jsonl"
+
         finally:
             proc.terminate()
             try:

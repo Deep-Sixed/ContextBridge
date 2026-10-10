@@ -26,6 +26,12 @@ from starlette.responses import JSONResponse
 from . import __version__
 from .audit import UgaAuditLog
 from .fs import Filesystem, FsError, filesystem_from_config
+from .fs_search import (
+    DEFAULT_MAX_RESULTS,
+    DEFAULT_PAGE,
+    DEFAULT_TIMEOUT_MS,
+    SearchManager,
+)
 from .gateway import (
     UgaAllowlistMiddleware,
     _add_audit_fields,
@@ -54,6 +60,10 @@ _DESTRUCTIVE = ToolAnnotations(
 _CREATE_DIRECTORY = ToolAnnotations(
     readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False
 )
+# Reads only, but each call starts a new search.
+_SEARCH = ToolAnnotations(
+    readOnlyHint=True, destructiveHint=False, idempotentHint=False, openWorldHint=False
+)
 # Refuses to overwrite, so nothing is lost, but a repeat call fails.
 _MOVE = ToolAnnotations(
     readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False
@@ -69,7 +79,25 @@ def _instructions(fs: Filesystem) -> str:
     for root in fs.roots:
         lines.append(f"- {root.path} ({'read-write' if root.writable else 'read-only'})")
     lines.append("Deleted items are moved to a trash folder that tools cannot access.")
+    lines.append(
+        "start_search returns a search_id and the first results; page through the rest "
+        "with get_more_search_results while the search runs or after it finishes."
+    )
     return "\n".join(lines)
+
+
+def _result_fields(result: dict[str, Any]) -> dict[str, Any]:
+    """Audit fields taken from a tool's result."""
+    fields: dict[str, Any] = {}
+    if "bytes" in result:
+        fields["size"] = result["bytes"]
+    if "trash_path" in result:
+        fields["destination"] = result["trash_path"]
+    if "search_id" in result:
+        fields["search_id"] = result["search_id"]
+    if isinstance(result.get("results"), list):
+        fields["result_count"] = len(result["results"])
+    return fields
 
 
 def create_fs_server(
@@ -84,6 +112,7 @@ def create_fs_server(
     if audit is None:
         audit = UgaAuditLog(os.environ.get(AUDIT_ENV), route="fs")
     allowed = allowed_fs_tools(fs)
+    searches = SearchManager(fs)
     server = _UgaServer(
         name=name,
         version=__version__,
@@ -96,20 +125,20 @@ def create_fs_server(
     def audited(
         op: Callable[[], dict[str, Any]],
         *,
-        path: str | list[str],
+        path: str | list[str] | None = None,
         destination: str | None = None,
+        search_id: str | None = None,
+        query: str | None = None,
     ) -> dict[str, Any]:
-        # The middleware writes the request's one audit line; this adds what the
-        # tool knows to it.
-        _add_audit_fields(path=path, destination=destination)
+        # Audit as one request through middleware, not a second per-tool log.
+        _add_audit_fields(path=path, destination=destination, search_id=search_id, query=query)
         try:
             result = op()
         except FsError as exc:
             _add_audit_fields(detail=exc.code)
             raise ToolError(str(exc)) from None
-        _add_audit_fields(
-            destination=destination or result.get("trash_path"), size=result.get("bytes")
-        )
+        fields = _result_fields(result)
+        _add_audit_fields(**fields)
         return result
 
     async def run(op: Callable[..., dict[str, Any]], *args: Any, **audit_kw: Any) -> Any:
@@ -141,6 +170,61 @@ def create_fs_server(
     async def get_file_info(path: str) -> dict[str, Any]:
         """Get a file's or directory's size, timestamps, permissions and type."""
         return await run(fs.get_file_info, path, path=path)
+
+    @server.tool(name="start_search", annotations=_SEARCH)
+    async def start_search(
+        path: str,
+        pattern: str,
+        search_type: Literal["files", "content"] = "files",
+        file_pattern: str | None = None,
+        ignore_case: bool = True,
+        literal: bool = False,
+        include_hidden: bool = False,
+        context_lines: int = 0,
+        max_results: int = DEFAULT_MAX_RESULTS,
+        timeout_ms: int = DEFAULT_TIMEOUT_MS,
+    ) -> dict[str, Any]:
+        """Search recursively under path, in the background. search_type "files"
+        matches file and directory names (a glob if pattern has * ? or [, else a
+        substring); "content" matches lines of text files against a regular
+        expression, or a plain string with literal=true. file_pattern limits which
+        files are searched, e.g. "*.py" or "*.{ts,tsx}|*.md". Returns a search_id,
+        the status and the first results; line numbers are 1-based."""
+        return await run(
+            searches.start,
+            path,
+            pattern,
+            search_type,
+            file_pattern,
+            ignore_case,
+            literal,
+            include_hidden,
+            context_lines,
+            max_results,
+            timeout_ms,
+            path=path,
+            query=pattern,
+        )
+
+    @server.tool(name="get_more_search_results", annotations=_READ)
+    async def get_more_search_results(
+        search_id: str, offset: int = 0, length: int = DEFAULT_PAGE
+    ) -> dict[str, Any]:
+        """Get results of a search from offset (0-based; negative counts from the
+        end). has_more is true while more results exist or the search is running."""
+        return await run(
+            searches.more, search_id, offset, length, search_id=search_id
+        )
+
+    @server.tool(name="stop_search", annotations=_READ)
+    async def stop_search(search_id: str) -> dict[str, Any]:
+        """Stop a running search. Results found so far stay available."""
+        return await run(searches.stop, search_id, search_id=search_id)
+
+    @server.tool(name="list_searches", annotations=_READ)
+    async def list_searches() -> dict[str, Any]:
+        """List recent searches with their status and result counts."""
+        return await run(searches.list)
 
     if fs.writable:
 
