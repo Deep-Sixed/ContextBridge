@@ -30,6 +30,7 @@ TRASH_DIR_NAME = ".contextbridge-trash"
 DEFAULT_MAX_READ_BYTES = 1024 * 1024
 DEFAULT_MAX_WRITE_BYTES = 1024 * 1024
 DEFAULT_MAX_LIST_ENTRIES = 1000
+DEFAULT_MAX_SEARCH_FILE_BYTES = 10 * 1024 * 1024
 DEFAULT_READ_LINES = 1000
 DEFAULT_LIST_DEPTH = 2
 MAX_LIST_DEPTH = 10
@@ -97,6 +98,7 @@ class FsLimits:
     max_read_bytes: int = DEFAULT_MAX_READ_BYTES
     max_write_bytes: int = DEFAULT_MAX_WRITE_BYTES
     max_list_entries: int = DEFAULT_MAX_LIST_ENTRIES
+    max_search_file_bytes: int = DEFAULT_MAX_SEARCH_FILE_BYTES
 
 
 @dataclass(frozen=True)
@@ -507,7 +509,7 @@ class Filesystem:
 # -- configuration ----------------------------------------------------------------
 
 _ROOT_KEYS = frozenset({"path", "writable"})
-_LIMIT_KEYS = ("max_read_bytes", "max_write_bytes", "max_list_entries")
+_LIMIT_KEYS = ("max_read_bytes", "max_write_bytes", "max_list_entries", "max_search_file_bytes")
 
 
 def filesystem_from_config(section: Any, *, config_path: Path) -> Filesystem:

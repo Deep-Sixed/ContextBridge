@@ -122,14 +122,32 @@ export CONTEXTBRIDGE_FS_AUTH_TOKEN="<a different strong secret>"
 | `create_directory` | `path` | Creates missing parents |
 | `move_file` | `source`, `destination` | Moves or renames; refuses a destination that already exists |
 | `delete_file` | `path`, `recursive` | Moves the item to `<root>/.contextbridge-trash/`; a non-empty directory needs `recursive` |
+| `start_search` | `path`, `pattern`, `search_type`, `file_pattern`, `ignore_case`, `literal`, `include_hidden`, `context_lines`, `max_results`, `timeout_ms` | Starts a recursive search in the background and returns a `search_id`, its status, and the first 100 results |
+| `get_more_search_results` | `search_id`, `offset`, `length` | A page of results (up to 500); a negative `offset` counts from the end |
+| `stop_search` | `search_id` | Stops a running search; the results found so far stay available |
+| `list_searches` | none | Recent searches with their status and result counts |
 
-Read tools are annotated read-only. `write_file`, `edit_block` and `delete_file` are marked destructive.
+Read tools, including the four search tools, are annotated read-only and are offered even when every root is read-only. `write_file`, `edit_block` and `delete_file` are marked destructive.
+
+**Search:** `search_type` is `files` (the default) or `content`.
+
+- A `files` search matches file and directory names. The pattern is a glob if it contains `*`, `?` or `[`, and a substring otherwise.
+- A `content` search matches each line of a text file against a regular expression (Python `re` syntax), or against a plain string with `literal: true`. Results have the `path`, the 1-based `line` number and the line's `text`, plus `before` and `after` lists when `context_lines` (0–10) is set.
+- `ignore_case` defaults to true. `file_pattern` limits which files are searched, for example `*.py` or `*.{ts,tsx}|*.md`, and is matched against file names case-insensitively. With `file_pattern` set, a `files` search reports only files, not directories.
+- Hidden entries (names starting with `.`) are skipped unless `include_hidden` is true.
+
+The search starts at `path` (a directory, or a single file for a `content` search) and walks every level below it. Symlinks are reported by a `files` search but never followed, and the trash is never searched. A `content` search skips binary files (a NUL byte in the first 8 KiB) and files over `max_search_file_bytes`, and reports the counts in `skipped`. Lines longer than 500 characters are cut, and a match on a cut line is marked `truncated`.
+
+`start_search` waits up to one second, so a quick search returns complete. A longer one keeps running, and `get_more_search_results` returns its results so far, with `status: "running"` and `has_more: true` until it finishes. The final status is `completed`, `cancelled`, `timed_out` or `failed`; `limit_reached` is true when `max_results` (default 500, at most 5000) or the 8 MiB per-search cap stopped it early.
+
+Each search runs in its own worker process (`src/uga/fs_search_worker.py`, started with `python -I`), so `stop_search` and `timeout_ms` (default 30000, at most 300000) stop it even inside a slow regular expression. On Linux and macOS the worker also sets an alarm a few seconds past its timeout, so it ends even if the server dies first. At most 4 searches run at once. The 10 most recent are kept in memory, and the oldest finished one is dropped to make room, so search ids are not kept across restarts. Searches are shared: every client with the route's token can list, page through and stop them.
 
 **Deletion is recoverable:** each deleted item is kept under `.contextbridge-trash/<trash_id>/`, next to a `<trash_id>.json` file recording its original path. No tool can read, list, change or empty the trash; recover or purge items from the host.
 
-**Limits:** `max_read_bytes` and `max_write_bytes` (1 MiB each by default) cap a response and a write, and `max_list_entries` (1000) caps a listing. Calls use the same `UGA_MCP_TOOL_TIMEOUT_SECONDS` and `UGA_MCP_METADATA_TIMEOUT_SECONDS` settings as the gateway. Text must be UTF-8; binary files are refused.
+**Limits:** `max_read_bytes` and `max_write_bytes` (1 MiB each by default) cap a response and a write, `max_list_entries` (1000) caps a listing, and `max_search_file_bytes` (10 MiB) is the largest file a content search reads. Calls use the same `UGA_MCP_TOOL_TIMEOUT_SECONDS` and `UGA_MCP_METADATA_TIMEOUT_SECONDS` settings as the gateway. Text must be UTF-8; binary files are refused.
 
-**Audit:** lines go to stderr and to `CONTEXTBRIDGE_FS_AUDIT_LOG` (or `serve.audit_log`, resolved against the config file's directory) with `route: "fs"`. As on the gateway, each request is one line, and `X-Forwarded-For` is ignored unless `serve.forwarded_allow_ips` lists the proxy. Paths are logged as the client sent them, with byte counts for reads and writes and the trash location for deletes. Refused paths are logged with `detail: "path_denied"`.
+**Audit:** lines go to stderr and to `CONTEXTBRIDGE_FS_AUDIT_LOG` (or `serve.audit_log`, resolved against the config file's directory) with `route: "fs"`. As on the gateway, each request is one line, and `X-Forwarded-For` is ignored unless `serve.forwarded_allow_ips` lists the proxy. Paths are logged as the client sent them, with byte counts for reads and writes and the trash location for deletes. Refused paths are logged with `detail: "path_denied"`. Search events include `search_id` and result counts; patterns are logged only by length and hash.
+
 
 **Known limits:** checks run before each operation, so another local process that swaps a symlink in between can still redirect it; only the final component is opened with `O_NOFOLLOW`. Likewise, a destination created between `move_file`'s check and the rename is replaced. Hard links that already exist inside a root are not detected.
 
@@ -160,6 +178,7 @@ export CONTEXTBRIDGE_COMPUTER_TOKEN="$(openssl rand -hex 32)"   # keep it in you
 ```
 
 Local MCP clients connect with the token as a bearer header. For example, in Claude Code:
+
 
 ```sh
 claude mcp add --transport http contextbridge http://127.0.0.1:8791/mcp \
@@ -521,7 +540,8 @@ Do not forward ports 8790, 8791, 8792, or 8794 to the internet. Publish 8793 onl
 
 ## Documentation
 
-The PDFs in `docs/` are planning documents. The filesystem and computer routes implement the roadmap's filesystem operations, and the computer route also covers search across files, terminal commands and sessions, processes, and remote devices. The computer route also reads, writes, and edits PDF, Word, and Excel files and has a native delete with a trash. Asynchronous search and synchronization are not implemented. The read-only knowledge gateway's default-deny policy rejects all of these tools. The documents refer to two target machines, Friday (Linux) and Thanatos (Windows).
+The PDFs in `docs/` are planning documents. The filesystem and computer routes implement the roadmap's filesystem operations; the filesystem route now also offers asynchronous file and content search. The computer route covers search, commands, processes, remote devices, documents (PDF, Word, Excel) and native recoverable delete. Synchronization remains unimplemented. The read-only knowledge route rejects these operations. The documents refer to Friday (Linux) and Thanatos (Windows).
+
 
 - `docs/capability-roadmap.pdf` lists the capabilities ContextBridge targets, with an implementation checklist. The checklist is a blank tracker, not a status report. It is generated by `scripts/build-roadmap-pdf.py`.
 - `docs/computer-use-linux-review.pdf` evaluates `agent-sh/computer-use-linux` as a Linux desktop-control engine for ContextBridge. It is generated by `scripts/build-review-pdf.py`.
