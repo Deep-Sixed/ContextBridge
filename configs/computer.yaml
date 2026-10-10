@@ -76,6 +76,7 @@ commands:
   max_session_seconds: 3600
   # env_strip: variables matching these globs are removed from child processes.
   # Omit for the built-in list (*TOKEN*, *SECRET*, *PASSWORD*, *API_KEY*, ...).
+  # The three route tokens are always removed, whatever this list says.
 
 processes:
   list: true

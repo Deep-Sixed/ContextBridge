@@ -85,6 +85,7 @@ from .policy import ComputerPolicy, PolicyError, PolicyViolation, load_policy
 
 TOKEN_ENV = "CONTEXTBRIDGE_COMPUTER_TOKEN"
 KNOWLEDGE_TOKEN_ENV = "MCP_AUTH_TOKEN"
+FS_TOKEN_ENV = "CONTEXTBRIDGE_FS_AUTH_TOKEN"
 CLIENT_ID = "contextbridge-computer"
 MIN_TOKEN_LENGTH = 32
 LOCAL_DEVICE = "local"
@@ -733,6 +734,10 @@ def _require_token() -> str:
     if token == os.environ.get(KNOWLEDGE_TOKEN_ENV):
         raise SystemExit(
             f"{TOKEN_ENV} must differ from {KNOWLEDGE_TOKEN_ENV}; knowledge and computer access are separate."
+        )
+    if token == os.environ.get(FS_TOKEN_ENV):
+        raise SystemExit(
+            f"{TOKEN_ENV} must differ from {FS_TOKEN_ENV}; filesystem and computer access are separate."
         )
     return token
 
