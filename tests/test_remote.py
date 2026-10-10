@@ -16,12 +16,12 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from helpers import PY, python_cmd
 
-from contextbridge.computer.audit import ComputerAuditLog
+from contextbridge.computer.audit import CallAudit, ComputerAuditLog
 from contextbridge.computer.policy import PolicyError
 from contextbridge.computer.server import ALL_SCOPES, TOOL_SCOPES, AuthorizationError, create_computer_server
 from contextbridge.computer.server import main as computer_main
 from contextbridge.remote.agent import Agent, FatalAgentError, Identity, enroll, load_agent_config
-from contextbridge.remote.hub import AgentHub, RemoteDenied, _Pending
+from contextbridge.remote.hub import AgentHub, RemoteDenied, RemoteFailed, _Pending
 from contextbridge.remote.protocol import encode
 from contextbridge.remote.registry import DeviceRegistry
 from contextbridge.remote.tls import PinMismatch, generate_self_signed, server_context
@@ -121,6 +121,18 @@ def mcp(gw, *, scopes=ALL_SCOPES, local_policy=None):
         audit=ComputerAuditLog(gw.audit_path, echo=False),
         hub=gw.hub,
         authorize=allow_scopes(*scopes),
+    )
+    return Client(server)
+
+
+def mcp_as(gw, client: str, *, listener: str = "local"):
+    """An MCP client the gateway knows as ``client`` on ``listener``, with every scope."""
+    server = create_computer_server(
+        None,
+        audit=ComputerAuditLog(gw.audit_path, echo=False),
+        hub=gw.hub,
+        authorize=lambda tool: client,
+        listener=listener,
     )
     return Client(server)
 
@@ -249,6 +261,22 @@ def test_token_scopes_still_apply_to_remote_devices(tmp_path, workspace):
                     await client.call_tool("run_command", {"command": HI, "device": DEVICE})
 
     asyncio.run(scenario())
+
+
+def test_remote_devices_show_command_lines_only_with_the_process_scope(tmp_path, workspace):
+    async def scenario():
+        async with gateway(tmp_path) as gw, connected_agent(tmp_path, workspace, gw):
+            results = []
+            for scopes in (["computer:read"], ALL_SCOPES):
+                async with mcp(gw, scopes=scopes) as client:
+                    args = {"limit": 1000, "device": DEVICE}
+                    results.append((await client.call_tool("list_processes", args)).structured_content)
+            return results
+
+    read_only, owner = asyncio.run(scenario())
+    assert not read_only["cmdline_included"]
+    assert all("cmdline" not in row for row in read_only["processes"])
+    assert owner["cmdline_included"] and all("cmdline" in row for row in owner["processes"])
 
 
 def test_unknown_and_offline_devices(tmp_path, workspace):
@@ -429,6 +457,99 @@ def test_replayed_and_out_of_order_calls_are_refused(tmp_path, workspace):
     assert replayed_seq["ok"] is False and "sequence" in replayed_seq["error"]["message"]
     assert replayed_id["ok"] is False and "already used" in replayed_id["error"]["message"]
     assert accepted["ok"] is True
+
+
+def test_agent_refuses_calls_with_an_invalid_caller(tmp_path, workspace):
+    async def scenario():
+        async with gateway(tmp_path) as gw, connected_agent(tmp_path, workspace, gw):
+            conn = gw.hub.connection(DEVICE)
+            loop = asyncio.get_running_loop()
+            seq = 0
+
+            async def raw_call(**extra) -> dict:
+                nonlocal seq
+                seq += 1
+                request_id = f"caller-test-{seq}"
+                future = loop.create_future()
+                conn.pending[request_id] = _Pending(future, None)
+                frame = {"type": "call", "seq": seq, "request_id": request_id, "tool": "list_sessions", "args": {}}
+                await conn.ws.send(encode({**frame, **extra}))
+                return await asyncio.wait_for(future, 5)
+
+            refused = [await raw_call(caller=bad) for bad in (123, "", "x" * 257, ["local:a"])]
+            legacy = await raw_call()  # a gateway that predates session ownership sends no caller
+            named = await raw_call(caller="remote:" + "x" * 249)
+            return refused, legacy, named
+
+    refused, legacy, named = asyncio.run(scenario())
+    for reply in refused:
+        assert reply["ok"] is False and reply["started"] is False
+        assert reply["error"]["kind"] == "denied" and "invalid caller" in reply["error"]["message"]
+    assert legacy["ok"] is True and named["ok"] is True
+    denied = [e for e in events(tmp_path / "agent-audit.jsonl") if e["event"] == "denied"]
+    assert len(denied) == 4 and all("invalid caller" in e["reason"] for e in denied)
+
+
+def test_remote_sessions_belong_to_the_client_that_started_them(tmp_path, workspace):
+    sleeper = {"command": python_cmd("import time; time.sleep(30)"), "wait_seconds": 0, "device": DEVICE}
+
+    async def scenario():
+        async with gateway(tmp_path) as gw, connected_agent(tmp_path, workspace, gw):
+            async with mcp_as(gw, "alice") as alice, mcp_as(gw, "bob", listener="remote") as bob:
+                sid = (await alice.call_tool("start_process", sleeper)).structured_content["session_id"]
+                theirs = (await bob.call_tool("list_sessions", {"device": DEVICE})).structured_content["sessions"]
+                for tool, extra in (
+                    ("read_process_output", {}),
+                    ("interact_with_process", {"input": "hello"}),
+                    ("force_terminate", {}),
+                ):
+                    with pytest.raises(ToolError, match="Unknown session"):
+                        await bob.call_tool(tool, {"session_id": sid, "device": DEVICE, **extra})
+                # The agent takes the owner from the call frame, never from the arguments.
+                as_bob = CallAudit(
+                    ComputerAuditLog(gw.audit_path, echo=False), "smuggled-1", "read_process_output", "bob",
+                    caller="remote:bob",
+                )
+                smuggled = {"session_id": sid, "caller": "local:alice"}
+                with pytest.raises(RemoteFailed, match="Unknown session"):
+                    await gw.hub.call(DEVICE, "read_process_output", smuggled, as_bob)
+                as_bob_again = CallAudit(
+                    ComputerAuditLog(gw.audit_path, echo=False), "smuggled-2", "read_process_output", "bob",
+                    caller="remote:bob",
+                )
+                with pytest.raises(RemoteFailed, match="Unknown session"):
+                    await gw.hub.call(
+                        DEVICE, "read_process_output", {"session_id": sid, "all_sessions": True}, as_bob_again
+                    )
+                # The owner's full session access stops at the gateway's own machine: on a device,
+                # alice (the local listener) cannot use bob's session either.
+                bobs = (await bob.call_tool("start_process", sleeper)).structured_content["session_id"]
+                for tool, extra in (
+                    ("read_process_output", {}),
+                    ("interact_with_process", {"input": "hello"}),
+                    ("force_terminate", {}),
+                ):
+                    with pytest.raises(ToolError, match="Unknown session"):
+                        await alice.call_tool(tool, {"session_id": bobs, "device": DEVICE, **extra})
+                await bob.call_tool("force_terminate", {"session_id": bobs, "device": DEVICE})
+                mine = (await alice.call_tool("list_sessions", {"device": DEVICE})).structured_content["sessions"]
+                final = (await alice.call_tool("force_terminate", {"session_id": sid, "device": DEVICE})).structured_content
+            await wait_for(
+                lambda: sum(e["event"] == "exited" for e in events(tmp_path / "gateway-audit.jsonl")) >= 2, timeout=15
+            )
+            return sid, theirs, mine, final
+
+    sid, theirs, mine, final = asyncio.run(scenario())
+    assert theirs == []
+    assert [s["session_id"] for s in mine] == [sid]
+    assert final["running"] is False
+    agent_log = events(tmp_path / "agent-audit.jsonl")
+    started = [e for e in agent_log if e["event"] == "requested" and e["tool"] == "start_process"]
+    assert [e["caller"] for e in started] == ["local:alice", "remote:bob"]
+    refused = [e for e in agent_log if e["event"] == "failed" and e.get("reason", "").startswith("Unknown session")]
+    assert len(refused) == 8
+    exited = {e["session_id"]: e["caller"] for e in events(tmp_path / "gateway-audit.jsonl") if e["event"] == "exited"}
+    assert exited[sid] == "local:alice" and set(exited.values()) == {"local:alice", "remote:bob"}
 
 
 def test_missed_heartbeats_mark_the_device_offline_and_it_reconnects(tmp_path, workspace, monkeypatch):

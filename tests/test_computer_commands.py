@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import time
+import uuid
 
 import psutil
 import pytest
@@ -10,6 +12,7 @@ from helpers import PY, python_cmd
 
 from contextbridge.computer import commands
 from contextbridge.computer.commands import BoundedCapture, CommandError, SessionManager
+from contextbridge.computer.dispatch import Engine
 from contextbridge.computer.policy import PolicyViolation
 
 posix_only = pytest.mark.skipif(os.name == "nt", reason="uses POSIX shell utilities")
@@ -123,6 +126,30 @@ def test_list_processes_includes_self():
     assert any(row["pid"] == os.getpid() for row in result["processes"])
 
 
+def test_list_processes_hides_command_lines_unless_asked():
+    secret = f"--password=cb-{uuid.uuid4().hex}"
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", secret])
+    try:
+        deadline = time.monotonic() + 10
+        while True:
+            shown = commands.list_processes(name_filter=secret, include_cmdline=True)
+            if any(row["pid"] == child.pid for row in shown["processes"]) or time.monotonic() > deadline:
+                break
+            time.sleep(0.05)
+        assert shown["cmdline_included"]
+        row = next(row for row in shown["processes"] if row["pid"] == child.pid)
+        assert secret in row["cmdline"]
+
+        hidden = commands.list_processes()
+        assert not hidden["cmdline_included"]
+        assert hidden["processes"] and all("cmdline" not in row for row in hidden["processes"])
+        # The filter cannot be used to probe command lines one guess at a time.
+        assert commands.list_processes(name_filter=secret)["matched"] == 0
+    finally:
+        child.kill()
+        child.wait()
+
+
 def test_kill_process_refuses_protected_pids():
     for pid in (1, os.getpid(), os.getppid()):
         with pytest.raises(PolicyViolation, match="protected"):
@@ -208,6 +235,57 @@ def test_interactive_session_on_every_platform(policy):
     finally:
         final = sessions.terminate(sid)
     assert final["running"] is False
+
+
+_SLEEP = python_cmd("import time; time.sleep(30)")
+
+
+def test_sessions_belong_to_the_caller_that_started_them(policy):
+    sessions = SessionManager(policy)
+    sid = sessions.start(_SLEEP, wait_seconds=0, owner="remote:alice")["session_id"]
+    try:
+        for caller in ("remote:bob", "local:alice", None):
+            for action in (
+                lambda: sessions.read(sid, caller=caller),
+                lambda: sessions.send(sid, "ping", caller=caller),
+                lambda: sessions.terminate(sid, caller=caller),
+            ):
+                with pytest.raises(CommandError, match="Unknown session"):
+                    action()
+            assert sessions.list(caller=caller) == []
+        assert [s["session_id"] for s in sessions.list(caller="remote:alice")] == [sid]
+        assert sessions.read(sid, caller="remote:alice")["running"] is True
+    finally:
+        final = sessions.terminate(sid, caller="remote:alice")
+    assert final["running"] is False
+
+
+def test_all_sessions_reaches_every_clients_session(policy):
+    sessions = SessionManager(policy)
+    sid = sessions.start(_SLEEP, wait_seconds=0, owner="remote:alice")["session_id"]
+    try:
+        listed = sessions.list(caller="local:owner", all_sessions=True)
+        assert [(s["session_id"], s["started_by"]) for s in listed] == [(sid, "remote:alice")]
+        assert sessions.read(sid, caller="local:owner", all_sessions=True)["running"] is True
+        assert sessions.list(caller="local:owner") == []  # without the flag, the owner is like anyone else
+    finally:
+        final = sessions.terminate(sid, caller="local:owner", all_sessions=True)
+    assert final["running"] is False
+
+
+def test_engine_takes_the_session_owner_from_the_call_not_the_arguments(policy):
+    engine = Engine(policy)
+    try:
+        args = {"command": _SLEEP, "wait_seconds": 0, "caller": "remote:bob"}
+        sid = engine.execute("start_process", args, caller="remote:alice")["session_id"]
+        with pytest.raises(CommandError, match="Unknown session"):
+            engine.execute("read_process_output", {"session_id": sid, "caller": "remote:alice"}, caller="remote:bob")
+        with pytest.raises(CommandError, match="Unknown session"):
+            engine.execute("read_process_output", {"session_id": sid, "all_sessions": True}, caller="remote:bob")
+        assert engine.execute("list_sessions", {"caller": "remote:alice"}, caller="remote:bob")["sessions"] == []
+        assert [s["session_id"] for s in engine.execute("list_sessions", {}, caller="remote:alice")["sessions"]] == [sid]
+    finally:
+        engine.shutdown()
 
 
 def test_session_lifetime_kills_grandchildren(policy):

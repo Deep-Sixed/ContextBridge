@@ -14,12 +14,13 @@ import shutil
 import stat
 import tempfile
 import time
-from collections import deque
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .audit import mark_started
+from .matcher import RegexWorker, RegexWorkerError
 from .policy import ComputerPolicy, PolicyViolation
 
 _BINARY_SNIFF_BYTES = 8192
@@ -75,6 +76,45 @@ def _require_file(path: Path, raw: str) -> None:
 
 def _clip(line: str) -> str:
     return line if len(line) <= _MAX_LINE_CHARS else line[:_MAX_LINE_CHARS] + "…"
+
+
+def _bounded_lines(fh: Any, limit: int):
+    """Yield ``(line, dropped)`` for each line of a text stream, holding at most ``limit`` characters.
+
+    A longer line yields only its first ``limit`` characters; the rest is read in
+    ``limit``-sized pieces and discarded, and ``dropped`` counts them. A file with
+    no newlines therefore never sits in memory whole.
+    """
+    pending = ""
+    while True:
+        line, pending = pending or fh.readline(limit), ""
+        if not line:
+            return
+        dropped = 0
+        piece = line
+        # A piece ends its line when it is short (line break or end of file) or ends in a line break.
+        while len(piece) == limit and not piece.endswith(("\n", "\r")):
+            piece = fh.readline(limit)
+            dropped += len(piece.rstrip("\r\n"))
+        if len(piece) == limit and piece.endswith("\r"):
+            # The cut may have split "\r\n"; the next read then returns the "\n" alone.
+            after = fh.readline(limit)
+            if after != "\n":
+                pending = after
+        yield line, dropped
+
+
+def _clip_to_budget(line: str, dropped: int, budget: int) -> str:
+    """The head of a line too long for the read limit, ending in a marker that says so."""
+    body = line.rstrip("\r\n")
+
+    def marker(omitted: int) -> str:
+        return f" … [{omitted} more characters on this line; clipped at the {budget}-byte read limit]\n"
+
+    # Size the head against the longest marker it could need, so head + marker fits the budget.
+    room = max(0, budget - len(marker(len(body) + dropped).encode("utf-8")))
+    head = body.encode("utf-8")[:room].decode("utf-8", "ignore")
+    return head + marker(len(body) + dropped - len(head))
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
@@ -141,7 +181,15 @@ def list_directory(policy: ComputerPolicy, path: str, *, depth: int = 1) -> dict
 def read_file(
     policy: ComputerPolicy, path: str, *, offset: int = 0, length: int | None = None
 ) -> dict[str, Any]:
-    """Read text lines. ``offset`` is 0-based; a negative offset reads the last N lines."""
+    """Read text lines. ``offset`` is 0-based; a negative offset reads the last N lines.
+
+    Memory stays within a small multiple of ``max_read_bytes`` whatever the file
+    holds: lines are read in bounded pieces, and a negative offset counts the lines
+    in a first pass instead of buffering them. Returned content stops at the read
+    limit (``truncated``). A single line longer than the limit can never be
+    returned whole; when it is the first requested line, its head comes back
+    with a marker (``line_clipped``), so paging forward always makes progress.
+    """
     resolved = policy.resolve(path)
     _require_file(resolved, path)
     mark_started(path=str(resolved))
@@ -152,40 +200,36 @@ def read_file(
             f"{path} looks like a binary file ({size} bytes); only text files can be read."
         )
     budget = policy.max_read_bytes
+    limit = budget + 1  # characters; a longer line is over budget in any encoding
+
+    def open_text():
+        return resolved.open("r", encoding=encoding, errors="replace", newline="")
+
+    if offset < 0:
+        with open_text() as fh:
+            counted = sum(1 for _ in _bounded_lines(fh, limit))
+        start = max(0, counted + offset)
+    else:
+        start = offset
     used = 0
     truncated = False
+    clipped = False
     total_lines = 0
-    with resolved.open("r", encoding=encoding, errors="replace", newline="") as fh:
-        if offset < 0:
-            tail: deque[str] = deque(maxlen=-offset)
-            for line in fh:
-                tail.append(line)
-                total_lines += 1
-            selected = list(tail)
-            if length is not None:
-                selected = selected[: max(0, length)]
-            start = total_lines - len(tail)
-            lines: list[str] = []
-            for line in selected:
-                used += len(line.encode("utf-8"))
-                if used > budget:
-                    truncated = True
-                    break
+    lines: list[str] = []
+    with open_text() as fh:
+        for index, (line, dropped) in enumerate(_bounded_lines(fh, limit)):
+            total_lines = index + 1
+            if index < start or truncated or (length is not None and len(lines) >= length):
+                continue
+            line_bytes = len(line.encode("utf-8"))
+            if not dropped and used + line_bytes <= budget:
                 lines.append(line)
-        else:
-            start = offset
-            lines = []
-            for index, line in enumerate(fh):
-                total_lines = index + 1
-                if index < offset:
-                    continue
-                if truncated or (length is not None and len(lines) >= length):
-                    continue
-                used += len(line.encode("utf-8"))
-                if used > budget:
-                    truncated = True
-                    continue
-                lines.append(line)
+                used += line_bytes
+                continue
+            truncated = True
+            if not lines:  # the first requested line alone is over the limit
+                lines.append(_clip_to_budget(line, dropped, budget))
+                clipped = True
     return {
         "path": str(resolved),
         "encoding": encoding,
@@ -195,6 +239,7 @@ def read_file(
         "total_lines": total_lines,
         "size": size,
         "truncated": truncated,
+        "line_clipped": clipped,
     }
 
 
@@ -220,7 +265,8 @@ def get_file_info(policy: ComputerPolicy, path: str) -> dict[str, Any]:
         if encoding is not None:
             info["encoding"] = encoding
             with resolved.open("r", encoding=encoding, errors="replace", newline="") as fh:
-                info["line_count"] = sum(1 for _ in fh)
+                # Bounded even if the file grew past the limit since the stat above.
+                info["line_count"] = sum(1 for _ in _bounded_lines(fh, policy.max_read_bytes + 1))
     return info
 
 
@@ -287,7 +333,10 @@ def search_code(
     context_lines: int = 0,
     max_results: int | None = None,
 ) -> dict[str, Any]:
-    """Search text file contents under ``path``; binary and oversized files are skipped."""
+    """Search text file contents under ``path``; binary and oversized files are skipped.
+
+    The whole search, regex matching included, ends at ``max_search_seconds``.
+    """
     root = policy.resolve(path)
     if not pattern:
         raise FileOperationError("A search pattern is required.")
@@ -312,38 +361,57 @@ def search_code(
     matches: list[dict[str, Any]] = []
     files_scanned = 0
     truncated = False
-    for candidate, is_dir in candidates:
-        if is_dir:
-            continue
-        if time.monotonic() > deadline or truncated:
-            break
-        if file_glob and not fnmatch.fnmatchcase(candidate.name.casefold(), file_glob):
-            continue
-        try:
-            if not candidate.is_file():  # never open FIFOs or devices
+    worker: RegexWorker | None = None  # started on the first file a regex search reads
+    try:
+        for candidate, is_dir in candidates:
+            if is_dir:
                 continue
-            if candidate.stat().st_size > policy.max_read_bytes:
-                continue
-            encoding = _text_encoding(candidate)
-            if encoding is None:
-                continue
-            with candidate.open("r", encoding=encoding, errors="replace") as fh:
-                lines = fh.read().splitlines()
-        except OSError:
-            continue
-        files_scanned += 1
-        for index, line in enumerate(lines):
-            if not matcher.search(line):
-                continue
-            if len(matches) >= limit:
-                truncated = True
+            if time.monotonic() > deadline or truncated:
                 break
-            hit: dict[str, Any] = {"path": str(candidate), "line": index + 1, "text": _clip(line)}
-            if context_lines:
-                lo = max(0, index - context_lines)
-                hit["before"] = [_clip(x) for x in lines[lo:index]]
-                hit["after"] = [_clip(x) for x in lines[index + 1 : index + 1 + context_lines]]
-            matches.append(hit)
+            if file_glob and not fnmatch.fnmatchcase(candidate.name.casefold(), file_glob):
+                continue
+            try:
+                if not candidate.is_file():  # never open FIFOs or devices
+                    continue
+                if candidate.stat().st_size > policy.max_read_bytes:
+                    continue
+                encoding = _text_encoding(candidate)
+                if encoding is None:
+                    continue
+                with candidate.open("r", encoding=encoding, errors="replace") as fh:
+                    text = fh.read(policy.max_read_bytes + 1)
+            except OSError:
+                continue
+            if len(text) > policy.max_read_bytes:  # it grew past the limit after the size check
+                continue
+            lines = text.splitlines()
+            if regex:
+                # Caller patterns can backtrack exponentially while holding the GIL: match them
+                # in a child process that is killed at the deadline (see .matcher).
+                if worker is None:
+                    worker = RegexWorker(pattern, flags, env=policy.child_env())
+                hits: Iterable[int] | None = worker.search(text, limit - len(matches) + 1, deadline)
+                if hits is None:
+                    break
+            else:
+                hits = (index for index, line in enumerate(lines) if matcher.search(line))
+            files_scanned += 1
+            for index in hits:
+                if len(matches) >= limit:
+                    truncated = True
+                    break
+                line = lines[index]
+                hit: dict[str, Any] = {"path": str(candidate), "line": index + 1, "text": _clip(line)}
+                if context_lines:
+                    lo = max(0, index - context_lines)
+                    hit["before"] = [_clip(x) for x in lines[lo:index]]
+                    hit["after"] = [_clip(x) for x in lines[index + 1 : index + 1 + context_lines]]
+                matches.append(hit)
+    except RegexWorkerError as exc:
+        raise FileOperationError(f"Regular-expression search failed: {exc}.") from None
+    finally:
+        if worker is not None:
+            worker.close()
     timed_out = time.monotonic() > deadline
     return {
         "path": str(root),

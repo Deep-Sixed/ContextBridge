@@ -11,6 +11,7 @@ import pytest
 import yaml
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
+from helpers import python_cmd
 
 from contextbridge.computer.audit import AuditError, ComputerAuditLog
 from contextbridge.computer.policy import PolicyError, load_policy
@@ -24,6 +25,7 @@ from contextbridge.computer.server import (
     WRITE_TOOLS,
     AuthorizationError,
     advertised_tool_names,
+    build_router,
     computer_tool_names,
     create_computer_server,
     load_scopes,
@@ -152,6 +154,19 @@ def test_scopes_are_enforced_per_call(policy, audit, audit_path, workspace):
     ]
 
 
+def test_process_command_lines_need_the_process_scope(policy, audit):
+    async def processes(client):
+        return (await client.call_tool("list_processes", {"limit": 1000})).structured_content
+
+    read_only = run(create_computer_server(policy, audit=audit, authorize=allow_scopes(SCOPE_READ)), processes)
+    assert not read_only["cmdline_included"]
+    assert read_only["processes"] and all("cmdline" not in row for row in read_only["processes"])
+    owner = run(create_computer_server(policy, audit=audit, authorize=allow_scopes(*ALL_SCOPES)), processes)
+    assert owner["cmdline_included"]
+    me = next(row for row in owner["processes"] if row["pid"] == os.getpid())
+    assert "pytest" in me["cmdline"]
+
+
 def test_tools_outside_policy_are_rejected(workspace, audit, audit_path):
     policy = load_policy({"filesystem": {"roots": [str(workspace)]}})
     server = create_computer_server(policy, audit=audit, authorize=allow_scopes(*ALL_SCOPES))
@@ -247,6 +262,117 @@ def test_timed_out_command_is_completed_but_not_successful(make_policy, audit, a
     completed = events(audit_path)[-1]
     assert completed["event"] == "completed"
     assert completed["timed_out"] is True and completed["success"] is False
+
+
+SLEEPER = {"command": python_cmd("import time; time.sleep(30)"), "wait_seconds": 0}
+ECHO = {"command": python_cmd("import sys\nfor line in sys.stdin:\n    print('got ' + line.strip(), flush=True)")}
+ACTIONS = (("read_process_output", {}), ("interact_with_process", {"input": "hello"}), ("force_terminate", {}))
+
+
+def shared_listeners(policy, audit):
+    """The owner's local listener plus two remote clients, one reusing the owner's client id."""
+    router = build_router(policy, audit=audit)
+
+    def server(listener: str, client: str):
+        return create_computer_server(
+            None, audit=audit, router=router, authorize=lambda tool: client, listener=listener
+        )
+
+    servers = (
+        server("local", "contextbridge-computer"),
+        server("remote", "client-b"),
+        server("remote", "contextbridge-computer"),  # ids are namespaced by listener
+    )
+    return router, servers
+
+
+def run_clients(router, servers, scenario):
+    async def inner():
+        async with Client(servers[0]) as a, Client(servers[1]) as b, Client(servers[2]) as c:
+            return await scenario(a, b, c)
+
+    try:
+        return anyio.run(inner)
+    finally:
+        router.local.shutdown()
+
+
+def wait_for_exits(audit_path: Path, count: int) -> list[dict]:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        exited = [e for e in events(audit_path) if e["event"] == "exited"]
+        if len(exited) >= count:
+            return exited
+        time.sleep(0.05)
+    raise AssertionError("sessions did not exit in time")
+
+
+def test_remote_clients_reach_only_their_own_sessions(policy, audit, audit_path):
+    router, servers = shared_listeners(policy, audit)
+
+    async def scenario(owner, b, c):
+        owners = (await owner.call_tool("start_process", SLEEPER)).structured_content["session_id"]
+        b_sid = (await b.call_tool("start_process", SLEEPER)).structured_content["session_id"]
+        for intruder, sid in ((b, owners), (c, owners), (c, b_sid)):
+            for tool, extra in ACTIONS:
+                with pytest.raises(ToolError, match="Unknown session"):
+                    await intruder.call_tool(tool, {"session_id": sid, **extra})
+        listed = [(await x.call_tool("list_sessions", {})).structured_content["sessions"] for x in (b, c)]
+        await b.call_tool("force_terminate", {"session_id": b_sid})
+        await owner.call_tool("force_terminate", {"session_id": owners})
+        return owners, b_sid, listed
+
+    owners, b_sid, (b_sees, c_sees) = run_clients(router, servers, scenario)
+    assert [(s["session_id"], s["started_by"]) for s in b_sees] == [(b_sid, "remote:client-b")]
+    assert c_sees == []
+    exited = {e["session_id"]: e["caller"] for e in wait_for_exits(audit_path, 2)}
+    assert exited == {owners: "local:contextbridge-computer", b_sid: "remote:client-b"}
+    # Refused session calls never touched a process.
+    refused = [e for e in events(audit_path) if e.get("reason", "").startswith("Unknown session")]
+    assert len(refused) == 9 and all(e["event"] == "failed" for e in refused)
+    assert {e["client"] for e in refused} == {"client-b", "contextbridge-computer"}
+
+
+def test_owner_token_manages_every_clients_sessions(policy, audit, audit_path):
+    router, servers = shared_listeners(policy, audit)
+
+    async def scenario(owner, b, c):
+        b_sid = (await b.call_tool("start_process", {**ECHO, "wait_seconds": 0.2})).structured_content["session_id"]
+        c_sid = (await c.call_tool("start_process", SLEEPER)).structured_content["session_id"]
+        listed = (await owner.call_tool("list_sessions", {})).structured_content["sessions"]
+        reply = (
+            await owner.call_tool("interact_with_process", {"session_id": b_sid, "input": "ping", "wait_seconds": 5})
+        ).structured_content
+        output = reply["output"]
+        for _ in range(20):
+            if "got ping" in output:
+                break
+            read = await owner.call_tool("read_process_output", {"session_id": b_sid, "wait_seconds": 0.5})
+            output += read.structured_content["output"]
+        finals = [
+            (await owner.call_tool("force_terminate", {"session_id": sid})).structured_content for sid in (b_sid, c_sid)
+        ]
+        return b_sid, c_sid, listed, output, finals
+
+    b_sid, c_sid, listed, output, finals = run_clients(router, servers, scenario)
+    assert {(s["session_id"], s["started_by"]) for s in listed} == {
+        (b_sid, "remote:client-b"),
+        (c_sid, "remote:contextbridge-computer"),
+    }
+    assert "got ping" in output
+    assert all(final["running"] is False for final in finals)
+    # The audit says whose session the owner used.
+    used = [
+        e
+        for e in events(audit_path)
+        if e["event"] == "started" and e["tool"] in {"interact_with_process", "force_terminate"}
+    ]
+    assert {(e["session_id"], e["started_by"]) for e in used} == {
+        (b_sid, "remote:client-b"),
+        (c_sid, "remote:contextbridge-computer"),
+    }
+    exited = {e["session_id"]: e["caller"] for e in wait_for_exits(audit_path, 2)}
+    assert exited == {b_sid: "remote:client-b", c_sid: "remote:contextbridge-computer"}
 
 
 @posix_only

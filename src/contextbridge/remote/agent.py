@@ -68,6 +68,7 @@ SEEN_REQUEST_IDS = 10_000
 MAX_BACKOFF_SECONDS = 60.0
 STARTED_NOTIFY_TIMEOUT_SECONDS = 10.0
 _MAX_ERROR_TEXT = 2000
+MAX_CALLER_LENGTH = 256
 
 
 class AgentError(RuntimeError):
@@ -411,9 +412,12 @@ class Agent:
     def _accept_call(self, msg: dict[str, Any]) -> None:
         request_id = msg.get("request_id")
         seq = msg.get("seq")
+        caller = msg.get("caller")  # absent from gateways that predate session ownership
         reason = None
         if not isinstance(request_id, str) or not request_id or len(request_id) > 64:
             reason = "call has no valid request_id"
+        elif caller is not None and (not isinstance(caller, str) or not 0 < len(caller) <= MAX_CALLER_LENGTH):
+            reason = "call has an invalid caller"
         elif not isinstance(seq, int) or isinstance(seq, bool) or seq <= self._last_seq:
             reason = "replayed or out-of-order call (sequence number did not increase)"
         elif request_id in self._seen:
@@ -423,7 +427,7 @@ class Agent:
             self._seen[request_id] = None
             if len(self._seen) > SEEN_REQUEST_IDS:
                 self._seen.popitem(last=False)
-            self._spawn(self._run_call(request_id, msg.get("tool"), msg.get("args")))
+            self._spawn(self._run_call(request_id, msg.get("tool"), msg.get("args"), caller))
             return
         self._log("denied", request_id=str(request_id)[:64], tool=str(msg.get("tool"))[:64], reason=reason)
         if isinstance(request_id, str):
@@ -434,11 +438,13 @@ class Agent:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    async def _run_call(self, request_id: str, tool: Any, args: Any) -> None:
+    async def _run_call(self, request_id: str, tool: Any, args: Any, caller: str | None = None) -> None:
         client = f"gateway:{self.identity.gateway_id}"
         tool_name = tool if isinstance(tool, str) else "<invalid>"
         try:
-            self.audit.record("requested", request_id=request_id, tool=tool_name, client=client, **summarize_args(args))
+            self.audit.record(
+                "requested", request_id=request_id, tool=tool_name, client=client, caller=caller, **summarize_args(args)
+            )
         except AuditError:
             await self._reply(request_id, ok=False, kind="failed", message="agent audit log unavailable", started=False)
             return
@@ -456,11 +462,12 @@ class Agent:
             )
             future.result(timeout=STARTED_NOTIFY_TIMEOUT_SECONDS)
 
-        call = CallAudit(self.audit, request_id, tool, client, on_started=notify_gateway)
+        call = CallAudit(self.audit, request_id, tool, client, on_started=notify_gateway, caller=caller)
         async with self._calls:
             binding = bind_call(call)
             try:
-                result = await asyncio.to_thread(self.engine.execute, tool, args)
+                # The gateway authenticated the caller; sessions belong to it, whatever args say.
+                result = await asyncio.to_thread(self.engine.execute, tool, args, caller=caller)
             except Exception as exc:
                 if call.started:
                     event, kind = "completed", "failed"
@@ -496,7 +503,7 @@ class Agent:
             self._log("result_undelivered", request_id=request_id)
 
     def _on_exit(self, status: dict[str, Any]) -> None:
-        fields = {k: status[k] for k in ("session_id", "pid", "command", "exit_code", "timed_out")}
+        fields = {k: status.get(k) for k in ("session_id", "pid", "command", "exit_code", "timed_out", "caller")}
         success = status["exit_code"] == 0 and not status["timed_out"]
         self.audit.record("exited", tool="session", success=success, **fields)
         loop = self._loop

@@ -173,8 +173,10 @@ class _Session:
         tree: ProcessTree,
         cap: int,
         on_exit: ExitCallback | None = None,
+        owner: str | None = None,
     ) -> None:
         self.id = session_id
+        self.owner = owner
         self.command = command
         self.cwd = cwd
         self.tree = tree
@@ -198,7 +200,7 @@ class _Session:
         if self._on_exit is None:
             return
         try:
-            self._on_exit(self.status())
+            self._on_exit({**self.status(), "caller": self.owner})
         except Exception as exc:  # an exit report must never crash the waiter thread
             print(f"[computer] could not report exit of session {self.id}: {exc}", file=sys.stderr, flush=True)
 
@@ -255,7 +257,16 @@ class _Session:
 
 
 class SessionManager:
-    """Long-running commands whose output is read incrementally."""
+    """Long-running commands whose output is read incrementally.
+
+    Each session belongs to the caller that started it (the ``owner`` passed to
+    :meth:`start`): only that caller can list, read, send to, or terminate it,
+    unless the call carries ``all_sessions`` (the gateway sets it for the owner's
+    static token on its own machine). Anyone else gets the same "Unknown session"
+    answer as for an id that never existed. Several clients share one manager (the
+    gateway's local and remote listeners, or every client of one gateway on an
+    agent), so this is what keeps one client out of another's shell.
+    """
 
     def __init__(self, policy: ComputerPolicy, *, on_exit: ExitCallback | None = None) -> None:
         self._policy = policy
@@ -264,12 +275,23 @@ class SessionManager:
         self._lock = threading.Lock()
         self._ids = itertools.count(1)
 
-    def _get(self, session_id: str) -> _Session:
+    @staticmethod
+    def _permits(session: _Session, caller: str | None, all_sessions: bool) -> bool:
+        """The ownership rule, for every action: the client that started it, or a caller with all_sessions."""
+        return all_sessions or session.owner == caller
+
+    def _get(self, session_id: str, caller: str | None, all_sessions: bool) -> _Session:
         with self._lock:
             session = self._sessions.get(session_id)
-        if session is None:
+        if session is None or not self._permits(session, caller, all_sessions):
             raise CommandError(f"Unknown session: {session_id}")
         return session
+
+    @staticmethod
+    def _mark_started(session: _Session, caller: str | None, **fields: Any) -> None:
+        # When someone other than its starter uses a session, the audit says whose it was.
+        started_by = session.owner if session.owner != caller else None
+        mark_started(session_id=session.id, pid=session.proc.pid, started_by=started_by, **fields)
 
     def _evict_finished(self) -> None:
         finished = [s for s in self._sessions.values() if not s.running()]
@@ -278,7 +300,13 @@ class SessionManager:
             self._sessions.pop(finished.pop(0).id, None)
 
     def start(
-        self, command: str, *, cwd: str | None = None, timeout_seconds: float | None = None, wait_seconds: float = 1.0
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        timeout_seconds: float | None = None,
+        wait_seconds: float = 1.0,
+        owner: str | None = None,
     ) -> dict[str, Any]:
         argv = self._policy.command_argv(command)
         directory = _resolve_cwd(self._policy, cwd)
@@ -312,6 +340,7 @@ class SessionManager:
                 tree,
                 self._policy.max_output_bytes * 4,
                 on_exit=self._on_exit,
+                owner=owner,
             )
             self._sessions[session.id] = session
         watchdog = threading.Timer(lifetime, self._expire, args=(session,))
@@ -326,18 +355,29 @@ class SessionManager:
             session.timed_out = True
             session.tree.kill()
 
-    def read(self, session_id: str, *, wait_seconds: float = 0.0) -> dict[str, Any]:
-        session = self._get(session_id)
-        mark_started(session_id=session_id, pid=session.proc.pid)
+    def read(
+        self, session_id: str, *, wait_seconds: float = 0.0, caller: str | None = None, all_sessions: bool = False
+    ) -> dict[str, Any]:
+        session = self._get(session_id, caller, all_sessions)
+        self._mark_started(session, caller)
         return session.read(wait_seconds)
 
-    def send(self, session_id: str, text: str, *, newline: bool = True, wait_seconds: float = 1.0) -> dict[str, Any]:
-        session = self._get(session_id)
+    def send(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        newline: bool = True,
+        wait_seconds: float = 1.0,
+        caller: str | None = None,
+        all_sessions: bool = False,
+    ) -> dict[str, Any]:
+        session = self._get(session_id, caller, all_sessions)
         if not session.running() or session.proc.stdin is None:
             raise CommandError(f"Session {session_id} is no longer running.")
         line_end = "\r\n" if IS_WINDOWS else "\n"
         payload = (text + (line_end if newline else "")).encode("utf-8")
-        mark_started(session_id=session_id, pid=session.proc.pid, input_bytes=len(payload))
+        self._mark_started(session, caller, input_bytes=len(payload))
         try:
             session.proc.stdin.write(payload)
             session.proc.stdin.flush()
@@ -345,9 +385,9 @@ class SessionManager:
             raise CommandError(f"Session {session_id} is not accepting input.") from None
         return session.read(wait_seconds)
 
-    def terminate(self, session_id: str) -> dict[str, Any]:
-        session = self._get(session_id)
-        mark_started(session_id=session_id, pid=session.proc.pid)
+    def terminate(self, session_id: str, *, caller: str | None = None, all_sessions: bool = False) -> dict[str, Any]:
+        session = self._get(session_id, caller, all_sessions)
+        self._mark_started(session, caller)
         if session.running():
             session.tree.kill()
             try:
@@ -356,11 +396,11 @@ class SessionManager:
                 pass
         return session.read(0.0)
 
-    def list(self) -> list[dict[str, Any]]:
+    def list(self, *, caller: str | None = None, all_sessions: bool = False) -> list[dict[str, Any]]:
         mark_started()
         with self._lock:
-            sessions = list(self._sessions.values())
-        return [s.status() for s in sessions]
+            sessions = [s for s in self._sessions.values() if self._permits(s, caller, all_sessions)]
+        return [{**s.status(), "started_by": s.owner} for s in sessions]
 
     def shutdown(self) -> None:
         with self._lock:
@@ -373,15 +413,22 @@ class SessionManager:
 # ---------------------------------------------------------------- processes
 
 
-def list_processes(*, name_filter: str | None = None, limit: int = 200) -> dict[str, Any]:
+def list_processes(
+    *, name_filter: str | None = None, limit: int = 200, include_cmdline: bool = False
+) -> dict[str, Any]:
+    """List processes. Command lines often carry secrets (tokens, passwords, connection strings),
+    so they are read, matched by ``name_filter``, and returned only when ``include_cmdline`` is set;
+    the gateway sets it for callers holding ``computer:process``."""
     needle = (name_filter or "").casefold()
-    mark_started(name_filter=name_filter)
+    mark_started(name_filter=name_filter, include_cmdline=include_cmdline)
     rows: list[dict[str, Any]] = []
-    attrs = ["pid", "ppid", "name", "username", "status", "create_time", "memory_info", "cmdline"]
+    attrs = ["pid", "ppid", "name", "username", "status", "create_time", "memory_info"]
+    if include_cmdline:
+        attrs.append("cmdline")
     total = 0
     for proc in psutil.process_iter(attrs):
         info = proc.info
-        cmdline = " ".join(info.get("cmdline") or [])
+        cmdline = " ".join(info.get("cmdline") or []) if include_cmdline else ""
         name = info.get("name") or ""
         if needle and needle not in name.casefold() and needle not in cmdline.casefold():
             continue
@@ -389,19 +436,19 @@ def list_processes(*, name_filter: str | None = None, limit: int = 200) -> dict[
         if len(rows) >= limit:
             continue
         memory = info.get("memory_info")
-        rows.append(
-            {
-                "pid": info["pid"],
-                "ppid": info.get("ppid"),
-                "name": name,
-                "user": info.get("username"),
-                "status": info.get("status"),
-                "rss_bytes": memory.rss if memory else None,
-                "started": round(info["create_time"]) if info.get("create_time") else None,
-                "cmdline": cmdline[:300],
-            }
-        )
-    return {"processes": rows, "matched": total, "truncated": total > len(rows)}
+        row: dict[str, Any] = {
+            "pid": info["pid"],
+            "ppid": info.get("ppid"),
+            "name": name,
+            "user": info.get("username"),
+            "status": info.get("status"),
+            "rss_bytes": memory.rss if memory else None,
+            "started": round(info["create_time"]) if info.get("create_time") else None,
+        }
+        if include_cmdline:
+            row["cmdline"] = cmdline[:300]
+        rows.append(row)
+    return {"processes": rows, "matched": total, "truncated": total > len(rows), "cmdline_included": include_cmdline}
 
 
 def kill_process(pid: int, *, force: bool = False) -> dict[str, Any]:

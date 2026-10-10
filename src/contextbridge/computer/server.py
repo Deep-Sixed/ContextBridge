@@ -80,6 +80,7 @@ KNOWLEDGE_TOKEN_ENV = "MCP_AUTH_TOKEN"
 CLIENT_ID = "contextbridge-computer"
 MIN_TOKEN_LENGTH = 32
 LOCAL_DEVICE = "local"
+OWNER_LISTENER = "local"  # accepts only the owner's static token
 LIST_DEVICES_TOOL = "list_devices"
 DEFAULT_REDIRECT_HOSTS = ("claude.ai", "claude.com", "chatgpt.com")
 
@@ -191,9 +192,12 @@ class DeviceRouter:
             raise AuthorizationError(f"Tool '{tool}' is not enabled on device '{device}'.")
 
     async def call(self, device: str, tool: str, args: dict[str, Any]) -> dict[str, Any]:
+        call = current_call()
         if device == LOCAL_DEVICE:
-            return await anyio.to_thread.run_sync(self.local.execute, tool, args)
-        return await self.hub.call(device, tool, args, current_call())
+            caller, all_sessions = (call.caller, call.all_sessions) if call is not None else (None, False)
+            run = functools.partial(self.local.execute, tool, args, caller=caller, all_sessions=all_sessions)
+            return await anyio.to_thread.run_sync(run)
+        return await self.hub.call(device, tool, args, call)
 
     def describe(self, devices: frozenset[str] | None = None) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -247,7 +251,7 @@ class ComputerPolicyMiddleware(Middleware):
         audit: ComputerAuditLog,
         authorize: Authorizer,
         devices: DeviceGrant = all_devices,
-        listener: str = "local",
+        listener: str = OWNER_LISTENER,
     ) -> None:
         self._router = router
         self._audit = audit
@@ -307,7 +311,15 @@ class ComputerPolicyMiddleware(Middleware):
             self._audit.record("failed", request_id=request_id, tool=name, device=device, reason=str(exc))
             raise ToolError(str(exc)) from exc
 
-        call = CallAudit(self._audit, request_id, name, client, device=device)
+        call = CallAudit(
+            self._audit,
+            request_id,
+            name,
+            client,
+            device=device,
+            caller=f"{self._listener}:{client}",
+            all_sessions=self._listener == OWNER_LISTENER,  # the owner may manage every client's sessions
+        )
         binding = bind_call(call)
         try:
             result = await call_next(context)
@@ -367,6 +379,7 @@ def build_router(policy: ComputerPolicy | None, *, audit: ComputerAuditLog, hub:
             tool="session",
             device=LOCAL_DEVICE,
             success=status["exit_code"] == 0 and not status["timed_out"],
+            caller=status.get("caller"),
             **{k: status[k] for k in ("session_id", "pid", "command", "exit_code", "timed_out", "runtime_seconds")},
         )
 
@@ -382,7 +395,7 @@ def create_computer_server(
     devices: DeviceGrant = all_devices,
     hub: Any | None = None,
     router: DeviceRouter | None = None,
-    listener: str = "local",
+    listener: str = OWNER_LISTENER,
     name: str = "ContextBridge Computer",
 ) -> FastMCP:
     """Build the MCP server. ``policy`` configures the ``local`` device (None for a gateway without one).
@@ -414,7 +427,9 @@ def create_computer_server(
         path: str, offset: int = 0, length: int | None = None, device: str = LOCAL_DEVICE
     ) -> dict[str, Any]:
         """Read a text file. offset is the 0-based first line; a negative offset reads the last N lines.
-        length limits the number of lines returned. Large files are truncated at the read limit."""
+        length limits the number of lines returned. Output stops at the read limit (truncated); continue
+        with offset = start_line + lines_returned. A single line longer than the limit comes back clipped,
+        with a marker (line_clipped)."""
         return await run(device, "read_file", {"path": path, "offset": offset, "length": length})
 
     @server.tool(annotations=_READ_ONLY)
@@ -440,8 +455,9 @@ def create_computer_server(
         max_results: int | None = None,
         device: str = LOCAL_DEVICE,
     ) -> dict[str, Any]:
-        """Search text file contents under path. Literal match unless regex is true.
-        file_pattern filters file names by glob (e.g. *.py). context_lines adds up to 5 surrounding lines."""
+        """Search text file contents under path. Literal match unless regex is true (Python re syntax).
+        file_pattern filters file names by glob (e.g. *.py). context_lines adds up to 5 surrounding lines.
+        The search stops at the device's time limit (timed_out) and returns what it found so far."""
         args = {
             "path": path,
             "pattern": pattern,
@@ -550,17 +566,29 @@ def create_computer_server(
 
     @server.tool(annotations=_READ_ONLY)
     async def list_sessions(device: str = LOCAL_DEVICE) -> dict[str, Any]:
-        """List sessions started through ContextBridge on a device, with their status."""
+        """List the sessions this client started on a device, with their status. On the gateway's own
+        machine, the owner's local token sees every client's sessions (started_by says whose)."""
         return await run(device, "list_sessions", {})
 
     # ------------------------------------------------------- process tools
+
+    def holds(tool: str) -> bool:
+        try:
+            authorize(tool)
+        except AuthorizationError:
+            return False
+        return True
 
     @server.tool(annotations=_READ_ONLY)
     async def list_processes(
         name_filter: str | None = None, limit: int = 200, device: str = LOCAL_DEVICE
     ) -> dict[str, Any]:
-        """List running processes, optionally filtered by a substring of the name or command line."""
-        return await run(device, "list_processes", {"name_filter": name_filter, "limit": limit})
+        """List running processes, optionally filtered by a substring of the name. Callers with
+        computer:process also get each command line, and name_filter searches it too."""
+        # Command lines often carry secrets, so computer:read alone (the default for remote
+        # clients) sees names only. The scope that may kill a process may also see its command line.
+        args = {"name_filter": name_filter, "limit": limit, "include_cmdline": holds(PROCESS_KILL_TOOL)}
+        return await run(device, "list_processes", args)
 
     @server.tool(annotations=_WRITE)
     async def kill_process(pid: int, force: bool = False, device: str = LOCAL_DEVICE) -> dict[str, Any]:

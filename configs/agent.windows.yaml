@@ -20,6 +20,8 @@ filesystem:
   # (Login Data, Cookies, Local State), *.ppk, .azure.
 
 commands:
+  # Background sessions belong to the gateway client that started them; no other client of the
+  # gateway, the owner's local token included, can read, type into, or end them on this device.
   mode: allowlist
   # Allowlist mode runs one .exe/.com program per call, found on PATH (never in the current directory).
   # cmd.exe built-ins (dir, type, echo) are not programs, and .bat/.cmd scripts are refused because
@@ -32,7 +34,7 @@ commands:
   max_timeout_seconds: 600
 
 processes:
-  list: true
+  list: true               # names, owners, memory; command lines only for callers with computer:process
   allow_kill: false        # critical Windows processes (lsass, csrss, winlogon, ...) are refused regardless
 
 # Phase 2: window titles can reveal sensitive information. Disabled unless opted in.

@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import io
 import os
 import stat
+import threading
+import time
+import tracemalloc
 
+import psutil
 import pytest
 from helpers import symlink_or_skip
 
 from contextbridge.computer import files
 from contextbridge.computer.files import FileOperationError
+from contextbridge.computer.matcher import WORKER_TAG
 from contextbridge.computer.policy import PolicyViolation, load_policy
 
 
@@ -60,6 +66,79 @@ def test_read_file_truncates_at_limit(make_policy, workspace):
     assert result["total_lines"] == 100
 
 
+def _peak_bytes(fn):
+    tracemalloc.start()
+    try:
+        result = fn()
+        return result, tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+def test_read_file_never_holds_a_newline_free_file_in_memory(make_policy, workspace):
+    (workspace / "docs" / "one-line.txt").write_bytes(b"a" * (16 * 1024 * 1024))
+    policy = make_policy(filesystem={"max_read_bytes": 4096})
+    result, peak = _peak_bytes(lambda: files.read_file(policy, "docs/one-line.txt"))
+    assert peak < 1024 * 1024
+    assert result["truncated"] and result["line_clipped"]
+    assert result["lines_returned"] == 1 and result["total_lines"] == 1
+    assert len(result["content"].encode()) <= 4096
+    assert result["content"].startswith("aaaa")
+    assert result["content"].endswith("clipped at the 4096-byte read limit]\n")
+
+
+def test_read_file_huge_negative_offset_is_bounded(make_policy, workspace):
+    (workspace / "docs" / "log.txt").write_bytes(b"".join(b"line %06d\n" % i for i in range(200_000)))
+    policy = make_policy(filesystem={"max_read_bytes": 4096})
+    result, peak = _peak_bytes(lambda: files.read_file(policy, "docs/log.txt", offset=-(10**9)))
+    assert peak < 1024 * 1024
+    assert result["start_line"] == 0
+    assert result["content"].startswith("line 000000\n")
+    assert result["truncated"] and not result["line_clipped"]
+    assert len(result["content"].encode()) <= 4096
+    assert result["total_lines"] == 200_000
+    tail = files.read_file(policy, "docs/log.txt", offset=-2)
+    assert tail["content"] == "line 199998\nline 199999\n"
+    assert tail["start_line"] == 199_998
+
+
+def test_read_file_pages_past_an_overlong_line(make_policy, workspace):
+    (workspace / "docs" / "mixed.txt").write_bytes(b"short\r\n" + b"x" * 1000 + b"\r\nafter\r\n")
+    policy = make_policy(filesystem={"max_read_bytes": 100})
+    first = files.read_file(policy, "docs/mixed.txt")
+    assert first["content"] == "short\r\n"
+    assert first["truncated"] and not first["line_clipped"]
+    clipped = files.read_file(policy, "docs/mixed.txt", offset=1)
+    assert clipped["line_clipped"] and clipped["lines_returned"] == 1
+    assert clipped["content"].startswith("xxx") and "more characters on this line" in clipped["content"]
+    assert len(clipped["content"].encode()) <= 100
+    after = files.read_file(policy, "docs/mixed.txt", offset=2)
+    assert after["content"] == "after\r\n"
+    assert not after["truncated"]
+    assert {r["total_lines"] for r in (first, clipped, after)} == {3}
+
+
+def test_read_file_clips_multibyte_lines_on_a_character_boundary(make_policy, workspace):
+    (workspace / "docs" / "accents.txt").write_text("é" * 300 + "\n", encoding="utf-8")
+    policy = make_policy(filesystem={"max_read_bytes": 120})
+    result = files.read_file(policy, "docs/accents.txt")
+    assert result["line_clipped"]
+    head = result["content"].split(" … [")[0]
+    assert head and set(head) == {"é"}
+    assert len(result["content"].encode()) <= 120
+
+
+def test_bounded_lines_counts_crlf_split_at_the_limit_once():
+    def lines(text, limit=4):
+        return list(files._bounded_lines(io.StringIO(text, newline=""), limit))
+
+    assert lines("abc\r\ndef\n") == [("abc\r", 0), ("def\n", 0)]
+    assert lines("a\rb\rc") == [("a\r", 0), ("b\r", 0), ("c", 0)]
+    assert lines("abc\rdefgh\n") == [("abc\r", 0), ("defg", 1)]
+    assert lines("abcdefghij") == [("abcd", 6)]
+    assert lines("abcdefg\r\nz") == [("abcd", 3), ("z", 0)]
+
+
 def test_read_file_rejects_binary_and_denied(policy, workspace):
     (workspace / "docs" / "blob.bin").write_bytes(b"\x00\x01\x02")
     with pytest.raises(FileOperationError, match="binary"):
@@ -100,6 +179,52 @@ def test_search_code_literal_regex_and_context(policy, workspace):
     assert files.search_code(policy, str(workspace), "PRIVATE")["matches"] == []
     with pytest.raises(FileOperationError, match="regular expression"):
         files.search_code(policy, str(workspace), "(", regex=True)
+
+
+def _worker_processes():
+    rows = []
+    for proc in psutil.Process().children(recursive=True):
+        try:
+            if WORKER_TAG in " ".join(proc.cmdline()):
+                rows.append(proc)
+        except psutil.Error:
+            continue
+    return rows
+
+
+def test_search_code_catastrophic_regex_neither_hangs_nor_stalls_other_threads(make_policy, workspace):
+    (workspace / "docs" / "a_quick.txt").write_text("aaa\n", encoding="utf-8")
+    (workspace / "docs" / "b_slow.txt").write_text("a" * 26 + "b\n", encoding="utf-8")  # ~10 s in-process
+    policy = make_policy(filesystem={"max_search_seconds": 1})
+    ticks: list[float] = []
+    done = threading.Event()
+
+    def tick():
+        while not done.is_set():
+            ticks.append(time.monotonic())
+            time.sleep(0.01)
+
+    ticker = threading.Thread(target=tick)
+    ticker.start()
+    try:
+        started = time.monotonic()
+        result = files.search_code(policy, str(workspace / "docs"), r"^(a+)+$", regex=True)
+        elapsed = time.monotonic() - started
+    finally:
+        done.set()
+        ticker.join()
+    assert result["timed_out"] and result["truncated"]
+    assert [(os.path.basename(m["path"]), m["line"]) for m in result["matches"]] == [("a_quick.txt", 1)]
+    assert elapsed < 4
+    assert max(b - a for a, b in zip(ticks, ticks[1:])) < 1.0  # the GIL was never held for the match
+    assert _worker_processes() == []  # killed at the deadline, not left running
+
+
+def test_search_code_regex_worker_exits_after_a_normal_search(policy, workspace):
+    result = files.search_code(policy, str(workspace), r"^def \w+\(", regex=True)
+    assert [m["line"] for m in result["matches"]] == [1]
+    assert not result["timed_out"]
+    assert _worker_processes() == []
 
 
 def test_search_code_skips_symlinks_out_of_roots(policy, workspace):

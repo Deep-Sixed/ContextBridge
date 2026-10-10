@@ -53,7 +53,7 @@ The computer route is an independent replacement for Desktop Commander's tools, 
 | `list_directory`, `read_file`, `get_file_info`, `search_files`, `search_code`, `get_system_info` | same names / `get_config` | always (read-only) |
 | `write_file`, `edit_block`, `create_directory`, `move_file` | same names | `filesystem.writable_roots` is non-empty |
 | `run_command`, `start_process`, `read_process_output`, `interact_with_process`, `force_terminate`, `list_sessions` | same names (`run_command` is a one-shot convenience) | `commands.mode` is not `disabled` |
-| `list_processes` | same | `processes.list: true` |
+| `list_processes` | same (command lines only for callers with `computer:process`) | `processes.list: true` |
 | `kill_process` | same | `processes.allow_kill: true` |
 | `list_devices` | remote device list | always |
 
@@ -79,16 +79,16 @@ There is no unauthenticated mode. Every MCP request is checked against the token
 
 These checks run on **every tool call**, at the moment it executes:
 
-1. **Token scope.** The bearer token must carry the tool's scope: `computer:read` (file reading, search, system info, process listing, `list_devices`), `computer:write` (file changes), `computer:execute` (commands and sessions), or `computer:process` (`kill_process`). `auth.scopes` in the config sets what the token carries. Tools outside those scopes are hidden from the tool list and refused if called anyway.
+1. **Token scope.** The bearer token must carry the tool's scope: `computer:read` (file reading, search, system info, process listing, `list_devices`), `computer:write` (file changes), `computer:execute` (commands and sessions), or `computer:process` (`kill_process`). Command lines often carry secrets, so `list_processes` includes them, and lets `name_filter` match them, only for callers that also hold `computer:process`. `auth.scopes` in the config sets what the token carries. Tools outside those scopes are hidden from the tool list and refused if called anyway.
 2. **Device.** A remote (OAuth) client may only use the devices its grant names. The local token reaches every device. The device must exist and be online. Its policy must enable the tool. A remote device must also have been granted the tool's scope when it was paired.
 3. **Policy checks.** The device's engine re-validates every path, command, working directory, and limit before acting. For a remote device, that's the agent on that machine, under its own policy.
 
 ### Policy
 
 - **Paths.** Every path resolves through symlinks before it is checked, so neither `..` nor a symlink can escape `filesystem.roots`. Writes are allowed only inside `filesystem.writable_roots`. Any path with a component matching a `deny` glob (`.ssh`, `.env*`, `*.pem`, `*.kdbx`, and so on) is hidden from listings and searches and refused for reads and writes. The policy file and the audit log can never be written or moved through ContextBridge.
-- **Limits.** Reads, writes, search results, and search time all have caps. Rewrites are atomic and preserve file mode. `edit_block` fails unless the match count is exactly what the caller expected.
+- **Limits.** Reads, writes, search results, and search time all have caps. `read_file` holds no more than about `max_read_bytes` of a file in memory, however long its lines or however large a negative offset. A single line longer than the limit comes back clipped, with a marker, so paging forward always makes progress. `search_code` matches regular expressions in a separate process that is killed when `max_search_seconds` runs out, so a pattern that backtracks catastrophically, such as `(a+)+$`, can't stall the gateway or agent. Rewrites are atomic and preserve file mode. `edit_block` fails unless the match count is exactly what the caller expected.
 - **Commands.** `allowlist` mode runs one program per call without a shell. The program must be on the allowlist, and pipes, redirects, `;` and `&&` are refused before anything runs. `unrestricted` mode runs through `bash -c`. The working directory must be inside a readable root. Every command has a hard timeout (`max_timeout_seconds` caps whatever the caller asks for), and a timed-out command is killed along with every process it started. Output is capped in memory, keeping the head and the tail. Variables that look like credentials (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`, …) are removed from the child's environment, and both gateway tokens are always removed.
-- **Sessions.** `start_process` runs long or interactive programs in the background. Concurrent sessions are capped (`max_sessions`) and each is killed when it reaches `max_session_seconds`.
+- **Sessions.** `start_process` runs long or interactive programs in the background. Concurrent sessions are capped (`max_sessions`) and each is killed when it reaches `max_session_seconds`. A session belongs to the client that started it. A remote (OAuth) client can list, read, type into, and terminate only its own sessions; any other id gets the same `Unknown session` answer as one that never existed. The local token is the owner's, so on the gateway's own machine it can do all four to every client's sessions: `list_sessions` says whose each one is (`started_by`), and the audit records it whenever the owner uses another client's session. Output is handed out once, so if the owner reads a remote client's session, that client won't see the same output again. On a remote device, every caller, the local token included, reaches only its own sessions.
 
 **Know the boundary.** The command allowlist controls *which programs* run, not *what they touch*. `git diff --no-index` can read any file the OS user can, for example, and allowing a shell or an interpreter makes allowlist mode equivalent to unrestricted. The filesystem deny list applies to the file tools, not to commands. For a hard boundary, run the computer route as a dedicated OS user that can only reach what you intend to share.
 
@@ -288,6 +288,7 @@ contextbridge-admin --config configs/computer.yaml oauth-unlock               # 
 **Know the boundary.**
 - **Commands can reach the secrets.** Granting a remote client `computer:execute` on a device lets it run whatever that device's command policy allows. If that includes a shell, it can read the gateway's secrets the same way any command could.
 - **Keep remote clients read-only** unless you need more, and prefer `allowlist` mode.
+- **Read-only still sees processes.** `computer:read` includes `list_processes`, which shows every process's name, user, and memory use. Command lines are left out unless the client also holds `computer:process`. Set `processes.list: false` on a device to hide its processes from everyone.
 - **Device names are visible.** The consent page shows the names of the devices you allow remotely to anyone who starts an authorization.
 
 ## Network exposure
