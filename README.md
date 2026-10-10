@@ -276,12 +276,13 @@ Pairing is deliberately an admin CLI on the gateway host and not an MCP tool, so
   - **Certificate pinning.** Agents check the gateway certificate's SHA-256 fingerprint before sending anything.
   - **Allowed bind addresses.** The listener binds only a specific loopback, LAN, or overlay (e.g. Tailscale) address. `0.0.0.0`, `::`, public IPs, and hostnames are refused.
 - **Replay protection.** Calls carry a sequence number that must increase on each connection, and a request id the agent never accepts twice.
-- **Liveness.** Agents send heartbeats. A device that misses three is dropped and shown offline, and its pending calls fail. Agents reconnect with exponential backoff and stop permanently once revoked.
+- **Liveness.** Agents send heartbeats. A device that misses three is dropped and shown offline, and its pending calls fail. Agents reconnect with exponential backoff (reset once a connection is accepted, so a blip after a long outage is retried within a second) and stop permanently once revoked.
+- **One connection per device.** An agent refuses to start while another agent with the same identity file is running on that machine. If a second agent holding the same key connects anyway, the gateway pings the established connection: while it answers, the newcomer is refused (`already_connected`, retried with backoff) and the established connection keeps serving. A connection that does not answer within 5 seconds is replaced, so a restarted agent is never locked out by a half-open one.
 - **Revocation.** `revoke` marks the device in the registry. The gateway refuses the next call to it and drops its live connection within a second.
 - **Secrets stay hidden.** The local device can never read the TLS private key or the device registry, and an agent can never read its own identity file.
 - **Audit on both sides.**
   - **Shared request ids.** A remote call carries the same `request_id` in the gateway's audit log and the agent's.
-  - **Gateway events.** The gateway's log also records `device_enrolled`, `device_connected`, `device_disconnected`, `device_auth_failed`, `device_revoked`, and `device_heartbeat_lost`.
+  - **Gateway events.** The gateway's log also records `device_enrolled`, `device_connected`, `device_disconnected`, `device_auth_failed`, `device_duplicate_refused`, `device_revoked`, and `device_heartbeat_lost`.
   - **`started` comes from the agent.** The agent reports `started` only after its own checks pass and its own log has recorded it.
 
 ### Windows devices (Thanatos)
@@ -301,7 +302,7 @@ copy configs\agent.windows.yaml configs\agent.yaml     # then set name, gateway.
 **Running as a scheduled task.** `install-agent.ps1` registers a scheduled task that runs the agent as *your* account, never SYSTEM, so commands have exactly your permissions within the agent's policy.
 - **Default:** starts at boot whether or not you are signed in. It uses S4U, so no password is stored, but registering it needs an elevated shell.
 - **`-AtLogOn`:** starts at sign-in instead, and needs no elevation.
-- **Either way:** the task restarts the agent if it exits.
+- **Either way:** a second trigger repeats every minute from installation on, so an agent that exits is relaunched within a minute; a running one is left alone. To keep the agent stopped, disable the task (`Disable-ScheduledTask`); stopping it lasts only until the next repeat.
 - **Logs:** go to `audit\agent.log`, plus the agent's audit log.
 - **Removal:** `-Uninstall`.
 
@@ -536,3 +537,7 @@ python3 -m pip install -e '.[docs]'
 ## Status
 
 The knowledge route is a standalone extraction from an archived UGA (Unidirectional Gateway Appliance) implementation. That is why the package is `uga`, environment variables start with `UGA_`, the gateway's default name is `Nexus UGA`, and its timeout errors say "Nexus Datacore". Authentication-front/sidecar deployments and systemd services were intentionally left out. No route is production-validated yet.
+
+## License
+
+ContextBridge is released under the MIT License; see [`LICENSE`](LICENSE).
