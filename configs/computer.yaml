@@ -80,3 +80,7 @@ commands:
 processes:
   list: true               # names, owners, memory; command lines only for callers with computer:process
   allow_kill: false
+
+# Phase 2: window titles can reveal sensitive information. Disabled unless opted in.
+desktop:
+  observe: false

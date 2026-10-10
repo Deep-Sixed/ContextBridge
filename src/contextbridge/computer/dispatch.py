@@ -13,7 +13,7 @@ from typing import Any
 
 from pydantic import ValidationError, validate_call
 
-from . import commands, files
+from . import commands, files, desktop
 from .commands import ExitCallback, SessionManager
 from .policy import ComputerPolicy, PolicyViolation
 from .system import system_info
@@ -27,9 +27,10 @@ COMMAND_TOOLS = frozenset(
 )
 SESSION_TOOLS = COMMAND_TOOLS - {"run_command"}
 """Tools that act on background sessions, which belong to the caller that started them."""
+DESKTOP_TOOLS = frozenset({"list_windows"})
 PROCESS_LIST_TOOL = "list_processes"
 PROCESS_KILL_TOOL = "kill_process"
-ENGINE_TOOLS = READ_TOOLS | WRITE_TOOLS | COMMAND_TOOLS | {PROCESS_LIST_TOOL, PROCESS_KILL_TOOL}
+ENGINE_TOOLS = READ_TOOLS | WRITE_TOOLS | COMMAND_TOOLS | DESKTOP_TOOLS | {PROCESS_LIST_TOOL, PROCESS_KILL_TOOL}
 
 
 class InvalidArguments(ValueError):
@@ -50,6 +51,8 @@ def available_tools(policy: ComputerPolicy) -> frozenset[str]:
         names |= WRITE_TOOLS
     if policy.commands_enabled:
         names |= COMMAND_TOOLS
+    if policy.desktop_observe:
+        names |= DESKTOP_TOOLS
     if policy.list_processes:
         names.add(PROCESS_LIST_TOOL)
     if policy.allow_kill:
@@ -225,6 +228,11 @@ def _force_terminate(
 @_handler("list_sessions")
 def _list_sessions(engine: Any, caller: str | None = None, all_sessions: bool = False) -> dict[str, Any]:
     return {"sessions": engine.sessions.list(caller=caller, all_sessions=all_sessions)}
+
+
+@_handler("list_windows")
+def _list_windows(engine: Any) -> dict[str, Any]:
+    return desktop.list_windows(authorized=engine.policy.desktop_observe)
 
 
 @_handler("list_processes")
