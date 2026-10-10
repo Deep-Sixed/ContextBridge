@@ -537,3 +537,7 @@ python3 -m pip install -e '.[docs]'
 ## Status
 
 The knowledge route is a standalone extraction from an archived UGA (Unidirectional Gateway Appliance) implementation. That is why the package is `uga`, environment variables start with `UGA_`, the gateway's default name is `Nexus UGA`, and its timeout errors say "Nexus Datacore". Authentication-front/sidecar deployments and systemd services were intentionally left out. No route is production-validated yet.
+
+## License
+
+ContextBridge is released under the MIT License; see [`LICENSE`](LICENSE).
