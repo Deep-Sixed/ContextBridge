@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
 import anyio
@@ -19,7 +20,7 @@ import httpx
 import pytest
 from fastmcp import Client
 
-from conftest import TOKEN, record, write_jsonl
+from conftest import TOKEN, read_audit, record, write_jsonl
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -41,16 +42,26 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
+@dataclass
+class Gateway:
+    url: str
+    audit_log: Path
+    cwd: Path
+
+
 @pytest.fixture(scope="module")
-def gateway_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
+def gateway(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Gateway]:
     tmp = tmp_path_factory.mktemp("entrypoint")
+    # Started from another directory: relative config paths must not follow the CWD.
+    cwd = tmp_path_factory.mktemp("cwd")
     write_jsonl(tmp / "d.jsonl", [record("r1"), record("r2")])
     port = _free_port()
     config = tmp / "contextbridge.yaml"
     config.write_text(
         "name: ContextBridge\n"
         "datacore_jsonl: d.jsonl\n"
-        f"serve:\n  transport: http\n  host: 127.0.0.1\n  port: {port}\n",
+        f"serve:\n  transport: http\n  host: 127.0.0.1\n  port: {port}\n"
+        "  audit_log: audit.jsonl\n",
         encoding="utf-8",
     )
     env = {
@@ -66,6 +77,7 @@ def gateway_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
         proc = subprocess.Popen(
             [sys.executable, "-m", "uga.gateway", "--config", str(config)],
             env=env,
+            cwd=cwd,
             stdout=log_fh,
             stderr=subprocess.STDOUT,
         )
@@ -89,7 +101,7 @@ def gateway_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
                     pytest.fail(f"gateway did not start:\n{log.read_text()}")
                 time.sleep(0.2)
             assert "serving search/fetch over 2 records" in log.read_text()
-            yield base
+            yield Gateway(url=base, audit_log=tmp / "audit.jsonl", cwd=cwd)
         finally:
             proc.terminate()
             try:
@@ -99,16 +111,33 @@ def gateway_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
                 proc.wait()
 
 
-def test_entrypoint_rejects_requests_without_token(gateway_url: str) -> None:
+@pytest.fixture(scope="module")
+def gateway_url(gateway: Gateway) -> str:
+    return gateway.url
+
+
+def test_entrypoint_rejects_requests_without_token(gateway: Gateway) -> None:
     response = httpx.post(
-        f"{gateway_url}/mcp",
+        f"{gateway.url}/mcp",
         json=INITIALIZE,
-        headers={"Accept": "application/json, text/event-stream"},
+        # A local client must not be able to choose the peer address that is audited.
+        headers={
+            "Accept": "application/json, text/event-stream",
+            "X-Forwarded-For": "203.0.113.9",
+        },
         timeout=5,
         trust_env=False,
     )
 
     assert response.status_code == 401
+    rejected = [e for e in read_audit(gateway.audit_log) if e["tool"] == "auth"]
+    assert rejected[-1]["detail"] == "missing_token"
+    assert rejected[-1]["peer"] == "127.0.0.1"
+
+
+def test_entrypoint_audit_log_is_relative_to_config(gateway: Gateway) -> None:
+    assert gateway.audit_log.is_file()
+    assert not (gateway.cwd / "audit.jsonl").exists()
 
 
 def test_entrypoint_serves_tools_with_token(gateway_url: str) -> None:

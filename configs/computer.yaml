@@ -1,0 +1,82 @@
+# ContextBridge computer route — policy for this machine.
+# Everything not granted here is denied. The tool surface shrinks to match:
+# no writable_roots => no write tools; commands.mode disabled => no command tools.
+name: ContextBridge Computer
+
+serve:
+  host: 127.0.0.1          # loopback only; any other address is refused at startup
+  port: 8791               # HTTP, bearer token from CONTEXTBRIDGE_COMPUTER_TOKEN (32+ chars)
+  audit_log: ../audit/computer.audit.jsonl   # required; relative to this file; write-protected
+
+auth:
+  # Scopes granted to the token, checked on every tool call. Remove one to withhold it.
+  scopes: [computer:read, computer:write, computer:execute, computer:process]
+
+agents:
+  # Remote agents (other machines) dial in here. Off until you set it up:
+  #   contextbridge-admin --config configs/computer.yaml tls-init --hostname friday --ip <this host's LAN/Tailscale IP>
+  #   contextbridge-admin --config configs/computer.yaml pair thanatos
+  enabled: false
+  host: 127.0.0.1          # a specific loopback, LAN, or Tailscale IP; never 0.0.0.0 or a public address
+  port: 8792
+  tls_cert: ../state/tls/gateway.crt   # required unless host is loopback
+  tls_key: ../state/tls/gateway.key    # hidden from every file tool
+  # Mandatory tailnet admission. Use stable peer IDs from gateway-local
+  # `tailscale status --json` (Peer[*].ID), not a hostname or IP range.
+  # No remote agents start until this is explicitly configured.
+  tailnet_node_ids: []
+  registry: ../state/devices.json      # enrolled devices; hidden from every file tool
+  heartbeat_seconds: 15    # a device is dropped after 3 missed heartbeats
+  call_timeout_seconds: 660
+
+remote:
+  # ChatGPT, Claude, and other remote MCP clients connect here with OAuth. Off until you set it up:
+  #   contextbridge-admin --config configs/computer.yaml owner-init    # passphrase + authenticator app
+  #   Publish only via an authenticated private-tailnet endpoint; no public Funnel by default
+  # Then add <public_url>/mcp as a custom connector. Each client is approved on a consent page
+  # (passphrase + authenticator code) where you pick its permissions and devices.
+  enabled: false
+  host: 127.0.0.1          # loopback only; the tunnel publishes it
+  port: 8793               # must differ from serve.port and agents.port
+  public_url: https://friday.example.ts.net   # the https origin the tunnel serves (no path)
+  state: ../state/oauth.json   # owner credentials, clients, hashed tokens; hidden from every file tool
+  allow_scopes: [computer:read]   # the most any remote client can be approved for; add more deliberately
+  allow_devices: [local]   # device names remote clients may be offered; "*" for every enrolled device
+  allowed_redirect_hosts: [claude.ai, claude.com, chatgpt.com]   # who may register as a client
+  access_token_minutes: 60
+  refresh_token_days: 30   # a client unused this long must be approved again
+
+# The sections below configure the "local" device: this machine.
+# Remove filesystem/commands/processes entirely to run a gateway with no local device.
+
+filesystem:
+  roots:                   # readable; relative paths resolve against the first entry
+    - "~"
+  writable_roots: []       # start read-only; add e.g. ~/ContextBridge to enable write tools
+  # deny: path-component globs hidden from every file tool. Omit to use the built-in list
+  # (.ssh, .gnupg, .aws, .kube, .docker, .env*, *.pem, *.key, *.kdbx, id_rsa*, ...).
+  max_read_bytes: 1048576
+  max_write_bytes: 1048576
+  delete: trash            # trash (undo with restore_deleted) | permanent | disabled; writable roots only
+  max_document_bytes: 20971520   # PDF, Word, and Excel files larger than this are not opened
+  max_results: 500
+  max_search_seconds: 10
+
+commands:
+  mode: allowlist          # disabled | allowlist | unrestricted
+  # Allowlist mode runs one program per call without a shell. It limits WHICH programs
+  # run, not what they touch: commands run with this OS user's full permissions and are
+  # not subject to the filesystem deny list. Adding a shell or interpreter (bash, python3,
+  # powershell) makes allowlist mode equivalent to unrestricted.
+  allow: [git, ls, df, du, ps, uptime, whoami, hostname, uname, date, pwd]
+  default_timeout_seconds: 30
+  max_timeout_seconds: 600
+  max_output_bytes: 65536
+  max_sessions: 4
+  max_session_seconds: 3600
+  # env_strip: variables matching these globs are removed from child processes.
+  # Omit for the built-in list (*TOKEN*, *SECRET*, *PASSWORD*, *API_KEY*, ...).
+
+processes:
+  list: true
+  allow_kill: false

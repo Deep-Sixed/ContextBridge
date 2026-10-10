@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import os
 import stat
 from pathlib import Path
 
 import pytest
-
 from conftest import read_audit
+
 from uga.audit import UgaAuditLog
 
 
@@ -28,11 +30,60 @@ def test_query_text_is_logged_when_opted_in(tmp_path: Path) -> None:
     assert read_audit(path)[0]["query_preview"] == "hello"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits; Windows uses ACLs")
 def test_audit_file_is_private(tmp_path: Path) -> None:
     path = tmp_path / "audit.jsonl"
     UgaAuditLog(path)
 
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits; Windows uses ACLs")
+def test_existing_audit_file_is_made_private(tmp_path: Path) -> None:
+    path = tmp_path / "audit.jsonl"
+    path.write_text("")
+    path.chmod(0o644)
+
+    UgaAuditLog(path)
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_audit_log_refuses_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "elsewhere.jsonl"
+    target.write_text("")
+    os.symlink(target, tmp_path / "audit.jsonl")
+
+    with pytest.raises(OSError):
+        UgaAuditLog(tmp_path / "audit.jsonl")
+
+
+def test_query_hash_is_keyed(tmp_path: Path) -> None:
+    def query_hash(audit: UgaAuditLog, name: str) -> str:
+        audit_path = tmp_path / name
+        audit._fh = audit_path.open("a")
+        audit.record(tool="search", query="salary of jane doe", success=True)
+        audit._fh.close()
+        return read_audit(audit_path)[0]["query_hash"]
+
+    plain = hashlib.sha256(b"salary of jane doe").hexdigest()[:16]
+    keyed = query_hash(UgaAuditLog(None, hash_key=b"k" * 32), "a.jsonl")
+
+    assert keyed == query_hash(UgaAuditLog(None, hash_key=b"k" * 32), "b.jsonl")
+    assert keyed != plain
+    assert query_hash(UgaAuditLog(None), "c.jsonl") != query_hash(UgaAuditLog(None), "d.jsonl")
+
+
+def test_client_supplied_fields_are_clipped(tmp_path: Path) -> None:
+    path = tmp_path / "audit.jsonl"
+    UgaAuditLog(path).record(
+        tool="t" * 10_000, record_id="r" * 10_000, client_label="c" * 10_000, success=False
+    )
+
+    (entry,) = read_audit(path)
+
+    for key in ("tool", "record_id", "client"):
+        assert len(entry[key]) < 300, key
 
 
 class _BrokenStream:

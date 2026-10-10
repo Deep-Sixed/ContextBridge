@@ -2,7 +2,7 @@ name: ContextBridge Files
 serve:
   transport: http
   host: 127.0.0.1
-  port: 8791
+  port: 8794
 filesystem:
   # The route refuses to start until at least one root is listed. Roots are
   # read-only unless writable is true, must exist, and must not overlap. A
