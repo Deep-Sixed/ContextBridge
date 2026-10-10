@@ -27,6 +27,10 @@ _MAX_LINE_CHARS = 2000
 _MAX_DEPTH = 5
 
 
+# Binary formats the document tools read; read_file points callers there.
+DOCUMENT_SUFFIXES = (".pdf", ".docx", ".xlsx", ".xlsm")
+
+
 class FileOperationError(ValueError):
     """Raised when a file operation cannot be completed as requested."""
 
@@ -148,9 +152,8 @@ def read_file(
     size = resolved.stat().st_size
     encoding = _text_encoding(resolved)
     if encoding is None:
-        raise FileOperationError(
-            f"{path} looks like a binary file ({size} bytes); only text files can be read."
-        )
+        hint = " Use read_document for PDF, Word, and Excel files." if resolved.suffix.lower() in DOCUMENT_SUFFIXES else ""
+        raise FileOperationError(f"{path} looks like a binary file ({size} bytes); only text files can be read.{hint}")
     budget = policy.max_read_bytes
     used = 0
     truncated = False

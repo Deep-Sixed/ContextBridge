@@ -1,6 +1,7 @@
 """Phase 6: failover acceptance. Desktop Commander goes away; ContextBridge carries on.
 
-The acceptance criterion from docs/desktop-commander-inventory.pdf: "Desktop
+The acceptance criterion from the Desktop Commander inventory (since reworked into
+docs/capability-roadmap.pdf): "Desktop
 Commander can be completely disabled while ContextBridge continues operating
 against Friday and Thanatos using its own agents, permissions, transport, and tools."
 
@@ -66,6 +67,7 @@ from contextbridge.failover import (
     PROBE_COMMANDS,
     _join,
     desktop_commander_processes,
+    names_desktop_commander,
     pick_probe_command,
     render,
     run_drill,
@@ -78,7 +80,7 @@ COMPUTER_TOKEN = "computer-" + "f" * 40
 KNOWLEDGE_TOKEN = "knowledge-" + "k" * 40
 TRIPWIRES = ("npx", "node", "desktop-commander", "desktop-commander-remote")
 THANATOS = "thanatos"
-INVENTORY_TOOLS = 31  # docs/desktop-commander-inventory.pdf
+INVENTORY_TOOLS = 31  # Desktop Commander's tools, per the original inventory
 
 
 # ------------------------------------------------------------------ the jail
@@ -179,6 +181,22 @@ def test_probe_command_comes_from_the_device_policy():
 def test_probe_paths_keep_the_device_separator():
     assert _join("/home/c/work", ".contextbridge-failover", "probe.txt") == "/home/c/work/.contextbridge-failover/probe.txt"
     assert _join("C:\\Users\\c\\work\\", "x", "probe.txt") == "C:\\Users\\c\\work\\x\\probe.txt"
+
+
+@pytest.mark.parametrize(
+    ("name", "argv", "expected"),
+    [
+        ("npx", ["npx", "-y", "@wonderwhy-er/desktop-commander@latest"], True),
+        ("node", ["node", "/usr/lib/node_modules/@wonderwhy-er/desktop-commander/dist/index.js"], True),
+        ("node.exe", ["node.exe", "C:\\npm\\node_modules\\@wonderwhy-er\\desktop-commander\\dist\\index.js"], True),
+        ("desktop-commander.exe", ["desktop-commander.exe", "--remote"], True),
+        ("bash", ["bash", "-c", "grep -r desktop-commander docs/ && echo stop @wonderwhy-er/desktop-commander"], False),
+        ("vim", ["vim", "docs/desktop-commander-inventory.pdf"], False),
+        ("python", ["python", "-m", "contextbridge.failover", "--json"], False),
+    ],
+)
+def test_desktop_commander_is_recognised_by_how_it_runs(name, argv, expected):
+    assert names_desktop_commander(name, argv) is expected
 
 
 def test_drill_spots_a_running_desktop_commander(tmp_path):
@@ -354,6 +372,22 @@ async def exercise_parity(client, device: str, used: dict[str, set[str]]) -> Non
             break
     assert status["running"] is False
     await call("force_terminate", session_id=victim["session_id"])
+    # write_pdf, and the roadmap's documents: PDF, Word, and Excel
+    await call("write_document", path="work/failover/report.pdf", content="# Failover\n\nDesktop Commander is gone.")
+    await call("write_document", path="work/failover/appendix.pdf", content="Appendix")
+    merged = await call("edit_pdf", path="work/failover/report.pdf", insert_pdf="work/failover/appendix.pdf")
+    assert merged["pages_after"] == 2
+    assert (await call("read_document", path="work/failover/report.pdf", find="gone"))["matches"][0]["page"] == 1
+    await call("write_document", path="work/failover/memo.docx", content="Status: pending")
+    await call("edit_document", path="work/failover/memo.docx", old_text="pending", new_text="done")
+    assert "Status: done" in (await call("read_document", path="work/failover/memo.docx"))["content"]
+    await call("write_spreadsheet", path="work/failover/sheet.xlsx", rows=[["device", device]])
+    assert (await call("read_document", path="work/failover/sheet.xlsx"))["rows"] == [["device", device]]
+    # the roadmap's native delete, with undo
+    deleted = await call("delete_file", path="work/failover/memo.docx")
+    assert deleted["trash_id"] in {i["trash_id"] for i in (await call("list_deleted"))["items"]}
+    await call("restore_deleted", trash_id=deleted["trash_id"])
+    assert "Status: done" in (await call("read_document", path="work/failover/memo.docx"))["content"]
     # get_config: the device's policy
     assert (await call("get_system_info"))["policy"]["command_mode"] == "allowlist"
     # list_devices / ping
@@ -535,7 +569,7 @@ def test_desktop_commander_failover(tmp_path, jail):
                 for device in report["devices"]:
                     statuses = {c["name"]: c["status"] for c in device["checks"]}
                     assert set(statuses.values()) == {"pass"}, (device["device"], statuses)
-                    assert {"run_command", "session", "write_round_trip"} <= set(statuses)
+                    assert {"run_command", "session", "write_round_trip", "documents", "delete"} <= set(statuses)
                 for root in (friday, thanatos):
                     assert "status: verified" in (root / "work" / ".contextbridge-failover" / "probe.txt").read_text()
 

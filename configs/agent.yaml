@@ -17,6 +17,8 @@ filesystem:
   writable_roots: []
   max_read_bytes: 1048576
   max_write_bytes: 1048576
+  delete: trash            # trash (undo with restore_deleted) | permanent | disabled; writable roots only
+  max_document_bytes: 20971520   # PDF, Word, and Excel files larger than this are not opened
 
 commands:
   mode: allowlist

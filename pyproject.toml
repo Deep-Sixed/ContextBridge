@@ -17,6 +17,12 @@ dependencies = [
     "psutil>=5.9",
     "websockets>=13",
     "cryptography>=42",
+    # document tools (PDF, Word, Excel); defusedxml makes openpyxl parse XML safely
+    "pypdf>=4",
+    "python-docx>=1.1",
+    "openpyxl>=3.1",
+    "reportlab>=4.0",
+    "defusedxml>=0.7",
 ]
 
 [project.optional-dependencies]

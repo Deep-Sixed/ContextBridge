@@ -135,6 +135,10 @@ The computer route is an independent replacement for Desktop Commander's tools, 
 |---|---|---|
 | `list_directory`, `read_file`, `get_file_info`, `search_files`, `search_code`, `get_system_info` | same names / `get_config` | always (read-only) |
 | `write_file`, `edit_block`, `create_directory`, `move_file` | same names | `filesystem.writable_roots` is non-empty |
+| `delete_file` | none (Desktop Commander deletes through commands) | writable roots, and `filesystem.delete` is `trash` (default) or `permanent` |
+| `list_deleted`, `restore_deleted` | none | `filesystem.delete: trash` |
+| `read_document` | `read_file` on PDF and Excel files | always (read-only) |
+| `write_document`, `edit_document`, `write_spreadsheet`, `edit_pdf` | `write_pdf`; Excel and Word editing | `filesystem.writable_roots` is non-empty |
 | `run_command`, `start_process`, `read_process_output`, `interact_with_process`, `force_terminate`, `list_sessions` | same names (`run_command` is a one-shot convenience) | `commands.mode` is not `disabled` |
 | `list_processes` | same | `processes.list: true` |
 | `kill_process` | same | `processes.allow_kill: true` |
@@ -172,6 +176,26 @@ These checks run on **every tool call**, at the moment it executes:
 - **Limits.** Reads, writes, search results, and search time all have caps. Rewrites are atomic and preserve file mode. `edit_block` fails unless the match count is exactly what the caller expected.
 - **Commands.** `allowlist` mode runs one program per call without a shell. The program must be on the allowlist, and pipes, redirects, `;` and `&&` are refused before anything runs. `unrestricted` mode runs through `bash -c`. The working directory must be inside a readable root. Every command has a hard timeout (`max_timeout_seconds` caps whatever the caller asks for), and a timed-out command is killed along with every process it started. Output is capped in memory, keeping the head and the tail. Variables that look like credentials (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`, …) are removed from the child's environment, and both gateway tokens are always removed.
 - **Sessions.** `start_process` runs long or interactive programs in the background. Concurrent sessions are capped (`max_sessions`) and each is killed when it reaches `max_session_seconds`.
+- **Deletes.** `delete_file` works only inside writable roots. It never deletes a root, a protected or hidden path, or a folder holding anything the file tools may not see (a `.ssh` or `.env` inside, say). A non-empty folder needs `recursive: true` and is capped at `max_delete_entries` (10,000).
+  - **`delete: trash` (default):** the item moves to `.contextbridge-trash/<trash_id>/` in its writable root, beside a `<trash_id>.json` record of where it came from. `list_deleted` shows the trash and `restore_deleted` puts an item back, but no file tool can read, change, or empty the trash, so a client cannot make its own deletions permanent. Empty it on the host. The layout is the [filesystem route](#filesystem-route)'s, so a folder both routes serve has one trash.
+  - **`delete: permanent`:** removes the item outright.
+  - **`delete: disabled`:** removes the tool.
+
+### Documents
+
+`read_document` reads PDF, Word (`.docx`), and Excel (`.xlsx`, `.xlsm`) files; `read_file` is for text and points to it.
+- **PDF:** text per page, with `pages` like `1-3,7` (50 pages per call).
+- **Word:** the document as Markdown (headings, lists, and tables) plus a heading outline.
+- **Excel:** sheet names and cell values for a `sheet` and `cell_range` (10,000 cells per call). `formulas: true` shows formulas instead of the values Excel last calculated.
+- **`find`:** searches inside any of them and returns the pages, blocks, or cells that match.
+
+Writing needs a writable root:
+- **`write_document`:** creates or replaces a `.docx` or `.pdf` from simple Markdown (`#` headings, `-` and `1.` lists, `| a | b |` tables, paragraphs). PDFs use a Unicode font when the machine has one (DejaVu, Segoe UI, or Arial).
+- **`edit_document`:** replaces exact text in a `.docx` (body, tables, headers, and footers). Like `edit_block`, it fails unless the match count is exactly what the caller expected. Formatting is kept when a match sits inside one formatted run; a match spanning runs takes the paragraph's first run's formatting. Text inside hyperlinks and fields is not matched.
+- **`write_spreadsheet`:** writes rows of values into a sheet starting at `start_cell`, creating the `.xlsx` or the sheet if needed and keeping everything else. A string starting with `=` is stored as a formula. New workbooks must be `.xlsx`; existing `.xlsm` files keep their macros.
+- **`edit_pdf`:** deletes, rotates, or inserts pages (from another PDF), in place or into `output_path`.
+
+Documents go through the same path policy as every file tool. Files over `max_document_bytes` (20 MiB) are not opened. Word and Excel files are checked for zip bombs before parsing, and XML is parsed without entity expansion. The libraries (pypdf, python-docx, openpyxl, reportlab, defusedxml) are dependencies. A device without them doesn't offer the document tools.
 
 **Know the boundary.** The command allowlist controls *which programs* run, not *what they touch*. `git diff --no-index` can read any file the OS user can, for example, and allowing a shell or an interpreter makes allowlist mode equivalent to unrestricted. The filesystem deny list applies to the file tools, not to commands. For a hard boundary, run the computer route as a dedicated OS user that can only reach what you intend to share.
 
@@ -396,9 +420,12 @@ It prints PASS, FAIL, or skip for each check:
    - **Read checks:** system info, a directory listing, a file-name search, and a file read.
    - **Commands:** a harmless command (the first of `hostname`, `whoami`, `uname`, `pwd`, `date` the device's policy allows), run once directly and once as a session.
    - **Processes:** a process listing.
-   - **Writes (`--write` only):** create, write, edit, move, read back, file info, and content search, all inside `<first writable root>/.contextbridge-failover/`.
+   - **Writes (`--write` only):** all inside `<first writable root>/.contextbridge-failover/`:
+     - create, write, edit, move, read back, file info, and content search;
+     - Word, PDF, and Excel files written and read back;
+     - a file deleted and then restored from the trash, where the device keeps one.
 
-Nothing is deleted and no process is killed. The exit status is `0` for READY, `1` for NOT READY, and `2` if the drill could not run.
+No process is killed, and the only file deleted is the drill's own. The exit status is `0` for READY, `1` for NOT READY, and `2` if the drill could not run.
 
 ### What CI proves
 
@@ -443,7 +470,7 @@ All 31 Desktop Commander tools from the original functionality inventory (`docs/
 | `list_sessions` | `list_sessions` | same tool |  |
 | `list_processes` | `list_processes` | same tool |  |
 | `kill_process` | `kill_process` | same tool | only where the device's policy sets allow_kill |
-| `write_pdf` | — | **gap** | no PDF, Excel, or Word tools; text formats are read and edited as text |
+| `write_pdf` | `write_document`, `edit_pdf` | equivalent | write_document creates PDFs; edit_pdf deletes, rotates, inserts pages |
 | `list_devices` | `list_devices` | same tool | online state, last seen, tools, and policy |
 | `ping` | `list_devices` | equivalent | online state from heartbeats |
 | `shutdown` | — | not a tool, by design | on the host: contextbridge-admin revoke, or stop the agent's service |
@@ -457,12 +484,11 @@ All 31 Desktop Commander tools from the original functionality inventory (`docs/
 | `give_feedback_to_desktop_commander` | — | not a tool, by design | Desktop Commander product feedback |
 
 Beyond individual tools, the checklist in `docs/capability-roadmap.pdf` also lists capabilities the computer route does not have yet:
-- a native file **delete** with safeguards (the [filesystem route](#filesystem-route) has `delete_file`, for its own roots);
-- **document** tools (Excel, PDF, Word);
 - **asynchronous, paged search** sessions;
+- legacy **`.xls`** workbooks, images, and fetching URLs;
 - the **synchronization** layer (transfer, sync, checksums, conflicts).
 
-Until those exist, deletions and document work go through allowlisted commands on the device.
+Native delete and the PDF, Word, and Excel tools arrived in phase 7 (see [Documents](#documents) and the **Deletes** policy above).
 
 ## Network exposure
 
@@ -484,10 +510,11 @@ Do not forward ports 8790, 8791, or 8792 to the internet. Publish 8793 only thro
 4. ~~Windows agent for Thanatos (native agent, job-object process trees, scheduled-task install, Windows CI)~~
 5. ~~Authenticated remote MCP endpoint for ChatGPT and Claude (OAuth front end, per-device permissions)~~
 6. ~~Failover acceptance test with Desktop Commander fully stopped (drill + jailed CI test)~~
+7. ~~Native delete (trash with restore) and document tools (PDF, Word, Excel)~~
 
 ## Documentation
 
-The PDFs in `docs/` are planning documents. The filesystem and computer routes implement the roadmap's filesystem operations, and the computer route also covers search across files, terminal commands and sessions, processes, and remote devices. Documents and synchronization are not implemented. The read-only knowledge gateway's default-deny policy rejects all of these tools. The documents refer to two target machines, Friday (Linux) and Thanatos (Windows).
+The PDFs in `docs/` are planning documents. The filesystem and computer routes implement the roadmap's filesystem operations, and the computer route also covers search across files, terminal commands and sessions, processes, and remote devices. The computer route also reads, writes, and edits PDF, Word, and Excel files and has a native delete with a trash. Asynchronous search and synchronization are not implemented. The read-only knowledge gateway's default-deny policy rejects all of these tools. The documents refer to two target machines, Friday (Linux) and Thanatos (Windows).
 
 - `docs/capability-roadmap.pdf` lists the capabilities ContextBridge targets, with an implementation checklist. The checklist is a blank tracker, not a status report. It is generated by `scripts/build-roadmap-pdf.py`.
 - `docs/computer-use-linux-review.pdf` evaluates `agent-sh/computer-use-linux` as a Linux desktop-control engine for ContextBridge. It is generated by `scripts/build-review-pdf.py`.

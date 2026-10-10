@@ -63,10 +63,15 @@ from .audit import (
 from .commands import CommandError
 from .dispatch import (
     COMMAND_TOOLS,
+    DELETE_TOOL,
+    DOCUMENT_READ_TOOLS,
+    DOCUMENT_WRITE_TOOLS,
     ENGINE_TOOLS,
     PROCESS_KILL_TOOL,
     PROCESS_LIST_TOOL,
     READ_TOOLS,
+    TRASH_READ_TOOL,
+    TRASH_RESTORE_TOOL,
     WRITE_TOOLS,
     Engine,
     InvalidArguments,
@@ -91,10 +96,13 @@ SCOPE_PROCESS = "computer:process"
 ALL_SCOPES = (SCOPE_READ, SCOPE_WRITE, SCOPE_EXECUTE, SCOPE_PROCESS)
 
 TOOL_SCOPES: dict[str, str] = {
-    **{name: SCOPE_READ for name in READ_TOOLS},
+    **{name: SCOPE_READ for name in READ_TOOLS | DOCUMENT_READ_TOOLS},
     PROCESS_LIST_TOOL: SCOPE_READ,
     LIST_DEVICES_TOOL: SCOPE_READ,
-    **{name: SCOPE_WRITE for name in WRITE_TOOLS},
+    TRASH_READ_TOOL: SCOPE_READ,
+    **{name: SCOPE_WRITE for name in WRITE_TOOLS | DOCUMENT_WRITE_TOOLS},
+    DELETE_TOOL: SCOPE_WRITE,
+    TRASH_RESTORE_TOOL: SCOPE_WRITE,
     **{name: SCOPE_EXECUTE for name in COMMAND_TOOLS},
     PROCESS_KILL_TOOL: SCOPE_PROCESS,
 }
@@ -104,6 +112,7 @@ _READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
 _WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False)
 _ADDITIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False)
 _EXECUTE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True)
+_RESTORE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False)
 _DEVICE_DOC = " device: 'local' (default) or a name from list_devices."
 
 
@@ -348,7 +357,13 @@ def _instructions(policy: ComputerPolicy | None, remote: bool) -> str:
             cmds = "allowlist only: " + ", ".join(sorted(policy.command_allow)) + " (no shell operators)"
         else:
             cmds = policy.command_mode
-        parts.append(f"On 'local': readable roots {roots}; writable roots {writable}; commands {cmds}.")
+        deletes = {"trash": "to a trash (undo with restore_deleted)", "permanent": "permanently"}.get(
+            policy.delete_mode if policy.can_write else "disabled", "disabled"
+        )
+        parts.append(
+            f"On 'local': readable roots {roots}; writable roots {writable}; commands {cmds}; deletes {deletes}."
+        )
+        parts.append("Use read_document for PDF, Word, and Excel files; read_file is for text.")
     else:
         parts.append("This gateway has no local device.")
     if remote:
@@ -488,6 +503,110 @@ def create_computer_server(
     async def move_file(source: str, destination: str, device: str = LOCAL_DEVICE) -> dict[str, Any]:
         """Move or rename a file or directory. The destination must not already exist."""
         return await run(device, "move_file", {"source": source, "destination": destination})
+
+    @server.tool(annotations=_WRITE)
+    async def delete_file(path: str, recursive: bool = False, device: str = LOCAL_DEVICE) -> dict[str, Any]:
+        """Delete a file, symlink, or folder in a writable root. Folders with contents need recursive=true.
+        Where the device keeps a trash (the default), the item can be brought back with restore_deleted
+        using the returned trash_id. Refused for roots and for folders holding protected or hidden files."""
+        return await run(device, "delete_file", {"path": path, "recursive": recursive})
+
+    @server.tool(annotations=_READ_ONLY)
+    async def list_deleted(limit: int = 50, device: str = LOCAL_DEVICE) -> dict[str, Any]:
+        """List items in a device's trash, newest first, with trash_id and original path."""
+        return await run(device, "list_deleted", {"limit": limit})
+
+    @server.tool(annotations=_RESTORE)
+    async def restore_deleted(trash_id: str, device: str = LOCAL_DEVICE) -> dict[str, Any]:
+        """Put a deleted item back at its original path. Fails if something now exists there."""
+        return await run(device, "restore_deleted", {"trash_id": trash_id})
+
+    # -------------------------------------------------------- document tools
+
+    @server.tool(annotations=_READ_ONLY)
+    async def read_document(
+        path: str,
+        pages: str | None = None,
+        sheet: str | None = None,
+        cell_range: str | None = None,
+        find: str | None = None,
+        formulas: bool = False,
+        max_chars: int | None = None,
+        device: str = LOCAL_DEVICE,
+    ) -> dict[str, Any]:
+        """Read a PDF, Word (.docx), or Excel (.xlsx/.xlsm) file.
+        PDF: text per page; pages like "1-3,7". Word: Markdown text with headings, lists, and tables, plus
+        an outline. Excel: sheet names and cell values for sheet and cell_range (A1 notation); formulas=true
+        shows formulas instead of cached values. find searches inside instead of returning everything."""
+        args = {
+            "path": path,
+            "pages": pages,
+            "sheet": sheet,
+            "cell_range": cell_range,
+            "find": find,
+            "formulas": formulas,
+            "max_chars": max_chars,
+        }
+        return await run(device, "read_document", args)
+
+    @server.tool(annotations=_WRITE)
+    async def write_document(
+        path: str, content: str, title: str | None = None, device: str = LOCAL_DEVICE
+    ) -> dict[str, Any]:
+        """Create or replace a .docx or .pdf from simple Markdown: # headings, - and 1. lists,
+        | a | b | tables, and paragraphs separated by blank lines."""
+        return await run(device, "write_document", {"path": path, "content": content, "title": title})
+
+    @server.tool(annotations=_WRITE)
+    async def edit_document(
+        path: str, old_text: str, new_text: str, expected_replacements: int = 1, device: str = LOCAL_DEVICE
+    ) -> dict[str, Any]:
+        """Replace exact text in a Word (.docx) file: body, tables, headers, and footers. Fails unless
+        old_text occurs exactly expected_replacements times. Formatting is kept when a match sits in one run."""
+        args = {
+            "path": path,
+            "old_text": old_text,
+            "new_text": new_text,
+            "expected_replacements": expected_replacements,
+        }
+        return await run(device, "edit_document", args)
+
+    @server.tool(annotations=_WRITE)
+    async def write_spreadsheet(
+        path: str,
+        rows: list[list[str | int | float | bool | None]],
+        sheet: str | None = None,
+        start_cell: str = "A1",
+        device: str = LOCAL_DEVICE,
+    ) -> dict[str, Any]:
+        """Write rows of values into an Excel sheet starting at start_cell, creating the .xlsx file or the
+        sheet if needed and keeping everything else. A string starting with = is stored as a formula."""
+        args = {"path": path, "rows": rows, "sheet": sheet, "start_cell": start_cell}
+        return await run(device, "write_spreadsheet", args)
+
+    @server.tool(annotations=_WRITE)
+    async def edit_pdf(
+        path: str,
+        delete_pages: str | None = None,
+        rotate_pages: str | None = None,
+        rotate_degrees: int = 90,
+        insert_pdf: str | None = None,
+        insert_at: int | None = None,
+        output_path: str | None = None,
+        device: str = LOCAL_DEVICE,
+    ) -> dict[str, Any]:
+        """Change a PDF's pages: delete_pages and rotate_pages take ranges like "2,5-7"; insert_pdf adds
+        another PDF's pages before page insert_at (default: at the end). Writes to output_path if given."""
+        args = {
+            "path": path,
+            "delete_pages": delete_pages,
+            "rotate_pages": rotate_pages,
+            "rotate_degrees": rotate_degrees,
+            "insert_pdf": insert_pdf,
+            "insert_at": insert_at,
+            "output_path": output_path,
+        }
+        return await run(device, "edit_pdf", args)
 
     # --------------------------------------------------------- command tools
 

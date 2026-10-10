@@ -15,6 +15,8 @@ filesystem:
   roots:
     - "~"                  # C:/Users/<you>
   writable_roots: []       # e.g. "~/Projects" to allow edits there
+  delete: trash            # trash (undo with restore_deleted) | permanent | disabled; writable roots only
+  max_document_bytes: 20971520   # PDF, Word, and Excel files larger than this are not opened
   # Built-in deny list (always applied unless you set `deny`): .ssh, .env*, *.pem, *.key, *.kdbx, plus on
   # Windows NTUSER.DAT*, DPAPI/credential stores (Protect, Credentials, Vault), browser secrets
   # (Login Data, Cookies, Local State), *.ppk, .azure.

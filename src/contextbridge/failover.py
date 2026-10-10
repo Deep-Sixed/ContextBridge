@@ -16,11 +16,14 @@ It checks, and prints PASS / FAIL / SKIP for each item:
    ``--device``) is online and serves its tools: system info, directory
    listing, file search, a file read, a harmless command run both directly and
    as a session, and process listing. ``--write`` adds create, write, edit,
-   move, read-back, metadata, and content search under
+   move, read-back, metadata, and content search; Word, PDF, and Excel files
+   written and read back; and a delete that is then restored from the trash
+   (where the device keeps one), all under
    ``<first writable root>/.contextbridge-failover/``.
 
-Nothing is deleted, no process is killed, and with ``--write`` only that probe
-directory is touched. Exit status: 0 ready, 1 not ready, 2 could not run.
+No process is killed, and with ``--write`` only that probe directory is touched:
+the one file the drill deletes is its own, and it is restored where the device
+keeps a trash. Exit status: 0 ready, 1 not ready, 2 could not run.
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from collections.abc import Awaitable, Callable
@@ -48,8 +52,7 @@ from .computer.server import (
 
 DEFAULT_URL = "http://127.0.0.1:8791/mcp"
 PROBE_DIR = ".contextbridge-failover"
-# Substrings of a command line that identify Desktop Commander: its npm scope and package
-# names (MCP server and remote agent), as launched by npx, node, or an installed binary.
+# Desktop Commander's npm scope (first) and package and program names: MCP server and remote agent.
 DC_MARKERS = ("@wonderwhy-er", "desktop-commander", "desktopcommander", "claude-server-commander")
 # Commands that only report on the machine; the drill runs the first one the device allows.
 PROBE_COMMANDS = ("hostname", "whoami", "uname", "pwd", "date")
@@ -68,9 +71,10 @@ class Parity:
     note: str = ""
 
 
-# Every tool Desktop Commander exposes (local MCP server and Remote: the 31 in
-# docs/desktop-commander-inventory.pdf) and its ContextBridge counterpart. The failover
-# acceptance test exercises every tool named here on a local and a remote device.
+# Every tool Desktop Commander exposes (local MCP server and Remote: the 31 in its
+# inventory, since reworked into docs/capability-roadmap.pdf) and its ContextBridge
+# counterpart. The failover acceptance test exercises every tool named here on a
+# local and a remote device.
 DESKTOP_COMMANDER_PARITY: dict[str, Parity] = {
     # filesystem
     "read_file": Parity("same", ("read_file",), "offset, negative offset (tail), and length"),
@@ -96,7 +100,9 @@ DESKTOP_COMMANDER_PARITY: dict[str, Parity] = {
     "list_processes": Parity("same", ("list_processes",)),
     "kill_process": Parity("same", ("kill_process",), "only where the device's policy sets allow_kill"),
     # documents
-    "write_pdf": Parity("gap", (), "no PDF, Excel, or Word tools; text formats are read and edited as text"),
+    "write_pdf": Parity(
+        "equivalent", ("write_document", "edit_pdf"), "write_document creates PDFs; edit_pdf deletes, rotates, inserts pages"
+    ),
     # remote devices
     "list_devices": Parity("same", ("list_devices",), "online state, last seen, tools, and policy"),
     "ping": Parity("equivalent", ("list_devices",), "online state from heartbeats"),
@@ -159,8 +165,28 @@ class Report:
 # --------------------------------------------------------- Desktop Commander
 
 
+def names_desktop_commander(name: str, argv: list[str]) -> bool:
+    """Whether a process is Desktop Commander, judged by how it is launched.
+
+    ``npx <scope>/desktop-commander``, ``node .../desktop-commander/dist/index.js``, or an
+    installed ``desktop-commander`` program. Only argv elements without whitespace count:
+    a shell script or ``python -c`` code that merely mentions the name is not Desktop Commander.
+    """
+    scope, *names = DC_MARKERS
+    for token in (name, *argv):
+        token = (token or "").strip().strip("\"'").lower()
+        if not token or any(ch.isspace() for ch in token):
+            continue
+        if token.startswith(scope):
+            return True
+        for part in re.split(r"[\\/]", token):
+            if part.startswith(scope) or part in names or part.rsplit(".", 1)[0] in names:
+                return True
+    return False
+
+
 def desktop_commander_processes(*, exclude: set[int] | None = None) -> list[dict[str, Any]]:
-    """Running processes whose name or command line identifies Desktop Commander."""
+    """Running processes that are Desktop Commander (see :func:`names_desktop_commander`)."""
     import psutil
 
     skip = {os.getpid(), *(exclude or set())}
@@ -170,10 +196,10 @@ def desktop_commander_processes(*, exclude: set[int] | None = None) -> list[dict
             if proc.info["pid"] in skip:
                 continue
             argv = proc.info.get("cmdline") or []
-            text = " ".join([proc.info.get("name") or "", *argv]).lower()
+            name = proc.info.get("name") or ""
         except (psutil.Error, OSError):
             continue
-        if any(marker in text for marker in DC_MARKERS):
+        if names_desktop_commander(name, argv):
             found.append({"pid": proc.info["pid"], "name": proc.info.get("name"), "cmdline": " ".join(argv)[:200]})
     return found
 
@@ -334,6 +360,40 @@ class DeviceProbe:
             return f"{probe} ({info.get('size', '?')} bytes)"
 
         await self.check("write_round_trip", "write_file", round_trip)
+
+        async def documents() -> str:
+            await self.call("create_directory", path=folder)
+            text = f"# ContextBridge failover probe\n\nWritten {stamp}."
+            for name in ("probe.docx", "probe.pdf"):
+                await self.call("write_document", path=_join(folder, name), content=text)
+                found = await self.call("read_document", path=_join(folder, name), find=stamp)
+                if not found.get("matches"):
+                    raise RuntimeError(f"{name} did not read back")
+            sheet = _join(folder, "probe.xlsx")
+            await self.call("write_spreadsheet", path=sheet, rows=[["probe", stamp]])
+            rows = (await self.call("read_document", path=sheet)).get("rows")
+            if rows != [["probe", stamp]]:
+                raise RuntimeError(f"probe.xlsx read back {rows!r}")
+            return "probe.docx, probe.pdf, probe.xlsx written and read back"
+
+        async def delete() -> str:
+            await self.call("create_directory", path=folder)
+            victim = _join(folder, "delete-me.txt")
+            await self.call("write_file", path=victim, content=f"deleted by the failover drill {stamp}\n")
+            deleted = await self.call("delete_file", path=victim)
+            if not deleted.get("restorable"):
+                return "deleted permanently (the device keeps no trash)"
+            listed = await self.call("list_deleted", limit=500)
+            if deleted["trash_id"] not in {item.get("trash_id") for item in listed.get("items") or []}:
+                raise RuntimeError(f"{deleted['trash_id']} missing from list_deleted")
+            await self.call("restore_deleted", trash_id=deleted["trash_id"])
+            content = (await self.call("read_file", path=victim)).get("content", "")
+            if stamp not in content:
+                raise RuntimeError("the restored file has different content")
+            return f"deleted to the trash and restored ({deleted['trash_id']})"
+
+        await self.check("documents", "write_document", documents)
+        await self.check("delete", "delete_file", delete)
 
 
 # ------------------------------------------------------------------ drill

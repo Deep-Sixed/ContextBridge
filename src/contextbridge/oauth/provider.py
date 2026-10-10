@@ -60,8 +60,8 @@ CODE_SECONDS = 300
 PENDING_SECONDS = 600
 MAX_PENDING = 100
 SCOPE_DESCRIPTIONS = {
-    SCOPE_READ: "Read files, search, see system info, processes, and devices",
-    SCOPE_WRITE: "Create, edit, and move files in writable folders",
+    SCOPE_READ: "Read files and documents, search, see system info, processes, and devices",
+    SCOPE_WRITE: "Create, edit, move, and delete files and documents in writable folders",
     SCOPE_EXECUTE: "Run commands and interactive sessions",
     SCOPE_PROCESS: "Terminate processes",
 }
