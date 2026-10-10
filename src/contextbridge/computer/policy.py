@@ -153,6 +153,7 @@ class ComputerPolicy:
     env_strip: tuple[str, ...] = DEFAULT_ENV_STRIP
     list_processes: bool = True
     allow_kill: bool = False
+    desktop_observe: bool = False
     windows: bool = IS_WINDOWS
 
     # ------------------------------------------------------------------ paths
@@ -306,6 +307,7 @@ class ComputerPolicy:
             "max_sessions": self.max_sessions,
             "list_processes": self.list_processes,
             "allow_kill": self.allow_kill,
+            "desktop_observe": self.desktop_observe,
         }
 
 
@@ -348,7 +350,8 @@ def load_policy(
     fs = cfg.get("filesystem") or {}
     cmds = cfg.get("commands") or {}
     procs = cfg.get("processes") or {}
-    if not all(isinstance(s, dict) for s in (fs, cmds, procs)):
+    desktop_cfg = cfg.get("desktop") or {}
+    if not all(isinstance(s, dict) for s in (fs, cmds, procs, desktop_cfg)):
         raise PolicyError("filesystem, commands, and processes must be mappings")
 
     roots: list[Path] = []
@@ -411,6 +414,7 @@ def load_policy(
         env_strip=_str_list(cmds, "env_strip", DEFAULT_ENV_STRIP),
         list_processes=bool(procs.get("list", True)),
         allow_kill=bool(procs.get("allow_kill", False)),
+        desktop_observe=desktop_cfg.get("observe", False) is True,
         windows=windows,
     )
     return policy
