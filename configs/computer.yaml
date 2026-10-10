@@ -45,6 +45,10 @@ remote:
   allowed_redirect_hosts: [claude.ai, claude.com, chatgpt.com]   # who may register as a client
   access_token_minutes: 60
   refresh_token_days: 30   # a client unused this long must be approved again
+  google:                  # optional: sign in with Google instead of the passphrase (code still required)
+    enabled: false         # needs CONTEXTBRIDGE_GOOGLE_CLIENT_SECRET in the gateway's environment
+    client_id: ""          # "Web application" OAuth client; redirect URI <public_url>/consent/google
+    owner_email: ""        # the Google account that approves clients
 
 # The sections below configure the "local" device: this machine.
 # Remove filesystem/commands/processes entirely to run a gateway with no local device.

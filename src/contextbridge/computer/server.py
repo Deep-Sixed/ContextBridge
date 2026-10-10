@@ -855,6 +855,25 @@ class RemoteListenerConfig:
         self.access_seconds = round(minutes * 60)
         self.refresh_seconds = round(days * 86400)
 
+        google = cfg.get("google") or {}
+        if not isinstance(google, dict):
+            raise SystemExit(f"{where}: remote.google must be a mapping.")
+        self.google_client_id: str | None = None
+        self.google_owner_email: str | None = None
+        if google.get("enabled"):
+            client_id, email = google.get("client_id"), google.get("owner_email")
+            if not isinstance(client_id, str) or not client_id.strip():
+                raise SystemExit(f"{where}: remote.google.client_id is required (the OAuth client ID from Google Cloud).")
+            if not isinstance(email, str) or email.count("@") != 1 or email.strip() != email:
+                raise SystemExit(f"{where}: remote.google.owner_email must be the owner's Google account address.")
+            self.google_client_id, self.google_owner_email = client_id.strip(), email.lower()
+
+    @property
+    def google_redirect_uri(self) -> str:
+        from ..oauth.google import CALLBACK_PATH
+
+        return self.public_url + CALLBACK_PATH
+
     @property
     def public_host(self) -> str:
         return urlsplit(self.public_url).hostname or ""
@@ -874,8 +893,18 @@ class RemoteListenerConfig:
         return [self.state, *(self.state.with_name(self.state.name + suffix) for suffix in (".lock", ".tmp"))]
 
     def settings(self):
+        """The provider's settings. Reads the Google client secret from the environment (the CLI never needs it)."""
+        from ..oauth.google import CLIENT_SECRET_ENV, GoogleSettings
         from ..oauth.provider import RemoteSettings
 
+        google = None
+        if self.google_client_id and self.google_owner_email:
+            secret = os.environ.get(CLIENT_SECRET_ENV, "")
+            if not secret:
+                raise SystemExit(f"remote.google is enabled but {CLIENT_SECRET_ENV} is not set (fail closed).")
+            google = GoogleSettings(
+                client_id=self.google_client_id, owner_email=self.google_owner_email, client_secret=secret
+            )
         return RemoteSettings(
             public_url=self.public_url,
             allow_scopes=tuple(self.allow_scopes),
@@ -883,6 +912,7 @@ class RemoteListenerConfig:
             allowed_redirect_hosts=tuple(self.redirect_hosts),
             access_seconds=self.access_seconds,
             refresh_seconds=self.refresh_seconds,
+            google=google,
         )
 
 
@@ -998,6 +1028,7 @@ def main(argv: list[str] | None = None) -> None:
                     "public_url": remote.public_url,
                     "allow_scopes": remote.allow_scopes,
                     "allow_devices": remote.allow_devices,
+                    "google_owner": remote.google_owner_email,
                 }
                 if remote
                 else None
@@ -1021,6 +1052,13 @@ def main(argv: list[str] | None = None) -> None:
             file=sys.stderr,
             flush=True,
         )
+        if remote.google_owner_email:
+            print(
+                f"[computer] consent: authenticator code + Google sign-in as {remote.google_owner_email} "
+                f"(redirect URI {remote.google_redirect_uri})",
+                file=sys.stderr,
+                flush=True,
+            )
 
     async def serve_all() -> None:
         if hub is not None:

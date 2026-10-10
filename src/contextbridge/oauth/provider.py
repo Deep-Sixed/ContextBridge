@@ -12,7 +12,9 @@ the decisions:
   enter the passphrase *and* a TOTP code, and picks which scopes (capped by
   ``remote.allow_scopes``) and which devices (capped by ``remote.allow_devices``)
   the client receives. Only read access starts checked. Five failures lock
-  consent for 15 minutes.
+  consent for 15 minutes. With ``remote.google`` enabled, signing in with the
+  owner's Google account replaces the passphrase (:mod:`.google`); the TOTP code
+  is still required, and checked before the browser leaves for Google.
 * **Tokens** are opaque, stored hashed, bound to this MCP resource. Access tokens
   are short-lived; refresh tokens rotate on use and presenting a rotated one
   revokes the whole grant.
@@ -20,6 +22,8 @@ the decisions:
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import html
 import ipaddress
 import secrets
@@ -56,11 +60,14 @@ from ..computer.server import (
     SCOPE_MEDIA_DISCOVER,
     SCOPE_WRITE,
 )
-from .store import OAuthStateError, OAuthStore, new_token
+from . import google as google_login
+from .google import GoogleLogin, GoogleLoginError, GoogleSettings
+from .store import OAuthStateError, OAuthStore, new_token, token_hash
 
 CODE_SECONDS = 300
 PENDING_SECONDS = 600
 MAX_PENDING = 100
+GOOGLE_COOKIE = "cb_google_signin"
 SCOPE_DESCRIPTIONS = {
     SCOPE_READ: "Read files and documents, search, see system info, processes, and devices",
     SCOPE_DESKTOP_OBSERVE: "Observe window titles and IDs on authorized desktops",
@@ -79,6 +86,7 @@ class RemoteSettings:
     allowed_redirect_hosts: tuple[str, ...]
     access_seconds: int = 3600
     refresh_seconds: int = 30 * 86400
+    google: GoogleSettings | None = None  # owner signs in with Google instead of the passphrase
 
     @property
     def resource_url(self) -> str:
@@ -86,6 +94,18 @@ class RemoteSettings:
 
     def device_allowed(self, device: str) -> bool:
         return "*" in self.allow_devices or device in self.allow_devices
+
+
+@dataclass
+class _GoogleAttempt:
+    """A Google sign-in in progress: the owner passed the TOTP check and chose what to grant."""
+
+    state: str
+    nonce: str
+    verifier: str
+    browser_hash: str  # SHA-256 of the cookie set on the browser that left for Google
+    scopes: list[str]
+    devices: list[str]
 
 
 @dataclass
@@ -97,6 +117,7 @@ class _Pending:
     form_token: str
     expires_at: float
     redirect_origin: str = field(default="")
+    google: _GoogleAttempt | None = None
 
 
 def _is_loopback(host: str) -> bool:
@@ -130,6 +151,11 @@ class ContextBridgeOAuthProvider(OAuthProvider):
         self.audit = audit
         self._offered_devices = offered_devices
         self._pending: dict[str, _Pending] = {}
+        self.google = (
+            GoogleLogin(settings.google, settings.public_url.rstrip("/") + google_login.CALLBACK_PATH)
+            if settings.google is not None
+            else None
+        )
 
     # ------------------------------------------------------------ helpers
 
@@ -204,6 +230,8 @@ class ContextBridgeOAuthProvider(OAuthProvider):
     def get_routes(self, mcp_path: str | None = None) -> list[Route]:
         routes = super().get_routes(mcp_path)
         routes.append(Route("/consent", self._consent, methods=["GET", "POST"]))
+        if self.google is not None:
+            routes.append(Route(google_login.CALLBACK_PATH, self._google_callback, methods=["GET"]))
         return routes
 
     async def _consent(self, request: Request) -> Response:
@@ -230,19 +258,33 @@ class ContextBridgeOAuthProvider(OAuthProvider):
                 status_code=302,
             )
 
-        failure = self.store.verify_owner(str(form.get("passphrase", "")), str(form.get("totp", "")))
+        if self.google is None:
+            failure = self.store.verify_owner(str(form.get("passphrase", "")), str(form.get("totp", "")))
+            wrong = "Wrong passphrase or authenticator code."
+        else:
+            failure = self.store.verify_totp(str(form.get("totp", "")))
+            wrong = "Wrong authenticator code."
         if failure is not None:
             self._log("oauth_consent_failed", client=pending.client_id, reason=failure)
             if failure == "locked":
-                minutes = max(1, round((self.store.locked_until() - time.time()) / 60))
-                return _page(f"Too many failed attempts. Approval is locked for about {minutes} minutes.", status=429)
-            return self._form(request_id, pending, error="Wrong passphrase or authenticator code.", status=401)
+                return self._locked_page()
+            return self._form(request_id, pending, error=wrong, status=401)
 
         scopes = [s for s in form.getlist("scope") if s in self._grantable(pending)]
         devices = [d for d in form.getlist("device") if d in self.offered_devices()]
         if not scopes or not devices:
             return self._form(request_id, pending, error="Choose at least one permission and one device.", status=400)
+        if self.google is not None:
+            return self._leave_for_google(pending, scopes, devices)
+        return self._grant(request_id, pending, scopes, devices)
 
+    def _locked_page(self) -> HTMLResponse:
+        minutes = max(1, round((self.store.locked_until() - time.time()) / 60))
+        return _page(f"Too many failed attempts. Approval is locked for about {minutes} minutes.", status=429)
+
+    def _grant(self, request_id: str, pending: _Pending, scopes: list[str], devices: list[str]) -> Response:
+        """The owner approved: issue an authorization code and send the browser back to the client."""
+        state = pending.params.state
         code = new_token()
         self.store.save_code(
             code,
@@ -263,6 +305,86 @@ class ContextBridgeOAuthProvider(OAuthProvider):
             construct_redirect_uri(str(pending.params.redirect_uri), code=code, state=state), status_code=302
         )
 
+    # ------------------------------------------------------ Google sign-in
+
+    def _leave_for_google(self, pending: _Pending, scopes: list[str], devices: list[str]) -> Response:
+        assert self.google is not None
+        verifier, browser = secrets.token_urlsafe(48), secrets.token_urlsafe(32)
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+        attempt = _GoogleAttempt(
+            state=secrets.token_urlsafe(24),
+            nonce=secrets.token_urlsafe(24),
+            verifier=verifier,
+            browser_hash=token_hash(browser),
+            scopes=scopes,
+            devices=devices,
+        )
+        pending.google = attempt
+        self._log("oauth_google_signin_started", client=pending.client_id)
+        response = RedirectResponse(
+            self.google.authorization_url(state=attempt.state, nonce=attempt.nonce, code_challenge=challenge),
+            status_code=303,
+        )
+        response.set_cookie(
+            GOOGLE_COOKIE,
+            browser,
+            max_age=PENDING_SECONDS,
+            path=google_login.CALLBACK_PATH,
+            secure=self.settings.public_url.startswith("https://"),
+            httponly=True,
+            samesite="lax",
+        )
+        return response
+
+    async def _google_callback(self, request: Request) -> Response:
+        """Google sends the browser back here; finish the approval if the owner signed in."""
+        assert self.google is not None
+        params = request.query_params
+        state = params.get("state", "")
+        found = next(
+            (
+                (rid, p)
+                for rid, p in self._pending.items()
+                if p.google is not None and secrets.compare_digest(p.google.state, state)
+            ),
+            None,
+        )
+        if found is None or found[1].expires_at <= time.time():
+            return _page("This sign-in has expired or was already used. Start again from your AI client.", status=400)
+        request_id, pending = found
+        attempt, pending.google = pending.google, None  # one answer per sign-in
+        assert attempt is not None
+        retry = " Enter a new authenticator code to try again."
+
+        browser = request.cookies.get(GOOGLE_COOKIE, "")
+        if not secrets.compare_digest(token_hash(browser), attempt.browser_hash):
+            self._log("oauth_consent_failed", client=pending.client_id, reason="google_other_browser")
+            return _page("Finish signing in with Google in the browser that opened the approval page.", status=400)
+        if params.get("error"):
+            self._log("oauth_consent_failed", client=pending.client_id, reason="google_cancelled")
+            return self._form(request_id, pending, error="Sign-in with Google was cancelled." + retry, status=400)
+
+        email = ""
+        try:
+            email, sub = await self.google.identify(
+                params.get("code", ""), verifier=attempt.verifier, nonce=attempt.nonce
+            )
+            failure, pinned = self.store.verify_google_owner(email, sub)
+        except GoogleLoginError as exc:
+            failure, pinned = (self.store.record_failure(exc.reason) if exc.counts else exc.reason), False
+        if failure is not None:
+            self._log("oauth_consent_failed", client=pending.client_id, reason=failure)
+            if failure == "locked":
+                return self._locked_page()
+            if failure in ("google_unreachable", "google_token_error", "google_no_code"):
+                return self._form(request_id, pending, error="Sign-in with Google did not complete." + retry, status=502)
+            return self._form(request_id, pending, error="That Google account cannot approve requests." + retry, status=401)
+        if pinned:
+            self._log("oauth_google_owner_pinned", email=email)
+        response = self._grant(request_id, pending, attempt.scopes, attempt.devices)
+        response.delete_cookie(GOOGLE_COOKIE, path=google_login.CALLBACK_PATH)
+        return response
+
     def _grantable(self, pending: _Pending) -> list[str]:
         """Scopes the owner may approve: allowed for remote use and registered by the client."""
         return [s for s in ALL_SCOPES if s in self.settings.allow_scopes and s in pending.client_scopes]
@@ -282,6 +404,20 @@ class ContextBridgeOAuthProvider(OAuthProvider):
             for d in offered
         ) or "<p>No devices are available to remote clients.</p>"
         redirect_host = urlsplit(str(pending.params.redirect_uri)).netloc
+        if self.google is None:
+            identity = """<fieldset><legend>Confirm it is you</legend>
+<label>Passphrase <input type="password" name="passphrase" autocomplete="current-password" required></label>
+<label>Authenticator code <input name="totp" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]*" required></label>
+</fieldset>
+<button name="action" value="approve">Approve</button>"""
+            form_action = pending.redirect_origin
+        else:
+            identity = f"""<fieldset><legend>Confirm it is you</legend>
+<label>Authenticator code <input name="totp" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]*" required></label>
+<p class="small">Next, sign in with Google as {html.escape(self.google.settings.owner_email)}.</p>
+</fieldset>
+<button name="action" value="approve">Continue with Google</button>"""
+            form_action = f"{pending.redirect_origin} {google_login.ORIGIN}"
         body = f"""
 <h1>Allow access to your computers?</h1>
 <p><strong>{html.escape(pending.client_name)}</strong> wants to use ContextBridge.
@@ -293,15 +429,11 @@ Only approve a request you started yourself.</p>
 <input type="hidden" name="form_token" value="{html.escape(pending.form_token)}">
 <fieldset><legend>Permissions</legend>{scope_rows}</fieldset>
 <fieldset><legend>Devices</legend>{device_rows}</fieldset>
-<fieldset><legend>Confirm it is you</legend>
-<label>Passphrase <input type="password" name="passphrase" autocomplete="current-password" required></label>
-<label>Authenticator code <input name="totp" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]*" required></label>
-</fieldset>
-<button name="action" value="approve">Approve</button>
+{identity}
 <button name="action" value="deny" formnovalidate>Deny</button>
 </form>
 <p class="small">Client id: <code>{html.escape(pending.client_id)}</code></p>"""
-        return _page(body, status=status, raw=True, form_action=pending.redirect_origin)
+        return _page(body, status=status, raw=True, form_action=form_action)
 
     # ---------------------------------------------------------------- tokens
 
@@ -439,7 +571,8 @@ def _page(body: str, *, status: int = 200, raw: bool = False, form_action: str =
         '<meta name=viewport content="width=device-width, initial-scale=1">'
         f"<title>ContextBridge authorization</title><style>{_STYLE}</style></head><body>{content}</body></html>"
     )
-    # The form posts to this page, which redirects to the client; browsers apply form-action to that redirect.
+    # The form posts to this page, which redirects to the client (or to Google first);
+    # browsers apply form-action to that redirect.
     form_sources = " ".join(filter(None, ["'self'", form_action]))
     headers = {
         "Content-Security-Policy": (

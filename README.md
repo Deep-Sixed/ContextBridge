@@ -350,7 +350,7 @@ CI runs the whole suite on `windows-latest` as well as Ubuntu. That includes the
 
 ## Remote MCP clients (ChatGPT, Claude)
 
-ChatGPT and Claude reach MCP servers from their own clouds, so they need a public HTTPS URL and OAuth. ContextBridge provides both without a third-party identity provider (no Authentik, no hosted relay). The `remote` section of the gateway config adds a second MCP endpoint on its own loopback port. It accepts only OAuth access tokens, and a TLS tunnel publishes it.
+ChatGPT and Claude reach MCP servers from their own clouds, so they need a public HTTPS URL and OAuth. ContextBridge provides both without a third-party identity provider (no Authentik, no hosted relay); signing in with Google to approve clients is optional (see [Owner sign-in with Google](#owner-sign-in-with-google-optional)). The `remote` section of the gateway config adds a second MCP endpoint on its own loopback port. It accepts only OAuth access tokens, and a TLS tunnel publishes it.
 
 ```
  Claude / ChatGPT ──HTTPS──▶ tunnel (e.g. Tailscale Funnel) ──▶ 127.0.0.1:8793  remote listener (OAuth)
@@ -382,7 +382,37 @@ ChatGPT and Claude reach MCP servers from their own clouds, so they need a publi
 5. **Approve on the consent page.**
    - **Permissions.** Only `computer:read` starts ticked; anything more is a deliberate choice.
    - **Devices.** Tick which devices this client may use.
-   - **Confirm.** Enter your passphrase and the current authenticator code.
+   - **Confirm.** Enter your passphrase and the current authenticator code. With Google sign-in, enter the code and then sign in with your Google account.
+
+### Owner sign-in with Google (optional)
+
+With `remote.google` enabled, the consent page asks for your authenticator code and then sends you to Google to sign in, in place of the passphrase. ContextBridge stays the OAuth server for Claude and ChatGPT. Google only confirms that it's you approving, and ContextBridge receives your email address and Google account ID, nothing else.
+
+1. **Create a Google OAuth client** in the Google Cloud Console:
+   - **OAuth consent screen.** Choose *External*, fill in the app name and contact emails, and add your Google account under *Test users*. The only scopes used are `openid` and `email`, which don't need Google's app verification.
+   - **Credentials → Create credentials → OAuth client ID.** Choose *Web application*, and under *Authorized redirect URIs* add `<public_url>/consent/google`, for example `https://friday.<tailnet>.ts.net/consent/google`. The gateway prints this URI at startup.
+2. **Configure it** in `configs/computer.yaml`:
+
+   ```yaml
+   remote:
+     google:
+       enabled: true
+       client_id: 1234-abc.apps.googleusercontent.com
+       owner_email: you@gmail.com
+   ```
+
+3. **Give the gateway the client secret** in `CONTEXTBRIDGE_GOOGLE_CLIENT_SECRET`, from your secret manager like the other tokens. Remote mode won't start without it, and commands the gateway runs never see it, whatever `env_strip` says. `contextbridge-admin` doesn't need it.
+4. **Restart `run-computer.sh`.** You still need `owner-init`: the passphrase is the fallback. If Google is unavailable, set `remote.google.enabled: false` and restart to approve with the passphrase and code again.
+
+How it works:
+
+- **Code first.** The authenticator code is checked, and used up, before the browser leaves for Google.
+- **One account.** The account must have the configured address, verified by Google. The first account that approves is pinned by its Google account ID (`sub`), so a different account later given the same address is refused. `owner-init --force` clears the pin.
+- **Bound to the request.** The sign-in uses PKCE, a single-use `state` tied to the consent request and, through a cookie, to the browser that started it, and a `nonce` that must come back in the ID token.
+- **Sign-in only.** ContextBridge asks for `openid email` without offline access, so it gets no refresh token and can't reach your Google data. It checks the ID token's issuer, audience, expiry, nonce, and verified email. It receives the token directly from Google's token endpoint over TLS, in exchange for the client secret, so it doesn't fetch Google's signing keys (OpenID Connect Core 3.1.3.7).
+- **Failures count.** A wrong account or a bad ID token counts toward the lockout. A cancelled sign-in or an unreachable Google doesn't; enter a new code and try again.
+
+**Know the trade-off.** Approving new clients now depends on Google: a Google outage blocks new approvals until you switch back to the passphrase, though existing clients keep working. Someone who controls both your Google account and your authenticator can approve a client.
 
 ### Managing clients
 
@@ -394,7 +424,7 @@ contextbridge-admin --config configs/computer.yaml oauth-unlock               # 
 
 ### How the remote endpoint is secured
 
-- **Owner consent on every authorization.** No client gets a token until you approve it on the consent page, which requires both the passphrase and a TOTP code.
+- **Owner consent on every authorization.** No client gets a token until you approve it on the consent page, which requires a TOTP code and either the passphrase or, with `remote.google` enabled, a Google sign-in as the owner.
   - **Single-use codes.** A TOTP code works only once.
   - **Lockout.** Five failures lock approvals for 15 minutes, and `oauth-unlock` clears the lock early. Anyone can trigger the lockout, but no one can get past it.
   - **Stored hashed.** The passphrase is kept only as an scrypt hash.
@@ -415,8 +445,8 @@ contextbridge-admin --config configs/computer.yaml oauth-unlock               # 
   - **Static token:** accepted only on the local listener.
   - **OAuth tokens:** accepted only on the remote listener.
   - **Host/Origin guard:** both listeners refuse requests whose `Host` or `Origin` isn't theirs, which blocks DNS rebinding. The remote listener also accepts the `public_url` name the tunnel forwards.
-- **Hardened consent page.** It sends a strict CSP (no scripts, no framing, form posts only to itself and the client's redirect origin) and `no-store`. Every value on it is HTML-escaped.
-- **Audit.** These events are written to the computer audit log: `oauth_client_registered`, `oauth_authorization_requested`, `oauth_consent_granted` / `_denied` / `_failed`, `oauth_token_issued`, `oauth_token_refreshed`, `oauth_refresh_reuse_detected`, and `oauth_grant_revoked`.
+- **Hardened consent page.** It sends a strict CSP (no scripts, no framing, form posts only to itself, the client's redirect origin, and Google's sign-in page when `remote.google` is enabled) and `no-store`. Every value on it is HTML-escaped.
+- **Audit.** These events are written to the computer audit log: `oauth_client_registered`, `oauth_authorization_requested`, `oauth_consent_granted` / `_denied` / `_failed`, `oauth_token_issued`, `oauth_token_refreshed`, `oauth_refresh_reuse_detected`, `oauth_grant_revoked`, and, with Google sign-in, `oauth_google_signin_started` and `oauth_google_owner_pinned`.
 
 **Know the boundary.**
 - **Commands can reach the secrets.** Granting a remote client `computer:execute` on a device lets it run whatever that device's command policy allows. If that includes a shell, it can read the gateway's secrets the same way any command could.

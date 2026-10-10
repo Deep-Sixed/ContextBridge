@@ -6,6 +6,9 @@ changes, so a revocation from the CLI applies to the next request. Writes go
 through a fixed ``<name>.tmp`` file (safe under the lock) so the gateway can
 hide all three paths -- state, ``.lock``, ``.tmp`` -- from the file tools.
 
+When the owner signs in with Google, the account's email and ``sub`` are kept
+too (identifiers, not secrets).
+
 The owner passphrase is an scrypt hash, and authorization codes, access tokens,
 and refresh tokens are SHA-256 hashes. The TOTP secret and any client secrets
 issued at registration are kept as issued (verifying them needs the original);
@@ -203,30 +206,84 @@ class OAuthStore:
         with self.update() as state:
             state["lockout"] = {"failures": [], "locked_until": 0}
 
+    @staticmethod
+    def _fail(state: dict[str, Any], reason: str) -> str:
+        """Count a failed approval. Returns ``reason``, or "locked" when this failure starts a lockout."""
+        now = time.time()
+        lockout = state["lockout"]
+        failures = [t for t in lockout.get("failures", []) if now - t < LOCKOUT_WINDOW_SECONDS] + [now]
+        lockout["failures"] = failures
+        if len(failures) >= LOCKOUT_FAILURES:
+            lockout["locked_until"] = now + LOCKOUT_SECONDS
+            lockout["failures"] = []
+            return "locked"
+        return reason
+
+    @staticmethod
+    def _is_locked(state: dict[str, Any]) -> bool:
+        return state["lockout"].get("locked_until", 0) > time.time()
+
     def verify_owner(self, passphrase: str, code: str) -> str | None:
         """Check the passphrase and TOTP code. Returns None on success, else the reason it failed.
 
         Failures count toward a lockout; a TOTP code is accepted only once.
         """
         with self.update() as state:
-            now = time.time()
-            lockout = state["lockout"]
-            if lockout.get("locked_until", 0) > now:
+            if self._is_locked(state):
                 return "locked"
             owner = state.get("owner") or {}
             ok_pass = check_passphrase(passphrase or "", owner.get("passphrase", ""))
             counter = totp.verify(owner.get("totp_secret", ""), code, last_counter=owner.get("totp_last_counter", 0))
             if ok_pass and counter is not None:
                 owner["totp_last_counter"] = counter
-                lockout["failures"] = []
+                state["lockout"]["failures"] = []
                 return None
-            failures = [t for t in lockout.get("failures", []) if now - t < LOCKOUT_WINDOW_SECONDS] + [now]
-            lockout["failures"] = failures
-            if len(failures) >= LOCKOUT_FAILURES:
-                lockout["locked_until"] = now + LOCKOUT_SECONDS
-                lockout["failures"] = []
+            return self._fail(state, "bad_credentials")
+
+    def verify_totp(self, code: str) -> str | None:
+        """Check only the TOTP code, as the first step of a Google sign-in. Returns None on success.
+
+        Failures count toward the lockout and a code is accepted only once, as in
+        :meth:`verify_owner`. Earlier failures are kept until
+        :meth:`verify_google_owner` completes the approval.
+        """
+        with self.update() as state:
+            if self._is_locked(state):
                 return "locked"
-            return "bad_credentials"
+            owner = state.get("owner") or {}
+            counter = totp.verify(owner.get("totp_secret", ""), code, last_counter=owner.get("totp_last_counter", 0))
+            if counter is None:
+                return self._fail(state, "bad_totp")
+            owner["totp_last_counter"] = counter
+            return None
+
+    def verify_google_owner(self, email: str, sub: str) -> tuple[str | None, bool]:
+        """Accept the Google account ``sub`` as the owner at ``email``. Returns (failure, newly_pinned).
+
+        The first account seen at an address is pinned; another account at the same
+        address later is refused and counts toward the lockout. ``owner-init --force``
+        clears the pin.
+        """
+        with self.update() as state:
+            if self._is_locked(state):
+                return "locked", False
+            owner = state.get("owner") or {}
+            pinned = owner.get("google") or {}
+            if pinned.get("email") == email:
+                if not hmac.compare_digest(str(pinned.get("sub", "")), sub):
+                    return self._fail(state, "google_account_changed"), False
+                state["lockout"]["failures"] = []
+                return None, False
+            owner["google"] = {"email": email, "sub": sub, "pinned_at": time.time()}
+            state["lockout"]["failures"] = []
+            return None, True
+
+    def record_failure(self, reason: str) -> str:
+        """Count a failed approval decided outside the store. Returns ``reason`` or "locked"."""
+        with self.update() as state:
+            if self._is_locked(state):
+                return "locked"
+            return self._fail(state, reason)
 
     # -------------------------------------------------------------- clients
 
