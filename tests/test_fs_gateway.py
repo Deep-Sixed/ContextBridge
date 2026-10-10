@@ -223,7 +223,7 @@ def test_search_over_mcp_is_audited_without_the_pattern(tmp_path: Path) -> None:
 
     assert started["status"] == "completed"
     assert [(r["path"], r["line"], r["text"]) for r in started["results"]] == [
-        (f"{ro}/notes.txt", 1, "hello")
+        (str(Path(ro) / "notes.txt"), 1, "hello")
     ]
     assert more["results"] == started["results"]
     assert [s["search_id"] for s in listed["searches"]] == [started["search_id"]]

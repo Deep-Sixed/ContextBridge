@@ -75,7 +75,7 @@ class _Search:
         self.timed_out = False
 
     def _check_deadline(self) -> None:
-        if time.monotonic() > self.deadline:
+        if time.monotonic() >= self.deadline:
             self.timed_out = True
             raise _Stop
 

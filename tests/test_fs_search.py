@@ -30,7 +30,7 @@ def tree(tmp_path: Path) -> Path:
         "import os\ndef main():\n    return os.getcwd()\n", encoding="utf-8"
     )
     (root / "src" / "pkg" / "util.PY").write_text("def Main_helper():\n    pass\n", encoding="utf-8")
-    (root / "README.md").write_text("# Notes\r\nmain entry point\r\n", encoding="utf-8")
+    (root / "README.md").write_bytes(b"# Notes\r\nmain entry point\r\n")
     (root / ".hidden").mkdir()
     (root / ".hidden" / "secret.txt").write_text("main secret\n", encoding="utf-8")
     (root / TRASH_DIR_NAME / "t1").mkdir(parents=True)
@@ -70,7 +70,7 @@ def _search(root: Path, **overrides: Any) -> tuple[list[dict[str, Any]], dict[st
 
 
 def _rel(root: Path, results: list[dict[str, Any]]) -> list[str]:
-    return [str(Path(r["path"]).relative_to(root)) for r in results]
+    return [Path(r["path"]).relative_to(root).as_posix() for r in results]
 
 
 # -- worker: file name search -----------------------------------------------------
@@ -306,7 +306,7 @@ def test_old_finished_sessions_are_evicted(
 def test_session_byte_budget_stops_the_worker(
     tree: Path, manager: SearchManager, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(fs_search, "MAX_SESSION_BYTES", 150)
+    monkeypatch.setattr(fs_search, "MAX_SESSION_BYTES", 320)
 
     result = _wait_finished(manager, manager.start(str(tree), "*")["search_id"])
 
