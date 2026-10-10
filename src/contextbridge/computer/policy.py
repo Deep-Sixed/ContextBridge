@@ -50,6 +50,15 @@ DEFAULT_DENY: tuple[str, ...] = (
     "id_rsa*",
     "id_ecdsa*",
     "id_ed25519*",
+    # Registry tokens, Firefox's password keys and cookies, PowerShell history, and
+    # ContextBridge device keys, including other agents' on the same machine.
+    ".npmrc",
+    ".pypirc",
+    "key3.db",
+    "key4.db",
+    "cookies.sqlite",
+    "ConsoleHost_history.txt",
+    "*identity.json",
 )
 
 # Added on Windows: registry hives, DPAPI keys and credential stores, browser

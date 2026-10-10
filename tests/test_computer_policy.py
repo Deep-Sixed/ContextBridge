@@ -4,7 +4,8 @@ import os
 from pathlib import Path
 
 import pytest
-from helpers import symlink_or_skip
+import yaml
+from helpers import REPO, symlink_or_skip
 
 from contextbridge.computer.policy import PolicyError, PolicyViolation, load_policy
 
@@ -49,6 +50,36 @@ def test_denied_patterns_apply_to_every_path_component(policy, workspace):
     for raw in (".ssh/id_ed25519", ".ssh", ".env", "docs/server.pem"):
         with pytest.raises(PolicyViolation, match="denied"):
             policy.resolve(raw)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        ".npmrc",
+        ".pypirc",
+        "firefox/key4.db",
+        "firefox/key3.db",
+        "firefox/cookies.sqlite",
+        "PSReadLine/ConsoleHost_history.txt",
+        "state/agent-identity.json",
+        "state/identity.json",
+    ],
+)
+def test_default_deny_covers_common_credential_files(policy, raw):
+    with pytest.raises(PolicyViolation, match="denied"):
+        policy.resolve(raw)
+
+
+# Each of these makes allowlist mode unrestricted: git through its -c options and aliases.
+_RUNS_OTHER_PROGRAMS = {"git", "bash", "sh", "zsh", "cmd", "powershell", "pwsh", "python", "python3", "py", "node"}
+
+
+def test_example_configs_allowlist_no_program_that_runs_others():
+    for path in sorted((REPO / "configs").glob("*.yaml")):
+        cfg = yaml.safe_load(path.read_text(encoding="utf-8"))
+        commands = (cfg.get("commands") if isinstance(cfg, dict) else None) or {}
+        allowed = {name.lower().removesuffix(".exe") for name in commands.get("allow") or []}
+        assert not allowed & _RUNS_OTHER_PROGRAMS, f"{path.name} allowlists {sorted(allowed & _RUNS_OTHER_PROGRAMS)}"
 
 
 def test_write_requires_writable_root(policy, workspace):
