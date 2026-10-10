@@ -1,25 +1,19 @@
-"""Phase 6: failover acceptance. Desktop Commander goes away; ContextBridge carries on.
+"""Phase 6: failover acceptance. ContextBridge serves both machines on its own.
 
-The acceptance criterion from the Desktop Commander inventory (since reworked into
-docs/capability-roadmap.pdf): "Desktop
-Commander can be completely disabled while ContextBridge continues operating
-against Friday and Thanatos using its own agents, permissions, transport, and tools."
+The acceptance criterion from docs/capability-roadmap.pdf: "ContextBridge operates
+against Friday and Thanatos using only its own agents, permissions, transport, and
+tools, with no third-party remote-access service."
 
 The whole deployment -- knowledge gateway, computer gateway with its agent and OAuth
 listeners, and a remote agent standing in for Thanatos -- runs from the shipped
-entry points inside a jail that models Desktop Commander being gone or stripped of
-its permissions:
+entry points inside a jail:
 
-* tripwire ``npx`` / ``node`` / ``desktop-commander`` programs come first on PATH
-  and record any call;
+* tripwire ``npx`` and ``node`` programs come first on PATH and record any call;
 * ``failover_jail/sitecustomize.py`` refuses and records every network destination
-  off this machine, so no hosted relay, registry, or update check can be reached;
-* Desktop Commander's config directory exists but is unreadable;
-* a stand-in Desktop Commander process runs at first and is then killed.
+  off this machine, so no hosted relay, registry, or update check can be reached.
 
-The test then proves, on both devices: the failover drill passes (and refuses to
-pass while Desktop Commander still runs), every Desktop Commander tool with a
-ContextBridge counterpart works, an OAuth (ChatGPT/Claude-style) client works,
+The test then proves, on both devices: the failover drill passes, every computer
+tool the deployment enables works, an OAuth (ChatGPT/Claude-style) client works,
 the knowledge route works, the agent and OAuth tokens survive a gateway restart,
 and nothing ever touched a tripwire or the network.
 """
@@ -31,7 +25,6 @@ import os
 import re
 import shutil
 import socket
-import stat
 import subprocess
 import sys
 import time
@@ -62,12 +55,8 @@ from test_oauth import PASSPHRASE, REDIRECT, form_fields, next_code, pkce
 
 from contextbridge.computer.server import SCOPE_READ, SERVER_TOOLS
 from contextbridge.failover import (
-    DC_MARKERS,
-    DESKTOP_COMMANDER_PARITY,
     PROBE_COMMANDS,
     _join,
-    desktop_commander_processes,
-    names_desktop_commander,
     pick_probe_command,
     render,
     run_drill,
@@ -78,9 +67,14 @@ JAIL_DIR = Path(__file__).with_name("failover_jail")
 FIXTURE = REPO / "tests" / "fixtures" / "datacore" / "datacore.fetch.v1.jsonl"
 COMPUTER_TOKEN = "computer-" + "f" * 40
 KNOWLEDGE_TOKEN = "knowledge-" + "k" * 40
-TRIPWIRES = ("npx", "node", "desktop-commander", "desktop-commander-remote")
+TRIPWIRES = ("npx", "node")
 THANATOS = "thanatos"
-INVENTORY_TOOLS = 31  # Desktop Commander's tools, per the original inventory
+# Computer tools the deployment below leaves off, and why. Every other tool must
+# work on both devices.
+NOT_EXERCISED = {
+    "list_windows": "needs a graphical session; the device policies leave desktop observation off",
+    "media_inventory": "the device policies leave media discovery off",
+}
 
 
 # ------------------------------------------------------------------ the jail
@@ -92,14 +86,13 @@ class Jail:
     tripwire_dir: Path
     tripwire_log: Path
     network_log: Path
-    dc_config: Path
 
     def hits(self) -> str:
         return read_log(self.tripwire_log) + read_log(self.network_log)
 
 
 def build_jail(tmp_path: Path) -> Jail:
-    """An environment in which Desktop Commander is gone and only this machine is reachable."""
+    """An environment without Node or npx, in which only this machine is reachable."""
     tripwire_dir = tmp_path / "tripwire-bin"
     tripwire_dir.mkdir()
     tripwire_log = tmp_path / "tripwire.log"
@@ -113,13 +106,8 @@ def build_jail(tmp_path: Path) -> Jail:
             script.write_text(f'#!/bin/sh\necho "{name} $*" >> "{tripwire_log}"\nexit 97\n', encoding="utf-8")
             script.chmod(0o755)
 
-    # Desktop Commander's own config, present but out of reach: it "lost its permissions".
     home = tmp_path / "home"
-    dc_config = home / ".claude-server-commander"
-    dc_config.mkdir(parents=True)
-    (dc_config / "config.json").write_text('{"allowedDirectories": [], "blockedCommands": ["*"]}', encoding="utf-8")
-    if not IS_WINDOWS:
-        dc_config.chmod(0)
+    home.mkdir()
 
     network_log = tmp_path / "network-jail.log"
     env = isolated_env()
@@ -129,17 +117,12 @@ def build_jail(tmp_path: Path) -> Jail:
     env["HOME"] = str(home)
     if IS_WINDOWS:
         env["USERPROFILE"] = str(home)
-    return Jail(env, tripwire_dir, tripwire_log, network_log, dc_config)
+    return Jail(env, tripwire_dir, tripwire_log, network_log)
 
 
 @pytest.fixture
 def jail(tmp_path):
-    jail = build_jail(tmp_path)
-    try:
-        yield jail
-    finally:
-        if not IS_WINDOWS:
-            jail.dc_config.chmod(stat.S_IRWXU)  # let pytest clean up
+    return build_jail(tmp_path)
 
 
 def test_the_jail_is_armed(jail):
@@ -183,52 +166,14 @@ def test_probe_paths_keep_the_device_separator():
     assert _join("C:\\Users\\c\\work\\", "x", "probe.txt") == "C:\\Users\\c\\work\\x\\probe.txt"
 
 
-@pytest.mark.parametrize(
-    ("name", "argv", "expected"),
-    [
-        ("npx", ["npx", "-y", "@wonderwhy-er/desktop-commander@latest"], True),
-        ("node", ["node", "/usr/lib/node_modules/@wonderwhy-er/desktop-commander/dist/index.js"], True),
-        ("node.exe", ["node.exe", "C:\\npm\\node_modules\\@wonderwhy-er\\desktop-commander\\dist\\index.js"], True),
-        ("desktop-commander.exe", ["desktop-commander.exe", "--remote"], True),
-        ("bash", ["bash", "-c", "grep -r desktop-commander docs/ && echo stop @wonderwhy-er/desktop-commander"], False),
-        ("vim", ["vim", "docs/desktop-commander-inventory.pdf"], False),
-        ("python", ["python", "-m", "contextbridge.failover", "--json"], False),
-    ],
-)
-def test_desktop_commander_is_recognised_by_how_it_runs(name, argv, expected):
-    assert names_desktop_commander(name, argv) is expected
-
-
-def test_drill_spots_a_running_desktop_commander(tmp_path):
-    marker = "@wonderwhy-er/desktop-commander"
-    assert any(m in marker for m in DC_MARKERS)
-    proc = spawn_logged(
-        [sys.executable, "-c", "import time; time.sleep(120)", marker], env=isolated_env(), log=tmp_path / "dc.log"
-    )
-    try:
-        deadline = time.monotonic() + 15
-        while proc.pid not in {p["pid"] for p in desktop_commander_processes()}:
-            assert time.monotonic() < deadline, "the stand-in Desktop Commander was not detected"
-            time.sleep(0.1)
-    finally:
-        proc.kill()
-        proc.wait()
-    assert proc.pid not in {p["pid"] for p in desktop_commander_processes()}
-
-
 def test_drill_reports_an_unreachable_gateway_instead_of_crashing():
     report = anyio.run(lambda: run_drill(f"http://127.0.0.1:{free_port()}/mcp", "x" * 40))
     assert report.gateway.status == "fail" and report.gateway.detail
     assert report.ready is False and "NOT READY" in render(report)
 
 
-def test_parity_map_covers_the_whole_inventory():
-    assert len(DESKTOP_COMMANDER_PARITY) == INVENTORY_TOOLS
-    for dc_tool, parity in DESKTOP_COMMANDER_PARITY.items():
-        assert parity.kind in {"same", "equivalent", "omitted", "gap"}, dc_tool
-        assert set(parity.tools) <= SERVER_TOOLS, dc_tool
-        assert bool(parity.tools) == (parity.kind in {"same", "equivalent"}), dc_tool
-        assert parity.tools or parity.note, f"{dc_tool}: say why it is not provided"
+def test_tools_left_out_of_the_failover_run_are_real_tools():
+    assert set(NOT_EXERCISED) <= SERVER_TOOLS
 
 
 # ------------------------------------------------------------- deployment
@@ -302,17 +247,18 @@ def drill_cli(env: dict, url: str, *args: str) -> tuple[int, dict]:
 
 
 def failed_checks(report: dict) -> list[str]:
-    bad = [f"{c['name']}: {c['detail']}" for c in (report["desktop_commander"], report["gateway"]) if c["status"] == "fail"]
+    gateway = report["gateway"]
+    bad = [f"{gateway['name']}: {gateway['detail']}"] if gateway["status"] == "fail" else []
     for device in report["devices"]:
         bad += [f"{device['device']}/{c['name']}: {c['detail']}" for c in device["checks"] if c["status"] == "fail"]
     return bad
 
 
-# ------------------------------------------------- Desktop Commander parity
+# ---------------------------------------------- every tool, on each device
 
 
-async def exercise_parity(client, device: str, used: dict[str, set[str]]) -> None:
-    """Do, on ``device``, what each Desktop Commander tool did, through its ContextBridge counterpart."""
+async def exercise_tools(client, device: str, used: dict[str, set[str]]) -> None:
+    """Use, on ``device``, every computer tool the deployment enables, recording each in ``used``."""
     seen = used.setdefault(device, set())
 
     async def call(tool: str, **args):
@@ -320,7 +266,7 @@ async def exercise_parity(client, device: str, used: dict[str, set[str]]) -> Non
         seen.add(tool)
         return result.structured_content
 
-    # read_file / read_multiple_files: ranges, tails, and several files
+    # read_file: ranges, tails, and several files
     assert (await call("read_file", path="docs/notes.md", offset=1, length=1))["content"] == "beta\n"
     assert (await call("read_file", path="docs/notes.md", offset=-1))["content"] == "gamma\n"
     assert "def main" in (await call("read_file", path="src/app.py"))["content"]
@@ -338,12 +284,12 @@ async def exercise_parity(client, device: str, used: dict[str, set[str]]) -> Non
     assert (await call("get_file_info", path="work/failover/log.txt"))["size"] == len("done\ndone\n")
     listing = await call("list_directory", path="work", depth=3)
     assert {e["path"].replace("\\", "/") for e in listing["entries"]} >= {"failover/log.txt", "failover/nested"}
-    # start_search / get_more_search_results: names and contents, bounded
+    # search_files / search_code: names and contents, bounded
     names = await call("search_files", path=".", pattern="*.md")
     assert [m["path"].replace("\\", "/").endswith("/docs/notes.md") for m in names["matches"]] == [True]
     code = await call("search_code", path=".", pattern="def main", file_pattern="*.py")
     assert [m["path"].replace("\\", "/").endswith("src/app.py") for m in code["matches"]] == [True]
-    # the deny list still holds while Desktop Commander is gone
+    # the deny list still holds
     with pytest.raises(ToolError, match="denied"):
         await client.call_tool("read_file", {"path": ".ssh/id_ed25519", "device": device})
     # start_process / interact_with_process / read_process_output / list_sessions / force_terminate: a REPL
@@ -372,12 +318,12 @@ async def exercise_parity(client, device: str, used: dict[str, set[str]]) -> Non
             break
     assert status["running"] is False
     await call("force_terminate", session_id=victim["session_id"])
-    # write_pdf, and the roadmap's documents: PDF, Word, and Excel
-    await call("write_document", path="work/failover/report.pdf", content="# Failover\n\nDesktop Commander is gone.")
+    # documents: PDF, Word, and Excel
+    await call("write_document", path="work/failover/report.pdf", content="# Failover\n\nThe gateway is serving.")
     await call("write_document", path="work/failover/appendix.pdf", content="Appendix")
     merged = await call("edit_pdf", path="work/failover/report.pdf", insert_pdf="work/failover/appendix.pdf")
     assert merged["pages_after"] == 2
-    assert (await call("read_document", path="work/failover/report.pdf", find="gone"))["matches"][0]["page"] == 1
+    assert (await call("read_document", path="work/failover/report.pdf", find="serving"))["matches"][0]["page"] == 1
     await call("write_document", path="work/failover/memo.docx", content="Status: pending")
     await call("edit_document", path="work/failover/memo.docx", old_text="pending", new_text="done")
     assert "Status: done" in (await call("read_document", path="work/failover/memo.docx"))["content"]
@@ -388,9 +334,9 @@ async def exercise_parity(client, device: str, used: dict[str, set[str]]) -> Non
     assert deleted["trash_id"] in {i["trash_id"] for i in (await call("list_deleted"))["items"]}
     await call("restore_deleted", trash_id=deleted["trash_id"])
     assert "Status: done" in (await call("read_document", path="work/failover/memo.docx"))["content"]
-    # get_config: the device's policy
+    # get_system_info: the device's policy
     assert (await call("get_system_info"))["policy"]["command_mode"] == "allowlist"
-    # list_devices / ping
+    # list_devices
     devices = (await client.call_tool("list_devices", {})).structured_content["devices"]
     seen.add("list_devices")
     assert {d["device"]: d["online"] for d in devices}[device] is True
@@ -451,7 +397,7 @@ def oauth_login(public: str, store: OAuthStore, *, scopes: list[str], devices: l
 # -------------------------------------------------------------- acceptance
 
 
-def test_desktop_commander_failover(tmp_path, jail):
+def test_failover(tmp_path, jail):
     friday = make_workspace(tmp_path / "friday", "friday")
     thanatos = make_workspace(tmp_path / "thanatos", THANATOS)
     local_port, agent_port, remote_port, knowledge_port = (free_port() for _ in range(4))
@@ -495,12 +441,6 @@ def test_desktop_commander_failover(tmp_path, jail):
     knowledge_env = {**env, "MCP_AUTH_TOKEN": KNOWLEDGE_TOKEN, "UGA_DATACORE_JSONL": str(FIXTURE)}
     admin = ("contextbridge.remote.admin", "--config", str(gateway_config))
 
-    # Desktop Commander is running when the drill starts...
-    dc = spawn_logged(
-        [sys.executable, "-c", "import time; time.sleep(600)", "@wonderwhy-er/desktop-commander", "--remote"],
-        env=env,
-        log=tmp_path / "desktop-commander.log",
-    )
     agent_proc = None
     try:
         # One-time setup, all with the shipped CLIs and nothing off this machine.
@@ -553,16 +493,6 @@ def test_desktop_commander_failover(tmp_path, jail):
                 )
                 run_async(with_client, local_url, COMPUTER_TOKEN, lambda c: wait_online(c, THANATOS))
 
-                # ...so the drill refuses to call this a failover,
-                code, report = drill_cli(env, local_url)
-                assert code == 1 and report["ready"] is False
-                assert report["desktop_commander"]["status"] == "fail"
-                assert str(dc.pid) in report["desktop_commander"]["detail"]
-                assert failed_checks(report) == [f"desktop_commander: {report['desktop_commander']['detail']}"]
-
-                # ...until Desktop Commander goes away.
-                dc.kill()
-                dc.wait()
                 code, report = drill_cli(env, local_url, "--write")
                 assert failed_checks(report) == [] and code == 0 and report["ready"] is True
                 assert [d["device"] for d in report["devices"]] == ["local", THANATOS]
@@ -573,17 +503,17 @@ def test_desktop_commander_failover(tmp_path, jail):
                 for root in (friday, thanatos):
                     assert "status: verified" in (root / "work" / ".contextbridge-failover" / "probe.txt").read_text()
 
-                # Every Desktop Commander tool with a counterpart, on both machines.
+                # Every computer tool the deployment enables, on both machines.
                 used: dict[str, set[str]] = {}
 
-                async def parity(client):
+                async def every_tool(client):
                     for device in ("local", THANATOS):
-                        await exercise_parity(client, device, used)
+                        await exercise_tools(client, device, used)
 
-                run_async(with_client, local_url, COMPUTER_TOKEN, parity)
-                covered = {t for p in DESKTOP_COMMANDER_PARITY.values() for t in p.tools}
+                run_async(with_client, local_url, COMPUTER_TOKEN, every_tool)
+                expected = SERVER_TOOLS - set(NOT_EXERCISED)
                 for device in ("local", THANATOS):
-                    assert covered <= used[device], (device, covered - used[device])
+                    assert expected <= used[device], (device, expected - used[device])
                 assert (thanatos / "work" / "failover" / "log.txt").read_text() == "done\ndone\n"
 
                 # A Claude/ChatGPT-style client, approved for reading on both machines.
@@ -631,15 +561,12 @@ def test_desktop_commander_failover(tmp_path, jail):
                 code, report = drill_cli(env, local_url)
                 assert failed_checks(report) == [] and code == 0
     finally:
-        for proc in (dc, agent_proc):
-            if proc is not None and proc.poll() is None:
-                proc.kill()
-                proc.wait()
+        if agent_proc is not None and agent_proc.poll() is None:
+            agent_proc.kill()
+            agent_proc.wait()
 
-    # Nothing reached for Desktop Commander, Node, or the network.
+    # Nothing reached for Node, npx, or the network.
     assert jail.hits() == "", jail.hits()
-    if not IS_WINDOWS:
-        assert stat.S_IMODE(jail.dc_config.stat().st_mode) == 0  # its config was never opened up
 
     gateway_events = [json.loads(line) for line in (gateway_dir / "audit" / "gateway.jsonl").read_text().splitlines()]
     agent_events = [json.loads(line) for line in (agent_dir / "audit" / "agent.jsonl").read_text().splitlines()]

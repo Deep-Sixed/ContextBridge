@@ -1,11 +1,10 @@
 """Network jail for the failover acceptance test (tests/test_failover.py).
 
 Python imports ``sitecustomize`` at startup from ``PYTHONPATH``, so every process
-the test starts -- gateways, agent, admin CLI, drill -- loads this first. Desktop
-Commander's remote mode depends on a hosted relay; ContextBridge must depend on
-nothing off this machine. Here every destination except loopback and this host's
-own name is refused, and each attempt is appended to ``$CONTEXTBRIDGE_JAIL_LOG``
-for the test to fail on.
+the test starts -- gateways, agent, admin CLI, drill -- loads this first.
+ContextBridge must depend on nothing off this machine, such as a hosted relay. Here
+every destination except loopback and this host's own name is refused, and each
+attempt is appended to ``$CONTEXTBRIDGE_JAIL_LOG`` for the test to fail on.
 
 Name resolution is jailed on every OS. Direct connects to IP literals are jailed
 wherever they go through ``socket.connect`` (all blocking sockets, and asyncio
