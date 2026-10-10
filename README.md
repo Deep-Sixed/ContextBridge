@@ -138,3 +138,7 @@ python3 -m pip install -e '.[docs]'
 ## Status
 
 Standalone extraction from an archived UGA (Unidirectional Gateway Appliance) implementation. That is why the package is `uga`, environment variables start with `UGA_`, the gateway's default name is `Nexus UGA`, and its timeout errors say "Nexus Datacore". Authentication-front/sidecar deployments and systemd services intentionally excluded. The code is not yet production-validated.
+
+## License
+
+ContextBridge is released under the MIT License; see [`LICENSE`](LICENSE).
