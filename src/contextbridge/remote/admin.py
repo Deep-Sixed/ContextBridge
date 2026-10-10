@@ -157,7 +157,8 @@ def cmd_owner_init(remote: RemoteListenerConfig, args: argparse.Namespace) -> No
         store.set_owner(passphrase, secret)
     except OAuthStateError as exc:
         raise SystemExit(str(exc)) from None
-    print(f"Owner credentials saved to {remote.state}. Approving a remote client now needs the passphrase and a code.")
+    second = f"Google sign-in as {remote.google_owner_email}" if remote.google_owner_email else "the passphrase"
+    print(f"Owner credentials saved to {remote.state}. Approving a remote client now needs a code and {second}.")
 
 
 def cmd_oauth_clients(remote: RemoteListenerConfig, args: argparse.Namespace) -> None:

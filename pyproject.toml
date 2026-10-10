@@ -13,6 +13,7 @@ dependencies = [
     "fastmcp>=3,<4",
     "mcp>=1.24,<2",
     "anyio>=4.1",
+    "httpx>=0.27.1,<1",   # Google sign-in's token exchange (also required by mcp)
     "pyyaml",
     "starlette",
     "psutil>=5.9",

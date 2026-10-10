@@ -83,7 +83,9 @@ DEFAULT_ENV_STRIP: tuple[str, ...] = (
 )
 
 # Gateway credentials are never passed to child processes, whatever env_strip says.
-ALWAYS_STRIPPED_ENV: frozenset[str] = frozenset({"MCP_AUTH_TOKEN", "CONTEXTBRIDGE_COMPUTER_TOKEN"})
+ALWAYS_STRIPPED_ENV: frozenset[str] = frozenset(
+    {"MCP_AUTH_TOKEN", "CONTEXTBRIDGE_COMPUTER_TOKEN", "CONTEXTBRIDGE_GOOGLE_CLIENT_SECRET"}
+)
 
 _UNQUOTED_OPERATORS = frozenset("|&<>")
 

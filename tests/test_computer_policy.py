@@ -158,8 +158,10 @@ def test_child_env_strips_credentials(policy, monkeypatch):
 
 def test_gateway_tokens_are_stripped_even_with_empty_env_strip(make_policy, monkeypatch):
     monkeypatch.setenv("MCP_AUTH_TOKEN", "t1")
+    monkeypatch.setenv("CONTEXTBRIDGE_GOOGLE_CLIENT_SECRET", "t2")
     policy = make_policy(commands={"env_strip": []})
-    assert "MCP_AUTH_TOKEN" not in policy.child_env()
+    env = policy.child_env()
+    assert "MCP_AUTH_TOKEN" not in env and "CONTEXTBRIDGE_GOOGLE_CLIENT_SECRET" not in env
 
 
 def test_default_timeout_follows_a_lower_max(make_policy):

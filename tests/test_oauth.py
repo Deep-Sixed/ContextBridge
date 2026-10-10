@@ -33,11 +33,13 @@ from contextbridge.computer.server import (
     SCOPE_WRITE,
     TOOL_SCOPES,
     AuthorizationError,
+    RemoteListenerConfig,
     build_router,
     create_computer_server,
 )
 from contextbridge.computer.server import main as computer_main
 from contextbridge.oauth import totp
+from contextbridge.oauth.google import AUTH_ENDPOINT, TOKEN_ENDPOINT, GoogleLogin, GoogleSettings
 from contextbridge.oauth.provider import RemoteSettings
 from contextbridge.oauth.remote import create_remote_server
 from contextbridge.oauth.store import (
@@ -46,6 +48,7 @@ from contextbridge.oauth.store import (
     OAuthStore,
     token_hash,
 )
+from contextbridge.remote.admin import main as admin_main
 
 PASSPHRASE = "correct horse battery staple"
 REDIRECT = "https://claude.ai/api/mcp/auth_callback"
@@ -137,6 +140,30 @@ def test_repeated_failures_lock_consent_until_unlocked(store):
     assert store.verify_owner(PASSPHRASE, next_code(store)) == "locked"  # even the right credentials
     store.unlock()
     assert store.verify_owner(PASSPHRASE, next_code(store)) is None
+
+
+def test_google_mode_checks_totp_alone_and_pins_the_first_account(store):
+    code = next_code(store)
+    assert store.verify_totp(code) is None
+    assert store.verify_totp(code) == "bad_totp"  # single use, as with the passphrase
+    assert store.state["lockout"]["failures"]  # kept until a Google sign-in completes the approval
+
+    assert store.verify_google_owner("owner@example.com", "sub-1") == (None, True)
+    assert not store.state["lockout"]["failures"]
+    assert store.verify_google_owner("owner@example.com", "sub-1") == (None, False)
+    assert store.verify_google_owner("owner@example.com", "sub-2") == ("google_account_changed", False)
+    assert store.verify_google_owner("new@example.com", "sub-2") == (None, True)  # owner_email changed in config
+
+    store.set_owner(PASSPHRASE, totp.new_secret())  # owner-init --force clears the pin
+    assert "google" not in store.state["owner"]
+
+
+def test_google_failures_count_toward_the_lockout(store):
+    for _ in range(4):
+        assert store.record_failure("wrong_google_account") == "wrong_google_account"
+    assert store.record_failure("wrong_google_account") == "locked"
+    assert store.verify_totp(next_code(store)) == "locked"
+    assert store.verify_google_owner("owner@example.com", "sub-1") == ("locked", False)
 
 
 def _grant(store: OAuthStore, client_id: str = "c1") -> tuple[str, str, str]:
@@ -247,8 +274,7 @@ def test_device_grant_limits_tools_and_listing(policy, tmp_path):
 # --------------------------------------------- authorization server (ASGI)
 
 
-@pytest.fixture
-def remote(policy, tmp_path, store):
+def _remote_app(policy, tmp_path: Path, store: OAuthStore, *, google=None) -> SimpleNamespace:
     audit_path = tmp_path / "audit.jsonl"
     audit = ComputerAuditLog(audit_path, echo=False)
     settings = RemoteSettings(
@@ -256,14 +282,26 @@ def remote(policy, tmp_path, store):
         allow_scopes=(SCOPE_READ, SCOPE_WRITE),
         allow_devices=("local",),
         allowed_redirect_hosts=("claude.ai", "localhost"),
+        google=google,
     )
     server = create_remote_server(build_router(policy, audit=audit), audit=audit, settings=settings, store=store)
+    fake_google = None
+    if google is not None:
+        fake_google = FakeGoogle()
+        server.auth.google = GoogleLogin(
+            google, server.auth.google.redirect_uri, transport=httpx.MockTransport(fake_google.handler)
+        )
     app = server.http_app()
 
     async def client() -> httpx.AsyncClient:
         return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=PUBLIC)
 
-    return SimpleNamespace(client=client, store=store, audit_path=audit_path)
+    return SimpleNamespace(client=client, store=store, audit_path=audit_path, google=fake_google)
+
+
+@pytest.fixture
+def remote(policy, tmp_path, store):
+    return _remote_app(policy, tmp_path, store)
 
 
 async def register(http: httpx.AsyncClient, *, redirect: str = REDIRECT, name: str = "Claude", **extra) -> httpx.Response:
@@ -534,6 +572,243 @@ def test_host_origin_guard(headers, status):
     assert anyio.run(scenario) == status
 
 
+# ------------------------------------------------------ Google sign-in
+
+
+GOOGLE_CLIENT = "1234-test.apps.googleusercontent.com"
+OWNER_EMAIL = "owner@example.com"
+OWNER_SUB = "108000000000000000001"
+GOOGLE = GoogleSettings(client_id=GOOGLE_CLIENT, owner_email=OWNER_EMAIL, client_secret="google-client-secret")
+
+
+def _b64url(value: dict) -> str:
+    return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
+
+
+class FakeGoogle:
+    """Google's token endpoint: checks the code exchange, then answers with an ID token.
+
+    The test sets ``expect`` from the authorization URL (nonce, PKCE challenge) and
+    ``claims`` to override what the ID token says.
+    """
+
+    def __init__(self) -> None:
+        self.expect: dict[str, str] = {}
+        self.claims: dict = {}
+        self.status = 200
+        self.exchanges: list[dict[str, list[str]]] = []
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == TOKEN_ENDPOINT and request.method == "POST"
+        form = parse_qs(request.content.decode())
+        self.exchanges.append(form)
+        if self.status != 200:
+            return httpx.Response(self.status, json={"error": "server_error"})
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(form["code_verifier"][0].encode()).digest()).rstrip(b"=")
+        if challenge.decode() != self.expect["challenge"] or form["code"] != ["google-code"]:
+            return httpx.Response(400, json={"error": "invalid_grant"})
+        now = int(time.time())
+        claims = {
+            "iss": "https://accounts.google.com",
+            "aud": GOOGLE_CLIENT,
+            "azp": GOOGLE_CLIENT,
+            "sub": OWNER_SUB,
+            "email": OWNER_EMAIL,
+            "email_verified": True,
+            "nonce": self.expect["nonce"],
+            "iat": now,
+            "exp": now + 3600,
+            **self.claims,
+        }
+        id_token = f"{_b64url({'alg': 'RS256', 'kid': 'k1'})}.{_b64url(claims)}.c2ln"
+        return httpx.Response(200, json={"access_token": "ya29.x", "id_token": id_token, "token_type": "Bearer"})
+
+
+@pytest.fixture
+def google_remote(policy, tmp_path, store):
+    return _remote_app(policy, tmp_path, store, google=GOOGLE)
+
+
+async def leave_for_google(http, page, store, *, code=None, scopes=(SCOPE_READ,)):
+    data = {**form_fields(page.text), "scope": list(scopes), "device": ["local"], "totp": code or next_code(store),
+            "action": "approve"}
+    return await http.post("/consent", data=data)
+
+
+async def back_from_google(http, remote, leave: httpx.Response, *, params=None, **claims) -> httpx.Response:
+    """Play the owner signing in at Google: Google redirects the browser back with a code."""
+    query = parse_qs(urlsplit(leave.headers["location"]).query)
+    remote.google.expect = {"nonce": query["nonce"][0], "challenge": query["code_challenge"][0]}
+    remote.google.claims = claims
+    params = params or {"code": "google-code", "state": query["state"][0]}
+    return await http.get("/consent/google", params=params)
+
+
+def events(remote) -> list[dict]:
+    return [json.loads(line) for line in remote.audit_path.read_text().splitlines()]
+
+
+def test_google_signin_replaces_the_passphrase(google_remote):
+    async def scenario():
+        async with await google_remote.client() as http:
+            client_id = (await register(http)).json()["client_id"]
+            verifier, page = await start_authorization(http, client_id, scope=f"{SCOPE_READ} {SCOPE_WRITE}")
+            leave = await leave_for_google(http, page, google_remote.store, scopes=(SCOPE_READ, SCOPE_WRITE))
+            back = await back_from_google(http, google_remote, leave)
+            state = parse_qs(urlsplit(leave.headers["location"]).query)["state"][0]
+            replay = await http.get("/consent/google", params={"code": "google-code", "state": state})
+            code = parse_qs(urlsplit(back.headers["location"]).query)["code"][0]
+            tokens = await exchange(http, client_id, verifier, code)
+            return page, leave, back, replay, tokens
+
+    page, leave, back, replay, tokens = anyio.run(scenario)
+    assert 'name="passphrase"' not in page.text and 'name="totp"' in page.text
+    assert "Continue with Google" in page.text and OWNER_EMAIL in page.text
+    form_action = page.headers["content-security-policy"].split("form-action")[1]
+    assert "https://accounts.google.com" in form_action and "https://claude.ai" in form_action
+
+    assert leave.status_code == 303
+    location = urlsplit(leave.headers["location"])
+    assert f"{location.scheme}://{location.netloc}{location.path}" == AUTH_ENDPOINT
+    query = {k: v[0] for k, v in parse_qs(location.query).items()}
+    assert query["client_id"] == GOOGLE_CLIENT and query["redirect_uri"] == PUBLIC + "/consent/google"
+    assert query["response_type"] == "code" and query["scope"] == "openid email"
+    assert query["code_challenge_method"] == "S256" and query["login_hint"] == OWNER_EMAIL
+    assert "access_type" not in query and "prompt" not in query  # sign-in only: no refresh token from Google
+    cookie = leave.headers["set-cookie"].lower()
+    assert "cb_google_signin=" in cookie and "httponly" in cookie and "path=/consent/google" in cookie
+    assert "samesite=lax" in cookie
+
+    assert back.status_code == 302, back.text
+    redirect = urlsplit(back.headers["location"])
+    assert f"{redirect.scheme}://{redirect.netloc}{redirect.path}" == REDIRECT
+    assert parse_qs(redirect.query)["state"] == ["s1"]
+    assert replay.status_code == 400 and "expired or was already used" in replay.text
+    assert tokens.status_code == 200 and tokens.json()["scope"] == f"{SCOPE_READ} {SCOPE_WRITE}"
+
+    (sent,) = google_remote.google.exchanges
+    assert sent["grant_type"] == ["authorization_code"] and sent["client_id"] == [GOOGLE_CLIENT]
+    assert sent["client_secret"] == ["google-client-secret"] and sent["redirect_uri"] == [PUBLIC + "/consent/google"]
+    assert google_remote.store.state["owner"]["google"]["sub"] == OWNER_SUB
+    names = [e["event"] for e in events(google_remote)]
+    for event in ("oauth_google_signin_started", "oauth_google_owner_pinned", "oauth_consent_granted"):
+        assert event in names
+    assert "google-client-secret" not in google_remote.audit_path.read_text()
+
+
+@pytest.mark.parametrize(
+    ("claims", "reason"),
+    [
+        ({"email": "someone.else@example.com"}, "wrong_google_account"),
+        ({"email_verified": False}, "google_email_not_verified"),
+        ({"aud": "another-app.apps.googleusercontent.com"}, "invalid_id_token"),
+        ({"azp": "another-app.apps.googleusercontent.com"}, "invalid_id_token"),
+        ({"iss": "https://accounts.example.com"}, "invalid_id_token"),
+        ({"exp": 1_000_000_000}, "invalid_id_token"),
+        ({"nonce": "from-another-sign-in"}, "invalid_id_token"),
+    ],
+)
+def test_google_signin_refuses_other_accounts_and_bad_id_tokens(google_remote, claims, reason):
+    async def scenario():
+        async with await google_remote.client() as http:
+            client_id = (await register(http)).json()["client_id"]
+            _, page = await start_authorization(http, client_id)
+            leave = await leave_for_google(http, page, google_remote.store)
+            return await back_from_google(http, google_remote, leave, **claims)
+
+    back = anyio.run(scenario)
+    assert back.status_code == 401 and "That Google account cannot approve requests" in back.text
+    assert form_fields(back.text)  # the form is shown again for another try
+    assert not google_remote.store.state["grants"] and not google_remote.store.state["codes"]
+    assert len(google_remote.store.state["lockout"]["failures"]) == 1  # counts toward the lockout
+    assert reason in [e.get("reason") for e in events(google_remote)]
+
+
+def test_a_new_google_account_at_the_owner_address_is_refused(google_remote):
+    async def scenario():
+        async with await google_remote.client() as http:
+            client_id = (await register(http)).json()["client_id"]
+            results = []
+            for sub in (OWNER_SUB, "108999999999999999999"):
+                _, page = await start_authorization(http, client_id)
+                leave = await leave_for_google(http, page, google_remote.store)
+                results.append(await back_from_google(http, google_remote, leave, sub=sub))
+            return results
+
+    first, second = anyio.run(scenario)
+    assert first.status_code == 302 and second.status_code == 401
+    assert google_remote.store.state["owner"]["google"]["sub"] == OWNER_SUB
+    assert "google_account_changed" in [e.get("reason") for e in events(google_remote)]
+
+
+def test_google_signin_needs_the_totp_code_first(google_remote):
+    async def scenario():
+        async with await google_remote.client() as http:
+            client_id = (await register(http)).json()["client_id"]
+            _, page = await start_authorization(http, client_id)
+            wrong = [(await leave_for_google(http, page, google_remote.store, code="000000")).status_code
+                     for _ in range(5)]
+            locked = await leave_for_google(http, page, google_remote.store)
+            return wrong, locked
+
+    wrong, locked = anyio.run(scenario)
+    assert wrong[:4] == [401] * 4 and wrong[4] == 429
+    assert locked.status_code == 429
+    assert not google_remote.google.exchanges  # never left for Google
+
+
+def test_google_callback_needs_the_same_browser_and_a_live_sign_in(google_remote):
+    async def scenario():
+        async with await google_remote.client() as http:
+            client_id = (await register(http)).json()["client_id"]
+            _, page = await start_authorization(http, client_id)
+            unknown = await http.get("/consent/google", params={"code": "google-code", "state": "made-up"})
+            leave = await leave_for_google(http, page, google_remote.store)
+            state = parse_qs(urlsplit(leave.headers["location"]).query)["state"][0]
+            http.cookies.clear()  # Google's answer arrives in a browser that never saw the consent page
+            other_browser = await back_from_google(http, google_remote, leave)
+            again = await http.get("/consent/google", params={"code": "google-code", "state": state})
+            return unknown, other_browser, again
+
+    unknown, other_browser, again = anyio.run(scenario)
+    assert unknown.status_code == 400
+    assert other_browser.status_code == 400 and "browser that opened the approval page" in other_browser.text
+    assert again.status_code == 400  # the sign-in was spent on the wrong browser
+    assert not google_remote.google.exchanges and not google_remote.store.state["codes"]
+
+
+def test_a_cancelled_google_signin_can_be_retried(google_remote):
+    async def scenario():
+        async with await google_remote.client() as http:
+            client_id = (await register(http)).json()["client_id"]
+            _, page = await start_authorization(http, client_id)
+            leave = await leave_for_google(http, page, google_remote.store)
+            state = parse_qs(urlsplit(leave.headers["location"]).query)["state"][0]
+            cancelled = await back_from_google(http, google_remote, leave, params={"error": "access_denied", "state": state})
+            failures = list(google_remote.store.state["lockout"]["failures"])
+            leave = await leave_for_google(http, page, google_remote.store)
+            return cancelled, failures, await back_from_google(http, google_remote, leave)
+
+    cancelled, failures, finished = anyio.run(scenario)
+    assert cancelled.status_code == 400 and "cancelled" in cancelled.text and form_fields(cancelled.text)
+    assert not failures  # cancelling is not a wrong answer
+    assert finished.status_code == 302
+
+
+def test_google_unreachable_is_not_counted_as_a_failure(google_remote):
+    async def scenario():
+        async with await google_remote.client() as http:
+            client_id = (await register(http)).json()["client_id"]
+            _, page = await start_authorization(http, client_id)
+            google_remote.google.status = 500
+            leave = await leave_for_google(http, page, google_remote.store)
+            return await back_from_google(http, google_remote, leave)
+
+    down = anyio.run(scenario)
+    assert down.status_code == 502 and "did not complete" in down.text and form_fields(down.text)
+    assert not google_remote.store.state["lockout"]["failures"] and not google_remote.store.state["codes"]
+
+
 # ------------------------------------------------------------- startup
 
 
@@ -572,11 +847,33 @@ def remote_config(tmp_path, workspace, monkeypatch):
         ({"allow_scopes": []}, "non-empty list"),
         ({"state": None}, "remote.state is required"),
         ({"refresh_token_days": 0}, "refresh_token_days"),
+        ({"google": "yes"}, "remote.google must be a mapping"),
+        ({"google": {"enabled": True, "owner_email": OWNER_EMAIL}}, "remote.google.client_id"),
+        ({"google": {"enabled": True, "client_id": GOOGLE_CLIENT, "owner_email": "owner"}}, "remote.google.owner_email"),
     ],
 )
 def test_remote_misconfiguration_fails_startup(remote_config, remote, message):
     with pytest.raises(SystemExit, match=message):
         computer_main(["--config", remote_config(**remote)])
+
+
+def test_google_signin_needs_its_client_secret_but_the_admin_cli_does_not(remote_config, monkeypatch, capsys):
+    config = Path(remote_config(google={"enabled": True, "client_id": GOOGLE_CLIENT, "owner_email": "Owner@Example.com"}))
+    section = yaml.safe_load(config.read_text(encoding="utf-8"))["remote"]
+    OAuthStore(section["state"]).set_owner(PASSPHRASE, totp.new_secret())
+    monkeypatch.delenv("CONTEXTBRIDGE_GOOGLE_CLIENT_SECRET", raising=False)
+    with pytest.raises(SystemExit, match="CONTEXTBRIDGE_GOOGLE_CLIENT_SECRET is not set"):
+        computer_main(["--config", str(config)])
+    admin_main(["--config", str(config), "oauth-clients"])  # no Google secret in the admin's shell
+    assert "no remote clients registered" in capsys.readouterr().out
+
+    monkeypatch.setenv("CONTEXTBRIDGE_GOOGLE_CLIENT_SECRET", "google-client-secret")
+    remote = RemoteListenerConfig(section, config.parent, config)
+    assert remote.settings().google == GoogleSettings(
+        client_id=GOOGLE_CLIENT, owner_email="owner@example.com", client_secret="google-client-secret"
+    )
+    assert remote.google_redirect_uri == "https://friday.example.ts.net/consent/google"
+    assert "google-client-secret" not in repr(remote.settings())
 
 
 # ------------------------------------------------------------ end to end
