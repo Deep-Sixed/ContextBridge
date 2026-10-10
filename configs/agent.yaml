@@ -30,3 +30,7 @@ processes:
 # Phase 2: window titles can reveal sensitive information. Disabled unless opted in.
 desktop:
   observe: false
+
+# Phase 3: inventory only; recording and playback are not supported.
+media:
+  discover: false

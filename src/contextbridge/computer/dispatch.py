@@ -13,7 +13,7 @@ from typing import Any
 
 from pydantic import ValidationError, validate_call
 
-from . import commands, files, desktop
+from . import commands, files, desktop, media
 from .commands import ExitCallback, SessionManager
 from .policy import ComputerPolicy, PolicyViolation
 from .system import system_info
@@ -26,9 +26,10 @@ COMMAND_TOOLS = frozenset(
     {"run_command", "start_process", "read_process_output", "interact_with_process", "force_terminate", "list_sessions"}
 )
 DESKTOP_TOOLS = frozenset({"list_windows"})
+MEDIA_TOOLS = frozenset({"media_inventory"})
 PROCESS_LIST_TOOL = "list_processes"
 PROCESS_KILL_TOOL = "kill_process"
-ENGINE_TOOLS = READ_TOOLS | WRITE_TOOLS | COMMAND_TOOLS | DESKTOP_TOOLS | {PROCESS_LIST_TOOL, PROCESS_KILL_TOOL}
+ENGINE_TOOLS = READ_TOOLS | WRITE_TOOLS | COMMAND_TOOLS | DESKTOP_TOOLS | MEDIA_TOOLS | {PROCESS_LIST_TOOL, PROCESS_KILL_TOOL}
 
 
 class InvalidArguments(ValueError):
@@ -49,6 +50,8 @@ def available_tools(policy: ComputerPolicy) -> frozenset[str]:
         names |= WRITE_TOOLS
     if policy.commands_enabled:
         names |= COMMAND_TOOLS
+    if policy.media_discover:
+        names |= MEDIA_TOOLS
     if policy.desktop_observe:
         names |= DESKTOP_TOOLS
     if policy.list_processes:
@@ -200,6 +203,11 @@ def _force_terminate(engine: Any, session_id: str) -> dict[str, Any]:
 @_handler("list_sessions")
 def _list_sessions(engine: Any) -> dict[str, Any]:
     return {"sessions": engine.sessions.list()}
+
+
+@_handler("media_inventory")
+def _media_inventory(engine: Any) -> dict[str, Any]:
+    return media.media_inventory(authorized=engine.policy.media_discover)
 
 
 @_handler("list_windows")
