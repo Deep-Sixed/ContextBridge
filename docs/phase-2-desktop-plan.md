@@ -2,7 +2,7 @@
 
 ContextBridge remains a transport and enforcement layer. AI clients may request explicitly authorized desktop capabilities; the host agent executes and audits them.
 
-## Phase 2a (this PR): window inventory foundation
+## Phase 2a: window inventory foundation (implemented)
 
 - Add `contextbridge.computer.desktop.list_windows(authorized=False)`.
 - Deny by default. The host must opt in before invoking discovery.
@@ -12,7 +12,7 @@ ContextBridge remains a transport and enforcement layer. AI clients may request 
 
 ## Delivery milestones
 
-1. Host-policy permission `desktop:observe`; include window inventory in the audited engine and MCP surface. **Implemented in this branch.**
+1. Host-policy permission `desktop:observe`; include window inventory in the audited engine and MCP surface. **Implemented.**
 2. OS-aware session discovery: Windows interactive desktop vs service session; Linux Wayland/X11 with explicit user-session authorization.
 3. Screen capture with permission controls, bounded data size and no unattended capture by default.
 4. Input interaction (`desktop:act`) separately authorized for cursor/keyboard and window controls, requiring an interactive session.

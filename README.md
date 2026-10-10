@@ -8,7 +8,7 @@ It has three routes, each with its own server, port, and credential:
 |---|---|---|---|
 | Knowledge (UGA) | `uga.gateway` | `search`, `fetch` over approved JSONL records | `MCP_AUTH_TOKEN` |
 | Filesystem | `uga.fs_gateway` | file tools inside configured directories (see [Filesystem route](#filesystem-route)) | `CONTEXTBRIDGE_FS_AUTH_TOKEN` |
-| Computer | `contextbridge.computer` | files, commands, sessions, processes | `CONTEXTBRIDGE_COMPUTER_TOKEN` |
+| Computer | `contextbridge.computer` | files, search, documents, commands, sessions, processes, devices; opt-in window and media inventory | `CONTEXTBRIDGE_COMPUTER_TOKEN` |
 
 Being able to read knowledge never grants file or computer access. Each route accepts only its own token. The computer route won't start if its token matches `MCP_AUTH_TOKEN`, and the filesystem route checks the same when both are set in its environment.
 
@@ -148,7 +148,6 @@ Each search runs in its own worker process (`src/uga/fs_search_worker.py`, start
 
 **Audit:** lines go to stderr and to `CONTEXTBRIDGE_FS_AUDIT_LOG` (or `serve.audit_log`, resolved against the config file's directory) with `route: "fs"`. As on the gateway, each request is one line, and `X-Forwarded-For` is ignored unless `serve.forwarded_allow_ips` lists the proxy. Paths are logged as the client sent them, with byte counts for reads and writes and the trash location for deletes. Refused paths are logged with `detail: "path_denied"`. Search events include `search_id` and result counts; patterns are logged only by length and hash.
 
-
 **Known limits:** checks run before each operation, so another local process that swaps a symlink in between can still redirect it; only the final component is opened with `O_NOFOLLOW`. Likewise, a destination created between `move_file`'s check and the rename is replaced. Hard links that already exist inside a root are not detected.
 
 ## Computer route
@@ -160,12 +159,14 @@ The computer route serves files, search, commands, processes, and documents on t
 | `list_directory`, `read_file`, `get_file_info`, `search_files`, `search_code`, `get_system_info` | always (read-only) |
 | `write_file`, `edit_block`, `create_directory`, `move_file` | `filesystem.writable_roots` is non-empty |
 | `delete_file` | writable roots, and `filesystem.delete` is `trash` (default) or `permanent` |
-| `list_deleted`, `restore_deleted` | `filesystem.delete: trash` |
+| `list_deleted`, `restore_deleted` | writable roots, and `filesystem.delete: trash` |
 | `read_document` | always (read-only) |
 | `write_document`, `edit_document`, `write_spreadsheet`, `edit_pdf` | `filesystem.writable_roots` is non-empty |
 | `run_command`, `start_process`, `read_process_output`, `interact_with_process`, `force_terminate`, `list_sessions` | `commands.mode` is not `disabled` |
 | `list_processes` | `processes.list: true` |
 | `kill_process` | `processes.allow_kill: true` |
+| `list_windows` | `desktop.observe: true` (see [Desktop and media inventory](#desktop-and-media-inventory)) |
+| `media_inventory` | `media.discover: true` |
 | `list_devices` | always |
 
 ### Running it
@@ -179,7 +180,6 @@ export CONTEXTBRIDGE_COMPUTER_TOKEN="$(openssl rand -hex 32)"   # keep it in you
 
 Local MCP clients connect with the token as a bearer header. For example, in Claude Code:
 
-
 ```sh
 claude mcp add --transport http contextbridge http://127.0.0.1:8791/mcp \
   --header "Authorization: Bearer $CONTEXTBRIDGE_COMPUTER_TOKEN"
@@ -191,7 +191,7 @@ There is no unauthenticated mode. Every MCP request is checked against the token
 
 These checks run on **every tool call**, at the moment it executes:
 
-1. **Token scope.** The bearer token must carry the tool's scope: `computer:read` (file reading, search, system info, process listing, `list_devices`), `computer:write` (file changes), `computer:execute` (commands and sessions), or `computer:process` (`kill_process`). `auth.scopes` in the config sets what the token carries. Tools outside those scopes are hidden from the tool list and refused if called anyway.
+1. **Token scope.** The bearer token must carry the tool's scope: `computer:read` (file reading, search, system info, process listing, `list_devices`), `computer:write` (file changes), `computer:execute` (commands and sessions), `computer:process` (`kill_process`), `desktop:observe` (`list_windows`), or `media:discover` (`media_inventory`). `auth.scopes` in the config sets what the token carries; without it the token carries all six, but the shipped `configs/computer.yaml` grants only the four `computer:*` scopes. Tools outside those scopes are hidden from the tool list and refused if called anyway.
 2. **Device.** A remote (OAuth) client may only use the devices its grant names. The local token reaches every device. The device must exist and be online. Its policy must enable the tool. A remote device must also have been granted the tool's scope when it was paired.
 3. **Policy checks.** The device's engine re-validates every path, command, working directory, and limit before acting. For a remote device, that's the agent on that machine, under its own policy.
 
@@ -199,7 +199,7 @@ These checks run on **every tool call**, at the moment it executes:
 
 - **Paths.** Every path resolves through symlinks before it is checked, so neither `..` nor a symlink can escape `filesystem.roots`. Writes are allowed only inside `filesystem.writable_roots`. Any path with a component matching a `deny` glob (`.ssh`, `.env*`, `*.pem`, `*.kdbx`, and so on) is hidden from listings and searches and refused for reads and writes. The policy file and the audit log can never be written or moved through ContextBridge.
 - **Limits.** Reads, writes, search results, and search time all have caps. Rewrites are atomic and preserve file mode. `edit_block` fails unless the match count is exactly what the caller expected.
-- **Commands.** `allowlist` mode runs one program per call without a shell. The program must be on the allowlist, and pipes, redirects, `;` and `&&` are refused before anything runs. `unrestricted` mode runs through `bash -c`. The working directory must be inside a readable root. Every command has a hard timeout (`max_timeout_seconds` caps whatever the caller asks for), and a timed-out command is killed along with every process it started. Output is capped in memory, keeping the head and the tail. Variables that look like credentials (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`, …) are removed from the child's environment, and both gateway tokens are always removed.
+- **Commands.** `allowlist` mode runs one program per call without a shell. The program must be on the allowlist, and pipes, redirects, `;` and `&&` are refused before anything runs. `unrestricted` mode runs through `bash -c`. The working directory must be inside a readable root. Every command has a hard timeout (`max_timeout_seconds` caps whatever the caller asks for), and a timed-out command is killed along with every process it started. Output is capped in memory, keeping the head and the tail. Variables that look like credentials (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`, …) are removed from the child's environment. `MCP_AUTH_TOKEN` and `CONTEXTBRIDGE_COMPUTER_TOKEN` are always removed, even with a custom `env_strip` list; `CONTEXTBRIDGE_FS_AUTH_TOKEN` is removed only by a `*TOKEN*`-style pattern.
 - **Sessions.** `start_process` runs long or interactive programs in the background. Concurrent sessions are capped (`max_sessions`) and each is killed when it reaches `max_session_seconds`.
 - **Deletes.** `delete_file` works only inside writable roots. It never deletes a root, a protected or hidden path, or a folder holding anything the file tools may not see (a `.ssh` or `.env` inside, say). A non-empty folder needs `recursive: true` and is capped at `max_delete_entries` (10,000).
   - **`delete: trash` (default):** the item moves to `.contextbridge-trash/<trash_id>/` in its writable root, beside a `<trash_id>.json` record of where it came from. `list_deleted` shows the trash and `restore_deleted` puts an item back, but no file tool can read, change, or empty the trash, so a client cannot make its own deletions permanent. Empty it on the host. The layout is the [filesystem route](#filesystem-route)'s, so a folder both routes serve has one trash.
@@ -224,6 +224,15 @@ Documents go through the same path policy as every file tool. Files over `max_do
 
 **Know the boundary.** The command allowlist controls *which programs* run, not *what they touch*. `git diff --no-index` can read any file the OS user can, for example, and allowing a shell or an interpreter makes allowlist mode equivalent to unrestricted. The filesystem deny list applies to the file tools, not to commands. For a hard boundary, run the computer route as a dedicated OS user that can only reach what you intend to share.
 
+### Desktop and media inventory
+
+Both tools are off by default and only report; neither captures the screen, sends input, records, or plays anything. Each needs the device policy switch and the token scope.
+
+- **`list_windows`** (`desktop.observe: true`, scope `desktop:observe`) returns up to 200 visible windows, each with an `id` and a `title` cut to 256 characters. Window titles can reveal what you are working on. On Windows it lists visible top-level windows of the interactive desktop. On Linux it needs a graphical session (`DISPLAY` or `WAYLAND_DISPLAY`) and `wmctrl`; without them the call fails.
+- **`media_inventory`** (`media.discover: true`, scope `media:discover`) returns device-count hints, never opening a device: on Linux the number of `/dev/video*` nodes, on Windows the number of audio input and output devices. Counts it cannot get are `null`, and a count is not proof that a device works.
+
+`docs/phase-2-desktop-plan.md` describes the planned next steps (session discovery, screen capture, input), none of which exist yet.
+
 ### Audit trail
 
 Each tool call writes a sequence of JSONL events that share a `request_id`:
@@ -246,14 +255,15 @@ Other machines join as **devices**. Each runs a small agent that dials *out* to 
 ```
  MCP client ──HTTP+token──▶ gateway (Friday) ◀──WSS, outbound──  agent (Thanatos)
             127.0.0.1:8791   agents listener    Ed25519 identity   own policy + audit
-                             LAN/Tailscale IP   pinned TLS cert
+                             Tailscale IP       pinned TLS cert
 ```
 
 ### Setting up a device
 
 On the gateway host, enable the `agents` section of `configs/computer.yaml`:
 - set `enabled: true`;
-- set `host` to the gateway's LAN or Tailscale IP;
+- set `host` to the gateway's Tailscale IP;
+- set `tailnet_node_ids` to the Tailscale node IDs of the machines allowed to connect (`Peer[*].ID` in `tailscale status --json` on the gateway). The gateway won't start with a non-loopback `host` and an empty list;
 - keep `tls_cert`, `tls_key` and `registry` pointing at files under `state/`.
 
 Then:
@@ -288,6 +298,7 @@ Pairing is deliberately an admin CLI on the gateway host and not an MCP tool, so
 
 ### How the channel is secured
 
+- **Tailnet admission.** Unless the listener is on loopback, every connection is checked against the gateway's own `tailscale status --json` before anything else: the peer must be online and its Tailscale IP must belong to exactly one node in `agents.tailnet_node_ids`. A machine reaching the listener over a plain LAN address is refused, as is everything when `tailscale` can't be queried.
 - **Enrollment.** `pair` issues a random 80-bit code that is stored only as a hash, expires (15 minutes by default), and works once. The code fixes the device's name and scopes. The agent generates an Ed25519 key, and only the public half is sent and registered.
 - **Authentication on every connection.** The gateway sends a fresh 32-byte nonce. The agent signs it, bound to the device id and the gateway id. Unknown, revoked, or wrongly signed devices are refused. Agents refuse a gateway whose id differs from the one they enrolled with.
 - **Encryption.**
@@ -301,7 +312,7 @@ Pairing is deliberately an admin CLI on the gateway host and not an MCP tool, so
 - **Secrets stay hidden.** The local device can never read the TLS private key or the device registry, and an agent can never read its own identity file.
 - **Audit on both sides.**
   - **Shared request ids.** A remote call carries the same `request_id` in the gateway's audit log and the agent's.
-  - **Gateway events.** The gateway's log also records `device_enrolled`, `device_connected`, `device_disconnected`, `device_auth_failed`, `device_duplicate_refused`, `device_revoked`, and `device_heartbeat_lost`.
+  - **Gateway events.** The gateway's log also records `device_enrolled`, `device_enroll_rejected`, `device_connected`, `device_disconnected`, `device_auth_failed`, `device_duplicate_refused`, `device_revoked`, `device_heartbeat_lost`, and `tailnet_admission_denied`.
   - **`started` comes from the agent.** The agent reports `started` only after its own checks pass and its own log has recorded it.
 
 ### Windows devices (Thanatos)
@@ -408,7 +419,7 @@ contextbridge-admin --config configs/computer.yaml oauth-unlock               # 
   - **Registration:** Dynamic Client Registration, accepted only for HTTPS redirect URIs on `remote.allowed_redirect_hosts` (Claude and ChatGPT by default).
   - **PKCE:** S256 is required.
   - **Bound tokens:** tokens are tied to this server's `/mcp` resource.
-- **Tokens.** Access tokens are opaque and short-lived (60 minutes by default). Refresh tokens rotate on every use, and presenting an already-rotated refresh token revokes the client's whole grant.
+- **Tokens.** Access tokens are opaque and short-lived (60 minutes by default). Refresh tokens rotate on every use, and presenting an already-rotated refresh token revokes the client's whole grant. A client that doesn't refresh for `refresh_token_days` (30 by default) must be approved again.
   - **Hashed at rest.** Codes and tokens are stored only as SHA-256 hashes, in a 0600 state file the file tools can never read.
   - **Live revocation.** A revocation from the CLI applies to the very next request.
 - **Separate listeners.**
@@ -492,7 +503,7 @@ No route depends on Authentik.
 - **Computer MCP endpoints:** refuse any non-loopback address; there is no override.
   - **Local listener (8791):** accepts only the static token.
   - **Remote listener (8793):** accepts only OAuth tokens. It is meant to be published only through a TLS tunnel.
-- **Agent listener:** TLS-only, limited to private addresses, and accepts only enrolled devices.
+- **Agent listener:** TLS-only, limited to private addresses, and accepts only enrolled devices, which, unless the listener is on loopback, must connect from a Tailscale node listed in `agents.tailnet_node_ids`.
 
 Do not forward ports 8790, 8791, 8792, or 8794 to the internet. Publish 8793 only through a TLS tunnel, and only once `owner-init` is done.
 
@@ -508,9 +519,9 @@ Do not forward ports 8790, 8791, 8792, or 8794 to the internet. Publish 8793 onl
 
 ## Documentation
 
-The PDFs in `docs/` are planning documents. The filesystem and computer routes implement the roadmap's filesystem operations; the filesystem route now also offers asynchronous file and content search. The computer route covers search, commands, processes, remote devices, documents (PDF, Word, Excel) and native recoverable delete. Synchronization remains unimplemented. The read-only knowledge route rejects these operations. The documents refer to Friday (Linux) and Thanatos (Windows).
+The files in `docs/` are planning documents. The filesystem and computer routes implement the roadmap's filesystem operations; the filesystem route now also offers asynchronous file and content search. The computer route covers search, commands, processes, remote devices, documents (PDF, Word, Excel) and native recoverable delete. Synchronization remains unimplemented. The read-only knowledge route rejects these operations. The documents refer to Friday (Linux) and Thanatos (Windows).
 
-
+- `docs/phase-2-desktop-plan.md` plans desktop interaction. Its first step, `list_windows`, is implemented (see [Desktop and media inventory](#desktop-and-media-inventory)); the rest is not. Its phase numbers are its own and don't match the [Roadmap](#roadmap) above.
 - `docs/capability-roadmap.pdf` lists the capabilities ContextBridge targets, with an implementation checklist. The checklist is a blank tracker, not a status report. It is generated by `scripts/build-roadmap-pdf.py`.
 - `docs/computer-use-linux-review.pdf` evaluates `agent-sh/computer-use-linux` as a Linux desktop-control engine for ContextBridge. It is generated by `scripts/build-review-pdf.py`.
 
@@ -525,6 +536,8 @@ python3 -m pip install -e '.[docs]'
 ## Status
 
 The knowledge route is a standalone extraction from an archived UGA (Unidirectional Gateway Appliance) implementation. That is why the package is `uga`, environment variables start with `UGA_`, the gateway's default name is `Nexus UGA`, and its timeout errors say "Nexus Datacore". Authentication-front/sidecar deployments and systemd services were intentionally left out. No route is production-validated yet.
+
+`src/contextbridge/projects.py` (a project-to-host-to-repository registry, see `configs/projects.example.yaml`) and `src/contextbridge/task_ledger.py` (a SQLite ledger of task states) are library foundations: no route, tool, or CLI uses them yet, and neither grants any access.
 
 ## License
 
