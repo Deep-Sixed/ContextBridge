@@ -1,7 +1,6 @@
-"""Failover drill: prove ContextBridge serves every device with Desktop Commander stopped.
+"""Failover drill: prove ContextBridge serves every device with its own gateway and agents.
 
-Run it on the gateway host after stopping Desktop Commander (its MCP server, its
-remote agent, and anything launched through ``npx``):
+Run it on the gateway host, with the gateway and each remote agent running:
 
     export CONTEXTBRIDGE_COMPUTER_TOKEN=...          # the local listener's token
     contextbridge-failover --config configs/computer.yaml            # read-only probes
@@ -9,10 +8,8 @@ remote agent, and anything launched through ``npx``):
 
 It checks, and prints PASS / FAIL / SKIP for each item:
 
-1. **Desktop Commander is not running** on this machine (no process whose
-   command line names it).
-2. **The gateway answers** over MCP with the computer tool surface.
-3. **Every device** (``local`` and each enrolled agent, or those named with
+1. **The gateway answers** over MCP with the computer tool surface.
+2. **Every device** (``local`` and each enrolled agent, or those named with
    ``--device``) is online and serves its tools: system info, directory
    listing, file search, a file read, a harmless command run both directly and
    as a session, and process listing. ``--write`` adds create, write, edit,
@@ -31,7 +28,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
 import time
 from collections.abc import Awaitable, Callable
@@ -52,72 +48,12 @@ from .computer.server import (
 
 DEFAULT_URL = "http://127.0.0.1:8791/mcp"
 PROBE_DIR = ".contextbridge-failover"
-# Desktop Commander's npm scope (first) and package and program names: MCP server and remote agent.
-DC_MARKERS = ("@wonderwhy-er", "desktop-commander", "desktopcommander", "claude-server-commander")
 # Commands that only report on the machine; the drill runs the first one the device allows.
 PROBE_COMMANDS = ("hostname", "whoami", "uname", "pwd", "date")
 CALL_TIMEOUT_SECONDS = 60
 SMALL_FILE_BYTES = 64 * 1024
 
 PASS, FAIL, SKIP = "pass", "fail", "skip"
-
-
-@dataclass(frozen=True)
-class Parity:
-    """How ContextBridge covers one Desktop Commander tool."""
-
-    kind: str  # "same": same tool; "equivalent": other tools do it; "omitted": deliberately not a tool; "gap"
-    tools: tuple[str, ...] = ()
-    note: str = ""
-
-
-# Every tool Desktop Commander exposes (local MCP server and Remote: the 31 in its
-# inventory, since reworked into docs/capability-roadmap.pdf) and its ContextBridge
-# counterpart. The failover acceptance test exercises every tool named here on a
-# local and a remote device.
-DESKTOP_COMMANDER_PARITY: dict[str, Parity] = {
-    # filesystem
-    "read_file": Parity("same", ("read_file",), "offset, negative offset (tail), and length"),
-    "read_multiple_files": Parity("equivalent", ("read_file",), "one read_file call per file"),
-    "write_file": Parity("same", ("write_file",), "atomic rewrite or append"),
-    "edit_block": Parity("same", ("edit_block",), "exact replacement; refuses an unexpected match count"),
-    "create_directory": Parity("same", ("create_directory",)),
-    "list_directory": Parity("same", ("list_directory",), "recursive to depth 5"),
-    "move_file": Parity("same", ("move_file",)),
-    "get_file_info": Parity("same", ("get_file_info",)),
-    # search
-    "start_search": Parity("equivalent", ("search_files", "search_code"), "synchronous, capped by result count and time"),
-    "get_more_search_results": Parity("equivalent", ("search_files", "search_code"), "raise max_results or narrow the path"),
-    "stop_search": Parity("omitted", (), "searches finish within max_search_seconds; nothing runs in the background"),
-    "list_searches": Parity("omitted", (), "no background searches exist"),
-    # terminal
-    "start_process": Parity("same", ("start_process", "run_command"), "run_command for one-shot commands"),
-    "read_process_output": Parity("same", ("read_process_output",)),
-    "interact_with_process": Parity("same", ("interact_with_process",)),
-    "force_terminate": Parity("same", ("force_terminate",), "kills the whole process tree"),
-    "list_sessions": Parity("same", ("list_sessions",)),
-    # processes
-    "list_processes": Parity("same", ("list_processes",)),
-    "kill_process": Parity("same", ("kill_process",), "only where the device's policy sets allow_kill"),
-    # documents
-    "write_pdf": Parity(
-        "equivalent", ("write_document", "edit_pdf"), "write_document creates PDFs; edit_pdf deletes, rotates, inserts pages"
-    ),
-    # remote devices
-    "list_devices": Parity("same", ("list_devices",), "online state, last seen, tools, and policy"),
-    "ping": Parity("equivalent", ("list_devices",), "online state from heartbeats"),
-    "shutdown": Parity("omitted", (), "on the host: contextbridge-admin revoke, or stop the agent's service"),
-    "who_am_i": Parity("gap", (), "the caller's client id is recorded in the audit log, not returned"),
-    # configuration
-    "get_config": Parity("equivalent", ("get_system_info", "list_devices"), "each device's policy summary"),
-    "set_config_value": Parity("omitted", (), "policy changes only on the host, so a client cannot widen its own access"),
-    # monitoring
-    "get_usage_stats": Parity("omitted", (), "the host's JSONL audit log records every call"),
-    "get_recent_tool_calls": Parity("omitted", (), "the host's JSONL audit log records every call"),
-    "get_tool_result": Parity("omitted", (), "calls complete within call_timeout_seconds; none is left pending"),
-    "list_remote_tool_calls": Parity("omitted", (), "calls complete within call_timeout_seconds; none is left pending"),
-    "give_feedback_to_desktop_commander": Parity("omitted", (), "Desktop Commander product feedback"),
-}
 
 
 @dataclass
@@ -141,18 +77,12 @@ class DeviceReport:
 @dataclass
 class Report:
     url: str
-    desktop_commander: Check
     gateway: Check
     devices: list[DeviceReport] = field(default_factory=list)
 
     @property
     def ready(self) -> bool:
-        return (
-            self.desktop_commander.status == PASS
-            and self.gateway.status == PASS
-            and bool(self.devices)
-            and all(d.ok for d in self.devices)
-        )
+        return self.gateway.status == PASS and bool(self.devices) and all(d.ok for d in self.devices)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -160,56 +90,6 @@ class Report:
         for device, report in zip(data["devices"], self.devices):
             device["ok"] = report.ok
         return data
-
-
-# --------------------------------------------------------- Desktop Commander
-
-
-def names_desktop_commander(name: str, argv: list[str]) -> bool:
-    """Whether a process is Desktop Commander, judged by how it is launched.
-
-    ``npx <scope>/desktop-commander``, ``node .../desktop-commander/dist/index.js``, or an
-    installed ``desktop-commander`` program. Only argv elements without whitespace count:
-    a shell script or ``python -c`` code that merely mentions the name is not Desktop Commander.
-    """
-    scope, *names = DC_MARKERS
-    for token in (name, *argv):
-        token = (token or "").strip().strip("\"'").lower()
-        if not token or any(ch.isspace() for ch in token):
-            continue
-        if token.startswith(scope):
-            return True
-        for part in re.split(r"[\\/]", token):
-            if part.startswith(scope) or part in names or part.rsplit(".", 1)[0] in names:
-                return True
-    return False
-
-
-def desktop_commander_processes(*, exclude: set[int] | None = None) -> list[dict[str, Any]]:
-    """Running processes that are Desktop Commander (see :func:`names_desktop_commander`)."""
-    import psutil
-
-    skip = {os.getpid(), *(exclude or set())}
-    found = []
-    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
-        try:
-            if proc.info["pid"] in skip:
-                continue
-            argv = proc.info.get("cmdline") or []
-            name = proc.info.get("name") or ""
-        except (psutil.Error, OSError):
-            continue
-        if names_desktop_commander(name, argv):
-            found.append({"pid": proc.info["pid"], "name": proc.info.get("name"), "cmdline": " ".join(argv)[:200]})
-    return found
-
-
-def check_desktop_commander() -> Check:
-    running = desktop_commander_processes()
-    if not running:
-        return Check("desktop_commander", PASS, "not running")
-    listed = "; ".join(f"pid {p['pid']}: {p['cmdline'] or p['name']}" for p in running)
-    return Check("desktop_commander", FAIL, f"still running ({listed}); stop it for a real failover test")
 
 
 # ------------------------------------------------------------------- probes
@@ -405,7 +285,7 @@ async def run_drill(
     from fastmcp import Client
     from fastmcp.client.auth import BearerAuth
 
-    report = Report(url=url, desktop_commander=check_desktop_commander(), gateway=Check("gateway", FAIL))
+    report = Report(url=url, gateway=Check("gateway", FAIL))
     try:
         async with Client(url, auth=BearerAuth(token), timeout=CALL_TIMEOUT_SECONDS) as client:
             tools = {t.name for t in await client.list_tools()}
@@ -437,7 +317,6 @@ def render(report: Report) -> str:
     def row(label: str, check: Check, indent: str = "") -> None:
         lines.append(f"{indent}{marks[check.status]:<5} {label:<18} {check.detail}")
 
-    row("Desktop Commander", report.desktop_commander)
     row("gateway", report.gateway)
     for device in report.devices:
         lines.append("")
@@ -447,7 +326,7 @@ def render(report: Report) -> str:
     lines.append("")
     names = ", ".join(d.device for d in report.devices) or "no devices"
     if report.ready:
-        lines.append(f"READY: ContextBridge serves {names} with Desktop Commander stopped.")
+        lines.append(f"READY: ContextBridge serves {names}.")
     else:
         lines.append("NOT READY: fix the FAIL lines above and run the drill again.")
     return "\n".join(lines)
@@ -462,9 +341,7 @@ def _url_from_config(path: str) -> str:
 
 
 def main(argv: list[str] | None = None) -> None:
-    ap = argparse.ArgumentParser(
-        description="Check that ContextBridge serves every device with Desktop Commander stopped."
-    )
+    ap = argparse.ArgumentParser(description="Check that ContextBridge serves every device.")
     target = ap.add_mutually_exclusive_group()
     target.add_argument("--config", help="gateway config (reads serve.host and serve.port)")
     target.add_argument("--url", help=f"computer MCP endpoint (default {DEFAULT_URL})")

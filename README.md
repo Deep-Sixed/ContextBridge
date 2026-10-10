@@ -1,6 +1,6 @@
 # ContextBridge
 
-A self-hosted MCP gateway that gives AI assistants authenticated, policy-controlled access to approved knowledge and to your own computers. ContextBridge has no runtime dependency on Desktop Commander or any hosted relay, so it keeps working if those go away or lose their permissions.
+A self-hosted MCP gateway that gives AI assistants authenticated, policy-controlled access to approved knowledge and to your own computers. ContextBridge has no runtime dependency on any hosted relay: its own gateway, agents, and transport do the work.
 
 It has three routes, each with its own server, port, and credential:
 
@@ -21,7 +21,7 @@ python3 -m pip install -e '.[test]'
 python3 -m pytest        # includes acceptance tests that launch the gateways and an agent as real processes
 ```
 
-ContextBridge requires Python 3.11+ and FastMCP 3.x (`fastmcp>=3,<4`). It has no runtime dependency on Desktop Commander, Node, or npx, and the acceptance tests run both gateways in an environment without them.
+ContextBridge requires Python 3.11+ and FastMCP 3.x (`fastmcp>=3,<4`). It has no runtime dependency on Node or npx, and the acceptance tests run both gateways in an environment without them.
 
 `tests/test_contract.py` pins the knowledge route's MCP contract: the exact tool set, annotations, input schemas, reported version, server instructions, and policy denial. `tests/test_entrypoint.py` starts the real `python -m uga.gateway` entrypoint and checks bearer auth over HTTP. `tests/test_fs.py` covers the filesystem operations and path rules, and `tests/test_fs_gateway.py` pins the filesystem route's MCP contract and starts its entrypoint. CI runs the whole suite on Ubuntu and Windows, with Python 3.11 against the oldest supported FastMCP (3.0.0) and Python 3.13 against the newest 3.x release.
 
@@ -153,20 +153,20 @@ Each search runs in its own worker process (`src/uga/fs_search_worker.py`, start
 
 ## Computer route
 
-The computer route is an independent replacement for Desktop Commander's tools, including its remote-machine support. Every tool takes a `device` argument: `local` (the gateway's own machine, the default) or the name of an enrolled remote device (see [Remote devices](#remote-devices)). `list_devices` shows what is reachable. A tool is offered only when some device's policy enables it:
+The computer route serves files, search, commands, processes, and documents on the gateway's own machine and on enrolled remote devices. Every tool takes a `device` argument: `local` (the gateway's own machine, the default) or the name of an enrolled remote device (see [Remote devices](#remote-devices)). `list_devices` shows what is reachable. A tool is offered only when some device's policy enables it:
 
-| Tool | Desktop Commander equivalent | Enabled on a device when |
-|---|---|---|
-| `list_directory`, `read_file`, `get_file_info`, `search_files`, `search_code`, `get_system_info` | same names / `get_config` | always (read-only) |
-| `write_file`, `edit_block`, `create_directory`, `move_file` | same names | `filesystem.writable_roots` is non-empty |
-| `delete_file` | none (Desktop Commander deletes through commands) | writable roots, and `filesystem.delete` is `trash` (default) or `permanent` |
-| `list_deleted`, `restore_deleted` | none | `filesystem.delete: trash` |
-| `read_document` | `read_file` on PDF and Excel files | always (read-only) |
-| `write_document`, `edit_document`, `write_spreadsheet`, `edit_pdf` | `write_pdf`; Excel and Word editing | `filesystem.writable_roots` is non-empty |
-| `run_command`, `start_process`, `read_process_output`, `interact_with_process`, `force_terminate`, `list_sessions` | same names (`run_command` is a one-shot convenience) | `commands.mode` is not `disabled` |
-| `list_processes` | same | `processes.list: true` |
-| `kill_process` | same | `processes.allow_kill: true` |
-| `list_devices` | remote device list | always |
+| Tool | Enabled on a device when |
+|---|---|
+| `list_directory`, `read_file`, `get_file_info`, `search_files`, `search_code`, `get_system_info` | always (read-only) |
+| `write_file`, `edit_block`, `create_directory`, `move_file` | `filesystem.writable_roots` is non-empty |
+| `delete_file` | writable roots, and `filesystem.delete` is `trash` (default) or `permanent` |
+| `list_deleted`, `restore_deleted` | `filesystem.delete: trash` |
+| `read_document` | always (read-only) |
+| `write_document`, `edit_document`, `write_spreadsheet`, `edit_pdf` | `filesystem.writable_roots` is non-empty |
+| `run_command`, `start_process`, `read_process_output`, `interact_with_process`, `force_terminate`, `list_sessions` | `commands.mode` is not `disabled` |
+| `list_processes` | `processes.list: true` |
+| `kill_process` | `processes.allow_kill: true` |
+| `list_devices` | always |
 
 ### Running it
 
@@ -423,13 +423,13 @@ contextbridge-admin --config configs/computer.yaml oauth-unlock               # 
 - **Keep remote clients read-only** unless you need more, and prefer `allowlist` mode.
 - **Device names are visible.** The consent page shows the names of the devices you allow remotely to anyone who starts an authorization.
 
-## Failover: running with Desktop Commander stopped
+## Failover
 
-This is what ContextBridge exists for: if Desktop Commander goes away, or loses its permissions, its functions stay available through ContextBridge's own gateway, agents, permissions, and transport.
+ContextBridge serves every device through its own gateway, agents, permissions, and transport. The failover drill checks that on a live deployment, and CI checks it on a jailed one.
 
 ### The failover drill
 
-Run the drill on the gateway host (Friday) after stopping Desktop Commander everywhere: its MCP server entry in your AI clients, its remote agent on each machine, and anything started with `npx @wonderwhy-er/desktop-commander`. Keep the ContextBridge gateway and the Thanatos agent running.
+Run the drill on the gateway host (Friday) with the ContextBridge gateway and the Thanatos agent running.
 
 ```sh
 export CONTEXTBRIDGE_COMPUTER_TOKEN=...                                      # the local listener's token
@@ -440,9 +440,8 @@ contextbridge-failover --config configs/computer.yaml --device thanatos --json
 
 It prints PASS, FAIL, or skip for each check:
 
-1. **Desktop Commander is not running.** No process on the gateway host has a command line naming it. While one does, the drill reports NOT READY.
-2. **The gateway answers.** It serves the computer tool surface over MCP, using your token.
-3. **Every device is online and working.** By default that is `local` plus each enrolled agent; `--device` limits it. On each device the drill runs:
+1. **The gateway answers.** It serves the computer tool surface over MCP, using your token.
+2. **Every device is online and working.** By default that is `local` plus each enrolled agent; `--device` limits it. On each device the drill runs:
    - **Read checks:** system info, a directory listing, a file-name search, and a file read.
    - **Commands:** a harmless command (the first of `hostname`, `whoami`, `uname`, `pwd`, `date` the device's policy allows), run once directly and once as a session.
    - **Processes:** a process listing.
@@ -455,59 +454,28 @@ No process is killed, and the only file deleted is the drill's own. The exit sta
 
 ### What CI proves
 
-`tests/test_failover.py` runs the whole deployment from its shipped entry points on Ubuntu and Windows: the knowledge gateway, the computer gateway with its agent and OAuth listeners, and an agent standing in for Thanatos. Everything runs inside a jail that models Desktop Commander being gone:
+`tests/test_failover.py` runs the whole deployment from its shipped entry points on Ubuntu and Windows: the knowledge gateway, the computer gateway with its agent and OAuth listeners, and an agent standing in for Thanatos. Everything runs inside a jail:
 
-- **Tripwires:** `npx`, `node`, and `desktop-commander` programs come first on `PATH` and record any call.
+- **Tripwires:** `npx` and `node` programs come first on `PATH` and record any call.
 - **Network jail:** `tests/failover_jail/sitecustomize.py` refuses and records every network destination off the machine, so no hosted relay, registry, or update check can be reached.
-- **No permissions:** Desktop Commander's config directory exists but is unreadable.
-- **A Desktop Commander process:** one runs at first, and the drill must report NOT READY until it is killed.
 
 Then the test checks each of these:
 - **Drill:** passes on both devices, including `--write`.
-- **Parity:** every Desktop Commander tool with a ContextBridge counterpart works on both devices.
+- **Every tool:** every computer tool works on both devices, apart from `list_windows` and `media_inventory`, which the test's device policies leave off.
 - **Remote client:** a Claude/ChatGPT-style OAuth client reads from both devices and is refused anything it wasn't granted.
 - **Knowledge route:** `search` and `fetch` work.
 - **Restart:** after a gateway restart, the agent reconnects on its own and the OAuth token still works.
 - **Audit:** both machines' audit logs show the same requests.
 - **Isolation:** nothing touched a tripwire or the network.
 
-### Desktop Commander parity
+### What the computer route leaves out
 
-All 31 Desktop Commander tools from the original functionality inventory (`docs/desktop-commander-inventory.pdf`, since replaced by `docs/capability-roadmap.pdf`), with their ContextBridge counterparts. This map is `DESKTOP_COMMANDER_PARITY` in `src/contextbridge/failover.py`. The failover test fails if a tool is missing from it, or if a mapped tool isn't exercised on both devices.
-
-| Desktop Commander | ContextBridge | Coverage | Notes |
-|---|---|---|---|
-| `read_file` | `read_file` | same tool | offset, negative offset (tail), and length |
-| `read_multiple_files` | `read_file` | equivalent | one read_file call per file |
-| `write_file` | `write_file` | same tool | atomic rewrite or append |
-| `edit_block` | `edit_block` | same tool | exact replacement; refuses an unexpected match count |
-| `create_directory` | `create_directory` | same tool |  |
-| `list_directory` | `list_directory` | same tool | recursive to depth 5 |
-| `move_file` | `move_file` | same tool |  |
-| `get_file_info` | `get_file_info` | same tool |  |
-| `start_search` | `search_files`, `search_code` | equivalent | synchronous, capped by result count and time |
-| `get_more_search_results` | `search_files`, `search_code` | equivalent | raise max_results or narrow the path |
-| `stop_search` | — | not a tool, by design | searches finish within max_search_seconds; nothing runs in the background |
-| `list_searches` | — | not a tool, by design | no background searches exist |
-| `start_process` | `start_process`, `run_command` | same tool | run_command for one-shot commands |
-| `read_process_output` | `read_process_output` | same tool |  |
-| `interact_with_process` | `interact_with_process` | same tool |  |
-| `force_terminate` | `force_terminate` | same tool | kills the whole process tree |
-| `list_sessions` | `list_sessions` | same tool |  |
-| `list_processes` | `list_processes` | same tool |  |
-| `kill_process` | `kill_process` | same tool | only where the device's policy sets allow_kill |
-| `write_pdf` | `write_document`, `edit_pdf` | equivalent | write_document creates PDFs; edit_pdf deletes, rotates, inserts pages |
-| `list_devices` | `list_devices` | same tool | online state, last seen, tools, and policy |
-| `ping` | `list_devices` | equivalent | online state from heartbeats |
-| `shutdown` | — | not a tool, by design | on the host: contextbridge-admin revoke, or stop the agent's service |
-| `who_am_i` | — | **gap** | the caller's client id is recorded in the audit log, not returned |
-| `get_config` | `get_system_info`, `list_devices` | equivalent | each device's policy summary |
-| `set_config_value` | — | not a tool, by design | policy changes only on the host, so a client cannot widen its own access |
-| `get_usage_stats` | — | not a tool, by design | the host's JSONL audit log records every call |
-| `get_recent_tool_calls` | — | not a tool, by design | the host's JSONL audit log records every call |
-| `get_tool_result` | — | not a tool, by design | calls complete within call_timeout_seconds; none is left pending |
-| `list_remote_tool_calls` | — | not a tool, by design | calls complete within call_timeout_seconds; none is left pending |
-| `give_feedback_to_desktop_commander` | — | not a tool, by design | Desktop Commander product feedback |
+Some operations are deliberately not tools:
+- **Changing policy** happens only on the host, so a client cannot widen its own access.
+- **Usage statistics and call history** are in the host's JSONL audit log.
+- **Collecting a pending result** is never needed: every call finishes within `call_timeout_seconds`.
+- **Stopping an agent** is done on the host, with `contextbridge-admin revoke` or by stopping the agent's service.
+- **The caller's identity** is recorded in the audit log but not returned to the client.
 
 Beyond individual tools, the checklist in `docs/capability-roadmap.pdf` also lists capabilities the computer route does not have yet:
 - **asynchronous, paged search** sessions;
@@ -535,7 +503,7 @@ Do not forward ports 8790, 8791, 8792, or 8794 to the internet. Publish 8793 onl
 3. ~~Remote agent transport and device registration (outbound agent connections, heartbeats, revocation)~~
 4. ~~Windows agent for Thanatos (native agent, job-object process trees, scheduled-task install, Windows CI)~~
 5. ~~Authenticated remote MCP endpoint for ChatGPT and Claude (OAuth front end, per-device permissions)~~
-6. ~~Failover acceptance test with Desktop Commander fully stopped (drill + jailed CI test)~~
+6. ~~Failover acceptance test (drill + jailed CI test)~~
 7. ~~Native delete (trash with restore) and document tools (PDF, Word, Excel)~~
 
 ## Documentation
