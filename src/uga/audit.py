@@ -57,6 +57,7 @@ class UgaAuditLog:
         path: str | list[str] | None = None,
         destination: str | None = None,
         size: int | None = None,
+        search_id: str | None = None,
     ) -> None:
         entry: dict[str, Any] = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -87,6 +88,8 @@ class UgaAuditLog:
             entry["destination"] = destination
         if size is not None:
             entry["size"] = size
+        if search_id is not None:
+            entry["search_id"] = search_id
         if detail:
             entry["detail"] = detail
         line = json.dumps(entry, separators=(",", ":"))

@@ -27,6 +27,12 @@ from starlette.responses import JSONResponse
 from . import __version__
 from .audit import UgaAuditLog
 from .fs import Filesystem, FsError, filesystem_from_config
+from .fs_search import (
+    DEFAULT_MAX_RESULTS,
+    DEFAULT_PAGE,
+    DEFAULT_TIMEOUT_MS,
+    SearchManager,
+)
 from .gateway import (
     UgaAllowlistMiddleware,
     _BearerTokenVerifier,
@@ -53,6 +59,10 @@ _DESTRUCTIVE = ToolAnnotations(
 _CREATE_DIRECTORY = ToolAnnotations(
     readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False
 )
+# Reads only, but each call starts a new search.
+_SEARCH = ToolAnnotations(
+    readOnlyHint=True, destructiveHint=False, idempotentHint=False, openWorldHint=False
+)
 # Refuses to overwrite, so nothing is lost, but a repeat call fails.
 _MOVE = ToolAnnotations(
     readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False
@@ -68,7 +78,25 @@ def _instructions(fs: Filesystem) -> str:
     for root in fs.roots:
         lines.append(f"- {root.path} ({'read-write' if root.writable else 'read-only'})")
     lines.append("Deleted items are moved to a trash folder that tools cannot access.")
+    lines.append(
+        "start_search returns a search_id and the first results; page through the rest "
+        "with get_more_search_results while the search runs or after it finishes."
+    )
     return "\n".join(lines)
+
+
+def _result_fields(result: dict[str, Any]) -> dict[str, Any]:
+    """Audit fields taken from a tool's result."""
+    fields: dict[str, Any] = {}
+    if "bytes" in result:
+        fields["size"] = result["bytes"]
+    if "trash_path" in result:
+        fields["destination"] = result["trash_path"]
+    if "search_id" in result:
+        fields["search_id"] = result["search_id"]
+    if isinstance(result.get("results"), list):
+        fields["result_count"] = len(result["results"])
+    return fields
 
 
 def create_fs_server(
@@ -83,6 +111,7 @@ def create_fs_server(
     if audit is None:
         audit = UgaAuditLog(os.environ.get(AUDIT_ENV), route="fs")
     allowed = allowed_fs_tools(fs)
+    searches = SearchManager(fs)
     server = FastMCP(
         name=name,
         version=__version__,
@@ -91,13 +120,8 @@ def create_fs_server(
         instructions=_instructions(fs),
     )
 
-    def audited(
-        tool: str,
-        op: Callable[[], dict[str, Any]],
-        *,
-        path: str | list[str],
-        destination: str | None = None,
-    ) -> dict[str, Any]:
+    def audited(tool: str, op: Callable[[], dict[str, Any]], **fields: Any) -> dict[str, Any]:
+        """Run ``op`` and write the tool's audit line; ``fields`` go to the audit log."""
         started = time.monotonic()
         request_id = _current_request_id.get()
         try:
@@ -105,8 +129,7 @@ def create_fs_server(
         except FsError as exc:
             audit.record(
                 tool=tool,
-                path=path,
-                destination=destination,
+                **fields,
                 success=False,
                 detail=exc.code,
                 request_id=request_id,
@@ -116,8 +139,7 @@ def create_fs_server(
         except Exception as exc:
             audit.record(
                 tool=tool,
-                path=path,
-                destination=destination,
+                **fields,
                 success=False,
                 detail=type(exc).__name__,
                 request_id=request_id,
@@ -126,9 +148,7 @@ def create_fs_server(
             raise
         audit.record(
             tool=tool,
-            path=path,
-            destination=destination or result.get("trash_path"),
-            size=result.get("bytes"),
+            **{**fields, **_result_fields(result)},
             success=True,
             request_id=request_id,
             elapsed_ms=_elapsed_ms(started),
@@ -162,6 +182,62 @@ def create_fs_server(
     async def get_file_info(path: str) -> dict[str, Any]:
         """Get a file's or directory's size, timestamps, permissions and type."""
         return await run("get_file_info", fs.get_file_info, path, path=path)
+
+    @server.tool(name="start_search", annotations=_SEARCH)
+    async def start_search(
+        path: str,
+        pattern: str,
+        search_type: Literal["files", "content"] = "files",
+        file_pattern: str | None = None,
+        ignore_case: bool = True,
+        literal: bool = False,
+        include_hidden: bool = False,
+        context_lines: int = 0,
+        max_results: int = DEFAULT_MAX_RESULTS,
+        timeout_ms: int = DEFAULT_TIMEOUT_MS,
+    ) -> dict[str, Any]:
+        """Search recursively under path, in the background. search_type "files"
+        matches file and directory names (a glob if pattern has * ? or [, else a
+        substring); "content" matches lines of text files against a regular
+        expression, or a plain string with literal=true. file_pattern limits which
+        files are searched, e.g. "*.py" or "*.{ts,tsx}|*.md". Returns a search_id,
+        the status and the first results; line numbers are 1-based."""
+        return await run(
+            "start_search",
+            searches.start,
+            path,
+            pattern,
+            search_type,
+            file_pattern,
+            ignore_case,
+            literal,
+            include_hidden,
+            context_lines,
+            max_results,
+            timeout_ms,
+            path=path,
+            query=pattern,
+        )
+
+    @server.tool(name="get_more_search_results", annotations=_READ)
+    async def get_more_search_results(
+        search_id: str, offset: int = 0, length: int = DEFAULT_PAGE
+    ) -> dict[str, Any]:
+        """Get results of a search from offset (0-based; negative counts from the
+        end). has_more is true while more results exist or the search is running."""
+        return await run(
+            "get_more_search_results", searches.more, search_id, offset, length, search_id=search_id
+        )
+
+    @server.tool(name="stop_search", annotations=_READ)
+    async def stop_search(search_id: str) -> dict[str, Any]:
+        """Stop a running search. Results found so far stay available."""
+        return await run("stop_search", searches.stop, search_id, search_id=search_id)
+
+    @server.tool(name="list_searches", annotations=_READ)
+    async def list_searches() -> dict[str, Any]:
+        """List recent searches with their status and result counts."""
+        return await run("list_searches", searches.list)
 
     if fs.writable:
 

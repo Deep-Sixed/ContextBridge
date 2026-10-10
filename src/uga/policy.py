@@ -22,7 +22,17 @@ UGA_FORBIDDEN_TOOL_EXAMPLES: frozenset[str] = frozenset(
 
 # The filesystem route (uga.fs_gateway) is a separate server with its own allowlist.
 FS_READ_TOOLS: frozenset[str] = frozenset(
-    {"read_file", "read_multiple_files", "list_directory", "get_file_info"}
+    {
+        "read_file",
+        "read_multiple_files",
+        "list_directory",
+        "get_file_info",
+        # Search sessions only read files; they are offered with read-only roots too.
+        "start_search",
+        "get_more_search_results",
+        "stop_search",
+        "list_searches",
+    }
 )
 # Advertised only when at least one configured root is writable.
 FS_WRITE_TOOLS: frozenset[str] = frozenset(
