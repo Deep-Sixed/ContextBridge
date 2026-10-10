@@ -21,5 +21,12 @@ UGA_FORBIDDEN_TOOL_EXAMPLES: frozenset[str] = frozenset(
 )
 
 
-def is_tool_allowed(name: str) -> bool:
-    return name in UGA_ALLOWED_TOOLS
+# The filesystem route (uga.fs_gateway) is a separate server with its own allowlist.
+# Names follow Desktop Commander's so clients can switch over; delete_file is new.
+FS_READ_TOOLS: frozenset[str] = frozenset(
+    {"read_file", "read_multiple_files", "list_directory", "get_file_info"}
+)
+# Advertised only when at least one configured root is writable.
+FS_WRITE_TOOLS: frozenset[str] = frozenset(
+    {"write_file", "edit_block", "create_directory", "move_file", "delete_file"}
+)

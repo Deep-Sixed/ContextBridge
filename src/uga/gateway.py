@@ -41,7 +41,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from . import __version__
 from .adapter import DatacoreRecordNotFound, DatacoreStore
 from .audit import UgaAuditLog, clip
-from .policy import UGA_ALLOWED_TOOLS, is_tool_allowed
+from .policy import UGA_ALLOWED_TOOLS
 
 DEFAULT_METADATA_TIMEOUT_SECONDS = 5.0
 DEFAULT_TOOL_TIMEOUT_SECONDS = 10.0
@@ -174,11 +174,11 @@ def _peer() -> str | None:
     return request.client.host if request.client else None
 
 
-def _require_token(token: str | None) -> str:
+def _require_token(token: str | None, *, name: str = "MCP_AUTH_TOKEN") -> str:
     if not token:
-        raise ValueError("MCP_AUTH_TOKEN must be set for the UGA gateway (fail closed).")
+        raise ValueError(f"{name} must be set (fail closed).")
     if len(token) < MIN_TOKEN_LENGTH:
-        raise ValueError(f"MCP_AUTH_TOKEN must be at least {MIN_TOKEN_LENGTH} characters.")
+        raise ValueError(f"{name} must be at least {MIN_TOKEN_LENGTH} characters.")
     return token
 
 
@@ -265,15 +265,28 @@ class _UgaServer(FastMCP):
         return super().http_app(path, [audit_middleware, *(middleware or [])], **kwargs)
 
 
-def _allowed_tools(tools: Sequence[Any]) -> list[Any]:
-    return [t for t in tools if is_tool_allowed(t.name)]
+def unauthenticated_response(request: Request) -> JSONResponse | None:
+    """Return a 401 for a custom-route request the bearer middleware did not authenticate.
+
+    Custom routes are not wrapped by the MCP endpoint's auth check. The bearer
+    middleware still runs for every request, so refuse anyone it did not
+    authenticate.
+    """
+    user = request.scope.get("user")
+    if user is not None and user.is_authenticated:
+        return None
+    return JSONResponse(
+        {"error": "invalid_token", "error_description": "Authentication required"},
+        status_code=401,
+        headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
+    )
 
 
-def _not_permitted(method: str) -> McpError:
+def _not_permitted(method: str, route_name: str = "UGA") -> McpError:
     return McpError(
         ErrorData(
             code=mcp.types.METHOD_NOT_FOUND,
-            message=f"Method '{clip(method)}' is not permitted on the UGA route.",
+            message=f"Method '{clip(method)}' is not permitted on the {route_name} route.",
         )
     )
 
@@ -283,16 +296,30 @@ class UgaAllowlistMiddleware(Middleware):
 
     initialize, tools/list (filtered to the allowlist) and allowlisted tools/call
     run. resources/list, resources/templates/list and prompts/list answer empty;
-    everything else is rejected.
+    everything else is rejected. The defaults are the UGA route's; the filesystem
+    route passes its own allowlist and names.
     """
 
-    def __init__(self, audit: UgaAuditLog) -> None:
+    def __init__(
+        self,
+        audit: UgaAuditLog,
+        *,
+        allowed_tools: frozenset[str] = UGA_ALLOWED_TOOLS,
+        route_name: str = "UGA",
+        service_name: str = "Nexus Datacore",
+    ) -> None:
         self._audit = audit
+        self._allowed_tools = allowed_tools
+        self._route_name = route_name
+        self._service_name = service_name
+
+    def _filter(self, tools: Sequence[Any]) -> list[Any]:
+        return [t for t in tools if t.name in self._allowed_tools]
 
     async def on_request(self, context: MiddlewareContext[Any], call_next: Any) -> Any:
         method = context.method or "<unknown>"
         if method == "tools/list" and _tool_cache_refresh.get():
-            return _allowed_tools(await call_next(context))
+            return self._filter(await call_next(context))
 
         started = time.monotonic()
         fields: dict[str, Any] = {
@@ -303,9 +330,11 @@ class UgaAllowlistMiddleware(Middleware):
         if method == "tools/call":
             raw_name = getattr(context.message, "name", None)
             label = str(raw_name) if raw_name else "<unknown>"
-            if not is_tool_allowed(label):
+            if label not in self._allowed_tools:
                 self._record(label, started, fields, success=False, detail="policy_denied")
-                raise ToolError(f"Tool '{clip(label)}' is not permitted on the UGA route.")
+                raise ToolError(
+                    f"Tool '{clip(label)}' is not permitted on the {self._route_name} route."
+                )
             timeout = _tool_timeout_seconds()
         elif method in ("initialize", "tools/list"):
             timeout = _metadata_timeout_seconds()
@@ -314,7 +343,7 @@ class UgaAllowlistMiddleware(Middleware):
             return []
         else:
             self._record(label, started, fields, success=False, detail="policy_denied")
-            raise _not_permitted(method)
+            raise _not_permitted(method, self._route_name)
 
         fields_token = _audit_fields.set(fields)
         try:
@@ -323,8 +352,10 @@ class UgaAllowlistMiddleware(Middleware):
         except TimeoutError:
             self._record(label, started, fields, success=False, detail="timeout")
             if method == "tools/call":
-                raise ToolError(f"Tool '{label}' timed out on the Nexus Datacore route.") from None
-            raise RuntimeError(f"Nexus Datacore MCP {method} timed out") from None
+                raise ToolError(
+                    f"Tool '{label}' timed out on the {self._service_name} route."
+                ) from None
+            raise RuntimeError(f"{self._service_name} MCP {method} timed out") from None
         except Exception as exc:
             # fastmcp wraps a tool's own exception in a masked ToolError; log the original type.
             cause = exc.__cause__ if isinstance(exc, ToolError) and exc.__cause__ else exc
@@ -334,7 +365,7 @@ class UgaAllowlistMiddleware(Middleware):
         finally:
             _audit_fields.reset(fields_token)
         if method == "tools/list":
-            result = _allowed_tools(result)
+            result = self._filter(result)
             fields["result_count"] = len(result)
         self._record(label, started, fields, success=True)
         return result
@@ -346,7 +377,9 @@ class UgaAllowlistMiddleware(Middleware):
 LowLevelHandler = Callable[[Any], Awaitable[Any]]
 
 
-def _guard_low_level_handlers(server: FastMCP, audit: UgaAuditLog) -> None:
+def _guard_low_level_handlers(
+    server: FastMCP, audit: UgaAuditLog, route_name: str = "UGA"
+) -> None:
     """Apply the policy to the MCP requests fastmcp's middleware never sees.
 
     The SDK answers ping itself and rejects methods that have no handler. Any other
@@ -362,7 +395,7 @@ def _guard_low_level_handlers(server: FastMCP, audit: UgaAuditLog) -> None:
         elif request_type is mcp.types.PingRequest or request_type in _MIDDLEWARE_ROUTED_REQUESTS:
             continue
         else:
-            handlers[request_type] = _audited_denial(audit)
+            handlers[request_type] = _audited_denial(audit, route_name)
 
 
 def _flag_tool_cache_refresh(handler: LowLevelHandler) -> LowLevelHandler:
@@ -378,7 +411,7 @@ def _flag_tool_cache_refresh(handler: LowLevelHandler) -> LowLevelHandler:
     return list_tools
 
 
-def _audited_denial(audit: UgaAuditLog) -> LowLevelHandler:
+def _audited_denial(audit: UgaAuditLog, route_name: str) -> LowLevelHandler:
     async def deny(request: Any) -> Any:
         audit.record(
             tool=request.method,
@@ -387,7 +420,7 @@ def _audited_denial(audit: UgaAuditLog) -> LowLevelHandler:
             request_id=_request_id(),
             **_who(),
         )
-        raise _not_permitted(request.method)
+        raise _not_permitted(request.method, route_name)
 
     return deny
 
@@ -458,18 +491,10 @@ def create_uga_server(
     server.add_middleware(UgaAllowlistMiddleware(audit))
     _guard_low_level_handlers(server, audit)
 
-    # Custom routes are not wrapped by the MCP endpoint's auth check. The bearer
-    # middleware still runs for every request, so refuse anyone it did not
-    # authenticate.
     @server.custom_route("/", methods=["GET"])
     async def root_status(request: Request) -> JSONResponse:
-        user = request.scope.get("user")
-        if user is None or not user.is_authenticated:
-            return JSONResponse(
-                {"error": "invalid_token", "error_description": "Authentication required"},
-                status_code=401,
-                headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
-            )
+        if (refused := unauthenticated_response(request)) is not None:
+            return refused
         return JSONResponse(
             {
                 "service": name,
@@ -487,6 +512,20 @@ def advertised_tool_names(server: FastMCP) -> set[str]:
         return {t.name for t in tools}
 
     return anyio.run(_names)
+
+
+def uvicorn_config(serve: dict[str, Any]) -> dict[str, Any]:
+    """uvicorn settings for a route's ``serve`` config block.
+
+    uvicorn trusts X-Forwarded-For from 127.0.0.1 by default, which would let any
+    local client choose the peer address the audit log records. Only proxies
+    listed in serve.forwarded_allow_ips are trusted.
+    """
+    forwarded_allow_ips = serve.get("forwarded_allow_ips")
+    config: dict[str, Any] = {"proxy_headers": bool(forwarded_allow_ips)}
+    if forwarded_allow_ips:
+        config["forwarded_allow_ips"] = forwarded_allow_ips
+    return config
 
 
 def _config_relative(value: str, config_path: Path) -> Path:
@@ -561,19 +600,12 @@ def main() -> None:
         file=sys.stderr,
         flush=True,
     )
-    # uvicorn trusts X-Forwarded-For from 127.0.0.1 by default, which would let any
-    # local client choose the peer address the audit log records. Only proxies
-    # listed in serve.forwarded_allow_ips are trusted.
-    forwarded_allow_ips = serve.get("forwarded_allow_ips")
-    uvicorn_config: dict[str, Any] = {"proxy_headers": bool(forwarded_allow_ips)}
-    if forwarded_allow_ips:
-        uvicorn_config["forwarded_allow_ips"] = forwarded_allow_ips
     server.run(
         transport="http",
         host=host,
         port=port,
         show_banner=False,
-        uvicorn_config=uvicorn_config,
+        uvicorn_config=uvicorn_config(serve),
     )
 
 

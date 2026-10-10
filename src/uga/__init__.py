@@ -1,4 +1,7 @@
-"""Unidirectional Gateway Appliance (UGA) — read-only Datacore MCP route."""
+"""Unidirectional Gateway Appliance (UGA) — read-only Datacore MCP route.
+
+The separate filesystem route lives in ``uga.fs`` and ``uga.fs_gateway``.
+"""
 
 from .adapter import (
     DatacoreFetchRecord,
