@@ -202,6 +202,7 @@ def test_server_reads_data_source_and_token_from_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # what ~ expands to on Windows
     write_jsonl(tmp_path / "d.jsonl", [record()])
     monkeypatch.setenv("MCP_AUTH_TOKEN", TOKEN)
     monkeypatch.setenv("UGA_DATACORE_JSONL", "~/d.jsonl")
@@ -329,4 +330,5 @@ def test_config_relative_paths(tmp_path: Path) -> None:
     config = tmp_path / "configs" / "c.yaml"
 
     assert _config_relative("audit.jsonl", config) == tmp_path / "configs" / "audit.jsonl"
-    assert _config_relative("/var/log/a.jsonl", config) == Path("/var/log/a.jsonl")
+    absolute = Path(tmp_path.anchor) / "var" / "log" / "a.jsonl"  # "/var/..." has no drive, so is relative, on Windows
+    assert _config_relative(str(absolute), config) == absolute

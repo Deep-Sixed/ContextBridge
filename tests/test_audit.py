@@ -38,6 +38,7 @@ def test_audit_file_is_private(tmp_path: Path) -> None:
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits; Windows uses ACLs")
 def test_existing_audit_file_is_made_private(tmp_path: Path) -> None:
     path = tmp_path / "audit.jsonl"
     path.write_text("")
