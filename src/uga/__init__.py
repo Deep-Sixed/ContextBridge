@@ -3,6 +3,10 @@
 The separate filesystem route lives in ``uga.fs`` and ``uga.fs_gateway``.
 """
 
+# One version for the whole distribution: pyproject.toml reads contextbridge.__version__,
+# and both MCP servers report it.
+from contextbridge import __version__
+
 from .adapter import (
     DatacoreFetchRecord,
     DatacoreRecordError,
@@ -10,9 +14,6 @@ from .adapter import (
     DatacoreStore,
 )
 from .policy import UGA_ALLOWED_TOOLS, UGA_FORBIDDEN_TOOL_EXAMPLES
-
-# Single source of truth: pyproject.toml reads this, and the MCP server reports it.
-__version__ = "0.1.0"
 
 __all__ = [
     "DatacoreFetchRecord",

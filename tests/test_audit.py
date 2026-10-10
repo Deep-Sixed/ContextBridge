@@ -6,8 +6,8 @@ import stat
 from pathlib import Path
 
 import pytest
-
 from conftest import read_audit
+
 from uga.audit import UgaAuditLog
 
 
@@ -30,6 +30,7 @@ def test_query_text_is_logged_when_opted_in(tmp_path: Path) -> None:
     assert read_audit(path)[0]["query_preview"] == "hello"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits; Windows uses ACLs")
 def test_audit_file_is_private(tmp_path: Path) -> None:
     path = tmp_path / "audit.jsonl"
     UgaAuditLog(path)
@@ -37,6 +38,7 @@ def test_audit_file_is_private(tmp_path: Path) -> None:
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits; Windows uses ACLs")
 def test_existing_audit_file_is_made_private(tmp_path: Path) -> None:
     path = tmp_path / "audit.jsonl"
     path.write_text("")

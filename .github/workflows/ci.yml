@@ -1,4 +1,4 @@
-name: ci
+name: CI
 
 on:
   push:
@@ -10,27 +10,43 @@ permissions:
 
 jobs:
   test:
-    name: pytest (Python ${{ matrix.python-version }}, fastmcp ${{ matrix.fastmcp || 'latest 3.x' }})
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os }} / Python ${{ matrix.python }} / fastmcp ${{ matrix.fastmcp || 'latest 3.x' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.13"]
         include:
-          # Oldest supported Python with the lower bound of the fastmcp pin.
-          - python-version: "3.11"
+          # Oldest supported Python with the lower bound of the fastmcp pin;
+          # 3.13 gets whatever fastmcp 3.x the pin resolves to.
+          - python: "3.11"
             fastmcp: "3.0.0"
-          # Newest Python with whatever fastmcp 3.x the pin resolves to.
-          - python-version: "3.13"
-            fastmcp: ""
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: ${{ matrix.python }}
       # Resolve the fastmcp pin in the same step so no newer fastmcp files are left behind.
       - name: Install
+        shell: bash
         env:
           FASTMCP_PIN: ${{ matrix.fastmcp }}
         run: python -m pip install -e ".[test]" ${FASTMCP_PIN:+"fastmcp==$FASTMCP_PIN"}
       - run: python -m pip show fastmcp mcp
-      - run: python -m pytest -q
+      - name: Test
+        # faulthandler dumps every thread's stack if a test runs over 4 minutes, so a hang is diagnosable.
+        run: python -m pytest -q -rs -o faulthandler_timeout=240
+      - name: Check PowerShell scripts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          foreach ($script in Get-ChildItem scripts -Filter *.ps1) {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($script.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors) { $errors | Format-List; throw "$($script.Name) has syntax errors" }
+          }
+          ./scripts/install-agent.ps1 -Config configs/agent.windows.yaml -DryRun
+          ./scripts/install-agent.ps1 -Config configs/agent.windows.yaml -AtLogOn -DryRun
+          ./scripts/install-agent.ps1 -Uninstall -DryRun

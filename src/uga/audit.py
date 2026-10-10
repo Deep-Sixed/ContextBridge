@@ -54,13 +54,18 @@ class UgaAuditLog:
         if path:
             p = Path(path)
             p.parent.mkdir(parents=True, exist_ok=True)
+            if not hasattr(os, "O_NOFOLLOW") and p.is_symlink():  # Windows: nothing to pass os.open
+                raise OSError(f"audit log is a symlink: {p}")
             flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
             fd = os.open(p, flags, 0o600)
             try:
                 if not stat.S_ISREG(os.fstat(fd).st_mode):
                     raise OSError(f"audit log is not a regular file: {p}")
                 # The mode passed to os.open only applies when the file is created.
-                os.fchmod(fd, 0o600)
+                if hasattr(os, "fchmod"):
+                    os.fchmod(fd, 0o600)
+                else:  # Windows before Python 3.13; there the mode only sets the read-only flag
+                    os.chmod(p, 0o600)
             except BaseException:
                 os.close(fd)
                 raise

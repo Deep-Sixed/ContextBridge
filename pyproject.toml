@@ -5,18 +5,39 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "contextbridge"
 dynamic = ["version"]
-description = "Read-only authenticated MCP gateway for approved project context"
+description = "Self-hosted MCP gateway for approved project context and policy-controlled computer access"
 requires-python = ">=3.11"
-# The gateway hooks fastmcp 3's middleware and server internals; fastmcp 4 reworked
-# that API (it also removed fastmcp.tools.tool).
-dependencies = ["fastmcp>=3,<4", "mcp>=1.24,<2", "anyio>=4", "pyyaml", "starlette"]
+# The gateways hook fastmcp 3's middleware and server internals; fastmcp 4 reworked
+# that API (it also removed fastmcp.tools.tool). anyio 4.1 added abandon_on_cancel.
+dependencies = [
+    "fastmcp>=3,<4",
+    "mcp>=1.24,<2",
+    "anyio>=4.1",
+    "pyyaml",
+    "starlette",
+    "psutil>=5.9",
+    "websockets>=13",
+    "cryptography>=42",
+    # document tools (PDF, Word, Excel); defusedxml makes openpyxl parse XML safely
+    "pypdf>=4",
+    "python-docx>=1.1",
+    "openpyxl>=3.1",
+    "reportlab>=4.0",
+    "defusedxml>=0.7",
+]
 
 [project.optional-dependencies]
-test = ["pytest"]
+test = ["pytest>=8"]
 docs = ["reportlab>=4.0"]
 
+[project.scripts]
+contextbridge-computer = "contextbridge.computer.server:main"
+contextbridge-agent = "contextbridge.remote.agent:main"
+contextbridge-admin = "contextbridge.remote.admin:main"
+contextbridge-failover = "contextbridge.failover:main"
+
 [tool.setuptools.dynamic]
-version = { attr = "uga.__version__" }
+version = { attr = "contextbridge.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]

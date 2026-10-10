@@ -1,0 +1,30 @@
+# ContextBridge agent — runs on each remote machine (e.g. Thanatos) and dials out to the gateway.
+# This file is the machine's own policy: the gateway cannot widen it.
+name: thanatos             # must match the name used with `contextbridge-admin pair`
+
+gateway:
+  url: wss://100.101.102.103:8792   # the gateway's agents.host/port; wss:// required unless on the same machine
+  fingerprint: sha256:REPLACE-WITH-THE-FINGERPRINT-FROM-contextbridge-admin-pair
+  # ca_file: ../state/ca.pem        # alternative to fingerprint pinning
+
+identity: ../state/agent-identity.json   # written by `enroll` (mode 0600); hidden from every file tool
+audit_log: ../audit/agent.audit.jsonl    # required; this machine's own record of every call
+max_concurrent_calls: 8
+
+filesystem:
+  roots:
+    - "~"
+  writable_roots: []
+  max_read_bytes: 1048576
+  max_write_bytes: 1048576
+  delete: trash            # trash (undo with restore_deleted) | permanent | disabled; writable roots only
+  max_document_bytes: 20971520   # PDF, Word, and Excel files larger than this are not opened
+
+commands:
+  mode: allowlist
+  allow: [git, ls, df, du, ps, uptime, whoami, hostname, uname, date, pwd]
+  max_timeout_seconds: 600
+
+processes:
+  list: true
+  allow_kill: false

@@ -19,13 +19,17 @@ from uga.fs import (
     filesystem_from_config,
 )
 
+# Windows reports a synthesized DOS read/write view in st_mode, not POSIX
+# permission bits; NTFS authorization is enforced by ACLs.
+WINDOWS = os.name == "nt"
+
 
 @pytest.fixture
 def dirs(tmp_path: Path) -> dict[str, Path]:
     paths = {name: tmp_path / name for name in ("rw", "ro", "outside")}
     for path in paths.values():
         path.mkdir()
-    (paths["ro"] / "notes.txt").write_text("one\ntwo\nthree\n", encoding="utf-8")
+    (paths["ro"] / "notes.txt").write_bytes(b"one\ntwo\nthree\n")  # LF on every OS
     (paths["outside"] / "secret.txt").write_text("secret\n", encoding="utf-8")
     return {name: Path(os.path.realpath(path)) for name, path in paths.items()}
 
@@ -134,7 +138,7 @@ def test_read_file_keeps_line_endings(dirs: dict[str, Path]) -> None:
 
 
 def test_read_file_caps_bytes(dirs: dict[str, Path]) -> None:
-    (dirs["ro"] / "big.txt").write_text("x" * 9 + "\n" + "y" * 9 + "\n", encoding="utf-8")
+    (dirs["ro"] / "big.txt").write_bytes(b"x" * 9 + b"\n" + b"y" * 9 + b"\n")
     fs = _fs(dirs, FsLimits(max_read_bytes=15))
 
     result = fs.read_file(str(dirs["ro"] / "big.txt"))
@@ -150,12 +154,14 @@ def test_read_file_rejects_non_text_and_non_files(dirs: dict[str, Path]) -> None
     fs = _fs(dirs)
     (dirs["ro"] / "blob.bin").write_bytes(b"\x89PNG\r\n\x00\x00")
     (dirs["ro"] / "latin1.txt").write_bytes("caf\xe9\n".encode("latin-1"))
-    os.mkfifo(dirs["ro"] / "pipe")
+    has_fifo = hasattr(os, "mkfifo")  # not on Windows
+    if has_fifo:
+        os.mkfifo(dirs["ro"] / "pipe")
 
     for name, code in [
         ("blob.bin", "binary"),
         ("latin1.txt", "binary"),
-        ("pipe", "not_a_file"),
+        *([("pipe", "not_a_file")] if has_fifo else []),
         ("missing.txt", "not_found"),
         ("", "is_a_directory"),
     ]:
@@ -231,7 +237,7 @@ def test_get_file_info(dirs: dict[str, Path]) -> None:
     assert {k: info[k] for k in ("type", "size", "permissions", "is_symlink", "writable")} == {
         "type": "file",
         "size": 14,
-        "permissions": "640",
+        "permissions": "666" if WINDOWS else "640",
         "is_symlink": False,
         "writable": False,
     }
@@ -253,7 +259,7 @@ def test_write_file_creates_with_umask_and_appends(dirs: dict[str, Path]) -> Non
         os.umask(umask)
 
     assert target.read_text(encoding="utf-8") == "a\nb\n"
-    assert stat.S_IMODE(target.stat().st_mode) == 0o644
+    assert stat.S_IMODE(target.stat().st_mode) == (0o666 if WINDOWS else 0o644)
 
 
 def test_write_file_rewrite_keeps_permissions_and_leaves_no_temp(dirs: dict[str, Path]) -> None:
@@ -264,7 +270,7 @@ def test_write_file_rewrite_keeps_permissions_and_leaves_no_temp(dirs: dict[str,
     _fs(dirs).write_file(str(target), "new\n")
 
     assert target.read_text(encoding="utf-8") == "new\n"
-    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert stat.S_IMODE(target.stat().st_mode) == (0o666 if WINDOWS else 0o600)
     assert [p.name for p in dirs["rw"].iterdir()] == ["keep.txt"]
 
 
@@ -358,7 +364,7 @@ def test_delete_file_moves_to_trash(dirs: dict[str, Path]) -> None:
     assert Path(result["trash_path"]).read_text(encoding="utf-8") == "keep me\n"
     manifest = json.loads((trash / f"{result['trash_id']}.json").read_text(encoding="utf-8"))
     assert manifest["original_path"] == str(target) and manifest["type"] == "file"
-    assert stat.S_IMODE(trash.stat().st_mode) == 0o700
+    assert stat.S_IMODE(trash.stat().st_mode) == (0o777 if WINDOWS else 0o700)
 
 
 def test_delete_directory_needs_recursive(dirs: dict[str, Path]) -> None:

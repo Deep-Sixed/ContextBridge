@@ -1,0 +1,2 @@
+{"id": "rec-001", "title": "ContextBridge architecture", "text": "ContextBridge exposes approved knowledge through search and fetch.", "url": "contextbridge://records/rec-001", "metadata": {"bank_id": "fixtures"}, "record_kind": "note"}
+{"id": "rec-002", "title": "Computer route policy", "text": "The computer route enforces allowlists, timeouts, and output limits.", "url": "contextbridge://records/rec-002", "metadata": {"bank_id": "fixtures"}, "summary": "Policy overview"}
