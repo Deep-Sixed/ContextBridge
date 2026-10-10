@@ -1,0 +1,7 @@
+# Project registry (Phase 4 foundation) — illustrative metadata only.
+# This file does NOT grant access to any host, file, GitHub repository or command.
+projects:
+  - name: ContextBridge
+    host: friday
+    path: /mnt/jarvis-data/projects/git/ContextBridge
+    github: Deep-Sixed/ContextBridge

@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+from contextlib import contextmanager
 import json
 import os
 import platform
@@ -315,6 +316,7 @@ class Agent:
         self._last_seq = 0
         self._tasks: set[asyncio.Task[None]] = set()
         self._stopping = asyncio.Event()
+        self._backoff = 1.0
 
     def stop(self) -> None:
         self._stopping.set()
@@ -328,12 +330,11 @@ class Agent:
     async def run(self) -> None:
         """Stay connected until stopped; raises FatalAgentError when the gateway refuses us for good."""
         self._loop = asyncio.get_running_loop()
-        delay = 1.0
+        self._backoff = 1.0
         try:
             while not self._stopping.is_set():
                 try:
                     await self._session()
-                    delay = 1.0
                 except FatalAgentError:
                     raise
                 except PinMismatch as exc:
@@ -343,8 +344,8 @@ class Agent:
                 if self._stopping.is_set():
                     break
                 with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(self._stopping.wait(), delay * random.uniform(0.5, 1.0))
-                delay = min(delay * 2, MAX_BACKOFF_SECONDS)
+                    await asyncio.wait_for(self._stopping.wait(), self._backoff * random.uniform(0.5, 1.0))
+                self._backoff = min(self._backoff * 2, MAX_BACKOFF_SECONDS)
         finally:
             self.engine.shutdown()
 
@@ -370,6 +371,8 @@ class Agent:
 
             self._ws = ws
             self._last_seq = 0
+            # However the session ends, its loss is a fresh outage, not more of an earlier one.
+            self._backoff = 1.0
             self.connected.set()
             self._log("gateway_connected", gateway=self.config.gateway_url, tools=sorted(self.engine.tools))
             beat = asyncio.create_task(self._heartbeats(ws, heartbeat))
@@ -511,6 +514,44 @@ class Agent:
             print(f"[agent] could not audit {event}: {exc}", file=sys.stderr, flush=True)
 
 
+@contextmanager
+def single_agent_instance(identity_path: Path):
+    """Prevent two CLI agents with the same identity competing for a gateway slot.
+
+    The lock is held for the full running lifetime, not just startup.
+    Its companion file is not an identity or a secret; stale files are safe.
+    """
+    lock_path = identity_path.with_name(identity_path.name + ".run.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                lock.seek(0)
+                if lock.read(1) == b"":
+                    lock.write(b"\0")
+                    lock.flush()
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise FatalAgentError(
+                f"another ContextBridge agent is already running with identity {identity_path}"
+            ) from exc
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 # ------------------------------------------------------------------------ CLI
 
 
@@ -562,7 +603,8 @@ def main(argv: list[str] | None = None) -> None:
         await agent.run()
 
     try:
-        asyncio.run(serve())
+        with single_agent_instance(config.identity_path):
+            asyncio.run(serve())
     except FatalAgentError as exc:
         raise SystemExit(f"[agent] stopped: {exc}") from None
     except KeyboardInterrupt:

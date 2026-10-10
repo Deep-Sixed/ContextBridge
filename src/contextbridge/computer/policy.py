@@ -160,6 +160,8 @@ class ComputerPolicy:
     delete_mode: str = "trash"
     max_delete_entries: int = 10_000
     max_document_bytes: int = 20 * 1024 * 1024
+    desktop_observe: bool = False
+    media_discover: bool = False
     windows: bool = IS_WINDOWS
 
     # ------------------------------------------------------------------ paths
@@ -330,6 +332,8 @@ class ComputerPolicy:
             "allow_kill": self.allow_kill,
             "delete": self.delete_mode if self.can_write else "disabled",
             "max_document_bytes": self.max_document_bytes,
+            "desktop_observe": self.desktop_observe,
+            "media_discover": self.media_discover,
         }
 
 
@@ -372,7 +376,9 @@ def load_policy(
     fs = cfg.get("filesystem") or {}
     cmds = cfg.get("commands") or {}
     procs = cfg.get("processes") or {}
-    if not all(isinstance(s, dict) for s in (fs, cmds, procs)):
+    desktop_cfg = cfg.get("desktop") or {}
+    media_cfg = cfg.get("media") or {}
+    if not all(isinstance(s, dict) for s in (fs, cmds, procs, desktop_cfg, media_cfg)):
         raise PolicyError("filesystem, commands, and processes must be mappings")
 
     roots: list[Path] = []
@@ -442,6 +448,8 @@ def load_policy(
         delete_mode=delete_mode,
         max_delete_entries=_positive(fs, "max_delete_entries", 10_000),
         max_document_bytes=_positive(fs, "max_document_bytes", 20 * 1024 * 1024),
+        desktop_observe=desktop_cfg.get("observe", False) is True,
+        media_discover=media_cfg.get("discover", False) is True,
         windows=windows,
     )
     return policy
