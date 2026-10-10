@@ -7,7 +7,8 @@ name = "contextbridge"
 dynamic = ["version"]
 description = "Self-hosted MCP gateway for approved project context and policy-controlled computer access"
 requires-python = ">=3.11"
-# fastmcp 4 removed fastmcp.tools.tool; anyio 4.1 added abandon_on_cancel.
+# The gateways hook fastmcp 3's middleware and server internals; fastmcp 4 reworked
+# that API (it also removed fastmcp.tools.tool). anyio 4.1 added abandon_on_cancel.
 dependencies = [
     "fastmcp>=3,<4",
     "mcp>=1.24,<2",

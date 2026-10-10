@@ -27,7 +27,7 @@ ContextBridge requires Python 3.11+ and FastMCP 3.x (`fastmcp>=3,<4`). It has no
 
 ## Knowledge route
 
-**Security model:** exactly two operations (`search` and `fetch`), default-deny tool middleware, read-only annotations, audit logging, and a static bearer token (at least 32 characters) required at startup. Error details are masked from clients. Only allowlisted top-level record fields are served; the `metadata` object is served as-is. It binds only to the loopback interface by default.
+**Security model:** exactly two operations (`search` and `fetch`), default-deny policy for tools and every other MCP method, read-only annotations, audit logging, and a static bearer token (at least 32 characters) required at startup. Error details are masked from clients. Only allowlisted record fields are served, at the top level and inside `metadata`. It binds only to the loopback interface by default.
 
 ```sh
 export MCP_AUTH_TOKEN="<strong random secret provided by secret manager>"
@@ -58,18 +58,20 @@ Every HTTP route requires the token, including `GET /`, which returns the servic
 | `name` | `Nexus UGA` | Server name reported in `serverInfo` and by `GET /` |
 | `UGA_AUDIT_LOG` or `serve.audit_log` | unset | Audit log file (see [Audit log](#audit-log)) |
 | `UGA_AUDIT_LOG_QUERY_TEXT` | off | `1`, `true`, or `yes` also logs a query preview |
+| `UGA_AUDIT_HASH_KEY` | random per run | Key for the audit log's query hash |
+| `serve.forwarded_allow_ips` | unset | Proxy addresses whose `X-Forwarded-For` is trusted for the audited `peer` |
 | `UGA_MCP_SEARCH_LIMIT` | `10` | Maximum `search` results |
 | `UGA_MCP_FETCH_MAX_CHARS` | `100000` | Maximum characters of `text` that `fetch` returns |
 | `UGA_MCP_TOOL_TIMEOUT_SECONDS` | `10` | Timeout for a tool call |
 | `UGA_MCP_METADATA_TIMEOUT_SECONDS` | `5` | Timeout for `initialize` and `tools/list` |
 
-Where a setting has both an environment variable and a config key, the environment variable wins. An unset, unparsable, or non-positive value for the last four falls back to the default. A relative `serve.audit_log` is resolved against the working directory, not the config file's directory.
+Where a setting has both an environment variable and a config key, the environment variable wins. An unset, unparsable, or non-positive value for the last four falls back to the default. A relative `serve.audit_log` is resolved against the config file's directory.
 
 ### Data format
 
-Each JSONL line is one approved record with `id` (a non-empty string or integer), `title`, `text`, and `url`, plus an optional `metadata` object. `title`, `text`, and `url` must be present and not `null`; their values are served as strings, and so is an integer `id` (record `7` is fetched as `"7"`). Of the other top-level keys, only the approved fields listed in `_OPTIONAL_TOP_LEVEL_FIELDS` in `src/uga/adapter.py` are kept; any other key is dropped at load time and is never served or searched. The allowlist does not apply inside `metadata`, which is served and searched in full, so keep out of it anything clients must not see.
+Each JSONL line is one approved record with `id` (a non-empty string or integer) and the strings `title`, `text`, and `url`, plus an optional `metadata` object. An integer `id` is served as a string (record `7` is fetched as `"7"`). Other keys, at the top level or inside `metadata`, are kept only if they are approved fields listed in `_APPROVED_FIELDS` in `src/uga/adapter.py`; any other key is dropped at load time and is never served or searched. An approved field keeps its whole value, including nested objects.
 
-Blank lines are skipped. Invalid JSON, a missing required field, or a duplicate `id` stops startup.
+Blank lines are skipped. Invalid JSON, a missing or non-string `title`, `text`, or `url`, or a duplicate `id` stops startup.
 
 ### Tools
 
@@ -78,23 +80,27 @@ Blank lines are skipped. Invalid JSON, a missing required field, or a duplicate 
 | `search` | `query` | `{"results": [...]}` with up to `UGA_MCP_SEARCH_LIMIT` hits. Each hit has `id`, `title`, and `url`, plus whichever of `summary`, `snippet`, `bank_id`, `record_kind`, `status`, and `updated_at` the record has (top-level field first, then `metadata`). |
 | `fetch` | `id` | The full record: `id`, `title`, `text`, `url`, `metadata`, and the approved top-level fields it has. |
 
-Search is a case-insensitive substring match against the values of `title`, `text`, `url`, `metadata`, and the approved fields; it does not match the `id` or JSON key names. An empty query returns the first records in file order. `fetch` of an unknown id fails with `Record not found: <id>`.
+Search is a case-insensitive substring match against the values of `title`, `text`, `url`, `metadata`, and the approved fields; it does not match the `id` or JSON key names, and never matches across two fields. An empty query returns the first records in file order. `fetch` of an unknown id fails with `Record not found: <id>`.
 
 `fetch` returns at most `UGA_MCP_FETCH_MAX_CHARS` characters of a record's `text`. A longer text is cut to that length, and the response adds `truncated: true` and the full `text_length`. Other fields are returned as exported.
 
 Both tools declare `readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`, and `openWorldHint=false`. They only read the snapshot loaded at startup, so changes to the JSONL file take effect on restart. The server reports the package version (`uga.__version__`) in `serverInfo`, and its MCP `instructions` tell agents to search, then fetch by id, and to treat record text as data rather than instructions.
 
+Other MCP methods follow the same default-deny policy: `resources/list`, `resources/templates/list` and `prompts/list` return empty lists, `ping` is answered, and every other request (for example `resources/read`, `prompts/get`, `logging/setLevel`) is rejected.
+
 ### Audit log
 
-Each `initialize`, `tools/list`, and `tools/call` request, and each HTTP request rejected by auth, is written as one JSON line to stderr (prefixed with `[uga audit] `) and, if `UGA_AUDIT_LOG` (or `serve.audit_log` in the config) is set, to that file. Missing parent directories are created, and a new file gets mode `0600`. Other MCP requests, such as `ping`, and an authenticated `GET /` are not audited.
+Each MCP request except `ping`, and each HTTP request rejected by auth, is written as one JSON line to stderr (prefixed with `[uga audit] `) and, if `UGA_AUDIT_LOG` (or `serve.audit_log` in the config, resolved against the config file's directory) is set, to that file. Missing parent directories are created. The file is opened without following symlinks, must be a regular file, and is set to mode `0600`, including when it already exists. An authenticated `GET /` is not audited.
 
-A permitted tool call produces two lines that share a `request_id`: one from the tool and one from the policy middleware. A call to any other tool produces one line with `detail: "policy_denied"`, and its arguments are not logged. Rejected HTTP requests are logged as `tool: "auth"` with `missing_token`, `invalid_token`, or `forbidden`.
+Each line has a `request_id` that is unique per request, and a tool call's line carries what the tool recorded (`record_id`, `result_count`, the query hash). Denied tools and methods are logged with `detail: "policy_denied"`, and their arguments are not logged. Requests rejected by bearer auth are logged as `tool: "auth"` with `missing_token`, `invalid_token`, or `forbidden`. Methods the MCP SDK does not implement at all are rejected by the SDK and not logged. Client-supplied strings such as tool names and record ids are cut to 200 characters.
 
-`fetch` ids are logged as given. Queries are logged as their length and the first 16 hex digits of an unsalted SHA-256 hash, which links repeated queries but does not hide short or guessable ones. Set `UGA_AUDIT_LOG_QUERY_TEXT=1` to also log a preview of up to 80 characters.
+Queries are recorded as their length and a keyed hash (the first 16 hex digits of an HMAC-SHA256); set `UGA_AUDIT_LOG_QUERY_TEXT=1` to also log a preview of up to 80 characters. Set `UGA_AUDIT_HASH_KEY` to a random secret to make the hash of the same query stable across restarts; without it a random key is used for each run, and the hash cannot be reversed by hashing guesses without the key.
+
+The `peer` field is the address of the TCP connection. `X-Forwarded-For` is ignored unless the proxy's address is listed in `serve.forwarded_allow_ips`. If you serve `create_uga_server().http_app()` with your own uvicorn, pass `proxy_headers=False` (uvicorn trusts the header from 127.0.0.1 by default).
 
 ## Filesystem route
 
-`python -m uga.fs_gateway` (or `./scripts/run-contextbridge-fs.sh`) is a separate MCP server on port 8791. It gives agents file access inside the directories listed under `filesystem.roots` in `configs/contextbridge-fs.yaml`. The shipped config lists none, so the route refuses to start until you add some.
+`python -m uga.fs_gateway` (or `./scripts/run-contextbridge-fs.sh`) is a separate MCP server on port 8794. It gives agents file access inside the directories listed under `filesystem.roots` in `configs/contextbridge-fs.yaml`. The shipped config lists none, so the route refuses to start until you add some.
 
 ```sh
 export CONTEXTBRIDGE_FS_AUTH_TOKEN="<a different strong secret>"
@@ -123,7 +129,7 @@ Read tools are annotated read-only. `write_file`, `edit_block` and `delete_file`
 
 **Limits:** `max_read_bytes` and `max_write_bytes` (1 MiB each by default) cap a response and a write, and `max_list_entries` (1000) caps a listing. Calls use the same `UGA_MCP_TOOL_TIMEOUT_SECONDS` and `UGA_MCP_METADATA_TIMEOUT_SECONDS` settings as the gateway. Text must be UTF-8; binary files are refused.
 
-**Audit:** lines go to stderr and to `CONTEXTBRIDGE_FS_AUDIT_LOG` (or `serve.audit_log`, resolved against the working directory) with `route: "fs"`. Paths are logged as the client sent them, with byte counts for reads and writes and the trash location for deletes. Refused paths are logged with `detail: "path_denied"`.
+**Audit:** lines go to stderr and to `CONTEXTBRIDGE_FS_AUDIT_LOG` (or `serve.audit_log`, resolved against the config file's directory) with `route: "fs"`. As on the gateway, each request is one line, and `X-Forwarded-For` is ignored unless `serve.forwarded_allow_ips` lists the proxy. Paths are logged as the client sent them, with byte counts for reads and writes and the trash location for deletes. Refused paths are logged with `detail: "path_denied"`.
 
 **Known limits:** checks run before each operation, so another local process that swaps a symlink in between can still redirect it; only the final component is opened with `O_NOFOLLOW`. Likewise, a destination created between `move_file`'s check and the rename is replaced. Hard links that already exist inside a root are not detected.
 
@@ -494,13 +500,13 @@ Native delete and the PDF, Word, and Excel tools arrived in phase 7 (see [Docume
 
 No route depends on Authentik.
 - **Knowledge route:** binds to loopback by default; do not set `serve.host` to a public interface. It has no OAuth front end; the remote endpoint serves only the computer route.
-- **Filesystem route:** binds to loopback by default, and the same `serve.host` rule applies. It has no OAuth front end either.
+- **Filesystem route (8794):** binds to loopback by default, and the same `serve.host` rule applies. It has no OAuth front end either.
 - **Computer MCP endpoints:** refuse any non-loopback address; there is no override.
   - **Local listener (8791):** accepts only the static token.
   - **Remote listener (8793):** accepts only OAuth tokens. It is meant to be published only through a TLS tunnel.
 - **Agent listener:** TLS-only, limited to private addresses, and accepts only enrolled devices.
 
-Do not forward ports 8790, 8791, or 8792 to the internet. Publish 8793 only through a TLS tunnel, and only once `owner-init` is done.
+Do not forward ports 8790, 8791, 8792, or 8794 to the internet. Publish 8793 only through a TLS tunnel, and only once `owner-init` is done.
 
 ## Roadmap
 

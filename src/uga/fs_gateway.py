@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-import time
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
@@ -29,13 +28,15 @@ from .audit import UgaAuditLog
 from .fs import Filesystem, FsError, filesystem_from_config
 from .gateway import (
     UgaAllowlistMiddleware,
+    _add_audit_fields,
     _BearerTokenVerifier,
-    _current_request_id,
-    _elapsed_ms,
+    _config_relative,
+    _guard_low_level_handlers,
     _require_token,
+    _UgaServer,
     advertised_tool_names,
-    http_middleware,
     unauthenticated_response,
+    uvicorn_config,
 )
 from .policy import FS_READ_TOOLS, FS_WRITE_TOOLS
 
@@ -83,85 +84,63 @@ def create_fs_server(
     if audit is None:
         audit = UgaAuditLog(os.environ.get(AUDIT_ENV), route="fs")
     allowed = allowed_fs_tools(fs)
-    server = FastMCP(
+    server = _UgaServer(
         name=name,
         version=__version__,
         auth=verifier,
         mask_error_details=True,
         instructions=_instructions(fs),
     )
+    server.uga_audit = audit
 
     def audited(
-        tool: str,
         op: Callable[[], dict[str, Any]],
         *,
         path: str | list[str],
         destination: str | None = None,
     ) -> dict[str, Any]:
-        started = time.monotonic()
-        request_id = _current_request_id.get()
+        # The middleware writes the request's one audit line; this adds what the
+        # tool knows to it.
+        _add_audit_fields(path=path, destination=destination)
         try:
             result = op()
         except FsError as exc:
-            audit.record(
-                tool=tool,
-                path=path,
-                destination=destination,
-                success=False,
-                detail=exc.code,
-                request_id=request_id,
-                elapsed_ms=_elapsed_ms(started),
-            )
+            _add_audit_fields(detail=exc.code)
             raise ToolError(str(exc)) from None
-        except Exception as exc:
-            audit.record(
-                tool=tool,
-                path=path,
-                destination=destination,
-                success=False,
-                detail=type(exc).__name__,
-                request_id=request_id,
-                elapsed_ms=_elapsed_ms(started),
-            )
-            raise
-        audit.record(
-            tool=tool,
-            path=path,
-            destination=destination or result.get("trash_path"),
-            size=result.get("bytes"),
-            success=True,
-            request_id=request_id,
-            elapsed_ms=_elapsed_ms(started),
+        _add_audit_fields(
+            destination=destination or result.get("trash_path"), size=result.get("bytes")
         )
         return result
 
-    async def run(tool: str, op: Callable[..., dict[str, Any]], *args: Any, **audit_kw: Any) -> Any:
-        # abandon_on_cancel lets the middleware's timeout cancel the call; see gateway.py.
-        work = partial(audited, tool, partial(op, *args), **audit_kw)
+    async def run(op: Callable[..., dict[str, Any]], *args: Any, **audit_kw: Any) -> Any:
+        # Filesystem calls block, so they run in a worker thread. abandon_on_cancel
+        # lets the middleware's timeout answer the client; the thread itself can't be
+        # stopped and may still finish, but it can no longer write an audit line.
+        work = partial(audited, partial(op, *args), **audit_kw)
         return await anyio.to_thread.run_sync(work, abandon_on_cancel=True)
 
     @server.tool(name="read_file", annotations=_READ)
     async def read_file(path: str, offset: int = 0, length: int | None = None) -> dict[str, Any]:
         """Read a UTF-8 text file by line. offset is the first line (0-based); a
         negative offset reads the last lines. length caps the lines returned."""
-        return await run("read_file", fs.read_file, path, offset, length, path=path)
+        return await run(fs.read_file, path, offset, length, path=path)
 
     @server.tool(name="read_multiple_files", annotations=_READ)
     async def read_multiple_files(paths: list[str]) -> dict[str, Any]:
         """Read several UTF-8 text files. A failure on one file is reported in its
         entry and does not fail the others."""
-        return await run("read_multiple_files", fs.read_multiple_files, paths, path=paths)
+        return await run(fs.read_multiple_files, paths, path=paths)
 
     @server.tool(name="list_directory", annotations=_READ)
     async def list_directory(path: str, depth: int = 2) -> dict[str, Any]:
         """List a directory's entries up to depth levels deep. Symlinks are listed,
         not followed."""
-        return await run("list_directory", fs.list_directory, path, depth, path=path)
+        return await run(fs.list_directory, path, depth, path=path)
 
     @server.tool(name="get_file_info", annotations=_READ)
     async def get_file_info(path: str) -> dict[str, Any]:
         """Get a file's or directory's size, timestamps, permissions and type."""
-        return await run("get_file_info", fs.get_file_info, path, path=path)
+        return await run(fs.get_file_info, path, path=path)
 
     if fs.writable:
 
@@ -171,7 +150,7 @@ def create_fs_server(
         ) -> dict[str, Any]:
             """Create or overwrite a text file, or append to it. The parent directory
             must exist."""
-            return await run("write_file", fs.write_file, path, content, mode, path=path)
+            return await run(fs.write_file, path, content, mode, path=path)
 
         @server.tool(name="edit_block", annotations=_DESTRUCTIVE)
         async def edit_block(
@@ -180,7 +159,6 @@ def create_fs_server(
             """Replace exact text in a file. Fails unless old_string occurs exactly
             expected_replacements times."""
             return await run(
-                "edit_block",
                 fs.edit_block,
                 file_path,
                 old_string,
@@ -192,20 +170,20 @@ def create_fs_server(
         @server.tool(name="create_directory", annotations=_CREATE_DIRECTORY)
         async def create_directory(path: str) -> dict[str, Any]:
             """Create a directory, including any missing parent directories."""
-            return await run("create_directory", fs.create_directory, path, path=path)
+            return await run(fs.create_directory, path, path=path)
 
         @server.tool(name="move_file", annotations=_MOVE)
         async def move_file(source: str, destination: str) -> dict[str, Any]:
             """Move or rename a file or directory. Fails if destination exists."""
             return await run(
-                "move_file", fs.move_file, source, destination, path=source, destination=destination
+                fs.move_file, source, destination, path=source, destination=destination
             )
 
         @server.tool(name="delete_file", annotations=_DESTRUCTIVE)
         async def delete_file(path: str, recursive: bool = False) -> dict[str, Any]:
             """Delete a file, symlink or directory by moving it to the trash. A
             non-empty directory needs recursive=true."""
-            return await run("delete_file", fs.delete_file, path, recursive, path=path)
+            return await run(fs.delete_file, path, recursive, path=path)
 
     server.add_middleware(
         UgaAllowlistMiddleware(
@@ -215,6 +193,7 @@ def create_fs_server(
             service_name="ContextBridge filesystem",
         )
     )
+    _guard_low_level_handlers(server, audit, route_name="filesystem")
 
     @server.custom_route("/", methods=["GET"])
     async def root_status(request: Request) -> JSONResponse:
@@ -247,8 +226,13 @@ def main() -> None:
         raise SystemExit(f"{args.config}: serve.port is required.")
 
     try:
-        fs = filesystem_from_config(cfg.get("filesystem"), config_path=Path(args.config))
-        audit = UgaAuditLog(os.environ.get(AUDIT_ENV) or serve.get("audit_log"), route="fs")
+        config_path = Path(args.config)
+        fs = filesystem_from_config(cfg.get("filesystem"), config_path=config_path)
+        configured_log = serve.get("audit_log")
+        audit_log = os.environ.get(AUDIT_ENV) or (
+            str(_config_relative(configured_log, config_path)) if configured_log else None
+        )
+        audit = UgaAuditLog(audit_log, route="fs")
     except (OSError, ValueError) as exc:
         raise SystemExit(f"filesystem route startup failed: {exc}") from None
 
@@ -274,7 +258,7 @@ def main() -> None:
         host=host,
         port=port,
         show_banner=False,
-        middleware=http_middleware(audit),
+        uvicorn_config=uvicorn_config(serve),
     )
 
 

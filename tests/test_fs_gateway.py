@@ -25,7 +25,6 @@ from uga import fs_gateway
 from uga.audit import UgaAuditLog
 from uga.fs import Filesystem, FsRoot
 from uga.fs_gateway import create_fs_server
-from uga.gateway import http_middleware
 from uga.policy import FS_READ_TOOLS, FS_WRITE_TOOLS, UGA_ALLOWED_TOOLS
 
 REPO = Path(__file__).resolve().parents[1]
@@ -174,9 +173,14 @@ def test_audit_records_paths_sizes_and_denials(tmp_path: Path) -> None:
     )
     assert (delete["tool"], delete["destination"]) == ("delete_file", trash)
     assert (refused["success"], refused["detail"]) == (False, "path_denied")
-    # The tool's line and the middleware's line share a request_id.
-    lines = [e for e in read_audit(audit_path) if e["tool"] == "write_file"]
-    assert len({e["request_id"] for e in lines[:2]}) == 1
+    # One line per request, written by the middleware with the tool's fields. The
+    # SDK's own tools/list refresh during a call is not audited, so no other line
+    # shares a call's request_id.
+    lines = read_audit(audit_path)
+    calls = [e for e in lines if e["tool"] not in ("initialize", "tools/list")]
+    assert calls == entries
+    ids = [e["request_id"] for e in lines]
+    assert all(ids.count(e["request_id"]) == 1 for e in calls)
 
 
 def test_unexpected_errors_are_masked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -207,7 +211,8 @@ def test_http_requires_bearer_token(tmp_path: Path) -> None:
 
     auth = {"Authorization": f"Bearer {TOKEN}"}
 
-    with TestClient(server.http_app(middleware=http_middleware(audit))) as client:
+    # The server's HTTP app always carries the auth-failure audit middleware.
+    with TestClient(server.http_app()) as client:
         missing = client.post("/mcp", json=_INITIALIZE, headers=headers)
         ok = client.post("/mcp", json=_INITIALIZE, headers={**headers, **auth})
         status_missing = client.get("/")
@@ -220,10 +225,10 @@ def test_http_requires_bearer_token(tmp_path: Path) -> None:
     assert auth_lines == ["missing_token", "missing_token"]
 
 
-def _write_config(tmp_path: Path, port: int, roots: str) -> Path:
+def _write_config(tmp_path: Path, port: int, roots: str, serve_extra: str = "") -> Path:
     config = tmp_path / "fs.yaml"
     config.write_text(
-        f"name: ContextBridge Files\nserve:\n  host: 127.0.0.1\n  port: {port}\n"
+        f"name: ContextBridge Files\nserve:\n  host: 127.0.0.1\n  port: {port}\n{serve_extra}"
         f"filesystem:\n  roots:\n{roots}",
         encoding="utf-8",
     )
@@ -271,11 +276,14 @@ def _free_port() -> int:
 
 
 @pytest.fixture(scope="module")
-def fs_gateway_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[str, Path]]:
+def fs_gateway_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[str, Path, Path]]:
     tmp = tmp_path_factory.mktemp("fs-entrypoint")
     (tmp / "work").mkdir()
     port = _free_port()
-    config = _write_config(tmp, port, "    - path: work\n      writable: true\n")
+    # A relative audit_log resolves against the config's directory, not the cwd.
+    config = _write_config(
+        tmp, port, "    - path: work\n      writable: true\n", "  audit_log: fs-audit.jsonl\n"
+    )
     env = {
         key: value
         for key, value in os.environ.items()
@@ -288,6 +296,7 @@ def fs_gateway_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[s
     with log.open("w") as log_fh:
         proc = subprocess.Popen(
             [sys.executable, "-m", "uga.fs_gateway", "--config", str(config)],
+            cwd=tmp_path_factory.mktemp("fs-cwd"),
             env=env,
             stdout=log_fh,
             stderr=subprocess.STDOUT,
@@ -312,7 +321,7 @@ def fs_gateway_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[s
                     pytest.fail(f"filesystem gateway did not start:\n{log.read_text()}")
                 time.sleep(0.2)
             assert "serving 9 tools over 1 root(s) (1 writable)" in log.read_text()
-            yield base, Path(os.path.realpath(tmp / "work"))
+            yield base, Path(os.path.realpath(tmp / "work")), tmp / "fs-audit.jsonl"
         finally:
             proc.terminate()
             try:
@@ -322,21 +331,29 @@ def fs_gateway_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[s
                 proc.wait()
 
 
-def test_entrypoint_rejects_requests_without_token(fs_gateway_url: tuple[str, Path]) -> None:
-    base, _ = fs_gateway_url
+def test_entrypoint_rejects_requests_without_token(
+    fs_gateway_url: tuple[str, Path, Path],
+) -> None:
+    base, _, audit_path = fs_gateway_url
     response = httpx.post(
         f"{base}/mcp",
         json=_INITIALIZE,
-        headers={"Accept": "application/json, text/event-stream"},
+        headers={
+            "Accept": "application/json, text/event-stream",
+            "X-Forwarded-For": "203.0.113.9",
+        },
         timeout=5,
         trust_env=False,
     )
 
     assert response.status_code == 401
+    # Audited next to the config, with the TCP peer rather than the forwarded one.
+    auth = [e for e in read_audit(audit_path) if e["tool"] == "auth"]
+    assert auth and all(e["peer"] == "127.0.0.1" for e in auth)
 
 
-def test_entrypoint_writes_and_reads_with_token(fs_gateway_url: tuple[str, Path]) -> None:
-    base, work = fs_gateway_url
+def test_entrypoint_writes_and_reads_with_token(fs_gateway_url: tuple[str, Path, Path]) -> None:
+    base, work, _ = fs_gateway_url
     target = str(work / "hello.txt")
 
     async def go() -> str:
