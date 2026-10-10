@@ -494,7 +494,7 @@ def gateway_config(tmp_path, workspace, monkeypatch):
     def launch(**agents):
         cfg = {
             "serve": {"host": "127.0.0.1", "port": 18791, "audit_log": str(tmp_path / "gw.jsonl")},
-            "agents": {"enabled": True, "port": 18792, "registry": str(tmp_path / "devices.json"), **agents},
+            "agents": {"enabled": True, "port": 18792, "registry": str(tmp_path / "devices.json"), "tailnet_node_ids": ["node-fixture"], **agents},
         }
         path = tmp_path / "gateway.yaml"
         path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
@@ -521,3 +521,8 @@ def test_agent_listener_requires_a_registry_and_numeric_timing(gateway_config):
         gateway_config(registry=None)
     with pytest.raises(SystemExit, match="must be numbers"):
         gateway_config(heartbeat_seconds="soon")
+
+
+def test_agent_listener_requires_tailnet_enrollment(gateway_config):
+    with pytest.raises(SystemExit, match="tailnet_node_ids"):
+        gateway_config(host="100.91.238.124", tls_cert="c", tls_key="k", tailnet_node_ids=[])

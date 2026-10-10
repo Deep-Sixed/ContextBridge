@@ -21,6 +21,10 @@ agents:
   port: 8792
   tls_cert: ../state/tls/gateway.crt   # required unless host is loopback
   tls_key: ../state/tls/gateway.key    # hidden from every file tool
+  # Mandatory tailnet admission. Use stable peer IDs from gateway-local
+  # `tailscale status --json` (Peer[*].ID), not a hostname or IP range.
+  # No remote agents start until this is explicitly configured.
+  tailnet_node_ids: []
   registry: ../state/devices.json      # enrolled devices; hidden from every file tool
   heartbeat_seconds: 15    # a device is dropped after 3 missed heartbeats
   call_timeout_seconds: 660
@@ -28,7 +32,7 @@ agents:
 remote:
   # ChatGPT, Claude, and other remote MCP clients connect here with OAuth. Off until you set it up:
   #   contextbridge-admin --config configs/computer.yaml owner-init    # passphrase + authenticator app
-  #   tailscale funnel --bg 8793                                       # or any TLS tunnel to host:port
+  #   Publish only via an authenticated private-tailnet endpoint; no public Funnel by default
   # Then add <public_url>/mcp as a custom connector. Each client is approved on a consent page
   # (passphrase + authenticator code) where you pick its permissions and devices.
   enabled: false

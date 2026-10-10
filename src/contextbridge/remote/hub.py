@@ -41,6 +41,7 @@ from .protocol import (
     error,
 )
 from .registry import DeviceRecord, DeviceRegistry, EnrollmentRejected, RegistryError
+from .tailnet import TailnetAdmissionDenied, verify_local_tailnet_peer
 
 MONITOR_INTERVAL_SECONDS = 0.5
 FAILED_ENROLL_DELAY_SECONDS = 1.0
@@ -115,8 +116,10 @@ class AgentHub:
         *,
         heartbeat_seconds: float = 15.0,
         call_timeout_seconds: float = 660.0,
+        allowed_tailnet_node_ids: frozenset[str] | None = None,
     ) -> None:
         self.registry = registry
+        self.allowed_tailnet_node_ids = allowed_tailnet_node_ids
         self.audit = audit
         self.heartbeat_seconds = heartbeat_seconds
         self.call_timeout_seconds = call_timeout_seconds
@@ -229,6 +232,17 @@ class AgentHub:
 
     async def _handle(self, ws: ServerConnection) -> None:
         peer = str(ws.remote_address[0]) if ws.remote_address else None
+        if self.allowed_tailnet_node_ids is not None:
+            try:
+                if peer is None:
+                    raise TailnetAdmissionDenied("unknown peer address")
+                await asyncio.to_thread(
+                    verify_local_tailnet_peer, peer, self.allowed_tailnet_node_ids
+                )
+            except TailnetAdmissionDenied:
+                self._log("tailnet_admission_denied", peer=peer)
+                await self._refuse(ws, "tailnet_denied", "tailnet admission denied")
+                return
         try:
             first = decode(
                 await asyncio.wait_for(ws.recv(), HANDSHAKE_TIMEOUT_SECONDS), expect=("enroll", "hello")
