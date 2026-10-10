@@ -80,7 +80,7 @@ The `peer` field is the address of the TCP connection. `X-Forwarded-For` is igno
 
 ## Filesystem route
 
-`python -m uga.fs_gateway` (or `./scripts/run-contextbridge-fs.sh`) is a second MCP server on port 8791. It gives agents file access inside the directories listed under `filesystem.roots` in `configs/contextbridge-fs.yaml`. The shipped config lists none, so the route refuses to start until you add some.
+`python -m uga.fs_gateway` (or `./scripts/run-contextbridge-fs.sh`) is a second MCP server on port 8794. It gives agents file access inside the directories listed under `filesystem.roots` in `configs/contextbridge-fs.yaml`. The shipped config lists none, so the route refuses to start until you add some.
 
 ```sh
 export CONTEXTBRIDGE_FS_AUTH_TOKEN="<a different strong secret>"
@@ -124,7 +124,7 @@ python3 -m pytest
 
 ## Access model
 
-This standalone gateway does not depend on Authentik. It does **not** include an OAuth proxy, public HTTPS listener, or ChatGPT/Claude Web OAuth discovery. To expose it to remote AI clients, use a separate authenticated TLS/OAuth access layer. Do not set `serve.host` to a public interface or directly forward port 8790 (or the filesystem route's 8791) to the internet.
+This standalone gateway does not depend on Authentik. It does **not** include an OAuth proxy, public HTTPS listener, or ChatGPT/Claude Web OAuth discovery. To expose it to remote AI clients, use a separate authenticated TLS/OAuth access layer. Do not set `serve.host` to a public interface or directly forward port 8790 (or the filesystem route's 8794) to the internet.
 
 ## Documentation
 
