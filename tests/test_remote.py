@@ -480,6 +480,121 @@ def test_agent_reconnects_after_gateway_restart(tmp_path, workspace):
     asyncio.run(scenario())
 
 
+def duplicate_of(remote, tmp_path: Path) -> Agent:
+    """A second agent holding the same device key: a copy started by hand, or a restarted agent."""
+    audit = ComputerAuditLog(tmp_path / "duplicate-audit.jsonl", route="agent", echo=False)
+    return Agent(remote.config, remote.identity, audit=audit)
+
+
+def count(path: Path, event: str) -> int:
+    return sum(1 for e in events(path) if e["event"] == event)
+
+
+def test_duplicate_agent_cannot_displace_a_live_connection(tmp_path, workspace):
+    async def scenario():
+        async with gateway(tmp_path) as gw, connected_agent(tmp_path, workspace, gw) as remote:
+            first = gw.hub.connection(DEVICE)
+            duplicate = duplicate_of(remote, tmp_path)
+            task = asyncio.create_task(duplicate.run())
+            try:
+                await wait_for(lambda: count(gw.audit_path, "device_duplicate_refused") >= 2, timeout=10)
+                assert gw.hub.connection(DEVICE) is first and not first.dropped
+                assert remote.agent.connected.is_set() and not duplicate.connected.is_set()
+                result = await gw.hub.call(DEVICE, "read_file", {"path": "docs/notes.md"}, None)
+                assert result["content"].startswith("alpha")
+            finally:
+                duplicate.stop()
+                await asyncio.wait_for(task, 10)
+
+    asyncio.run(scenario())
+    served = [e["tool"] for e in events(tmp_path / "agent-audit.jsonl") if e["event"] == "requested"]
+    assert served == ["read_file"]  # the established agent served the call
+    assert count(tmp_path / "duplicate-audit.jsonl", "gateway_connected") == 0
+    assert count(tmp_path / "gateway-audit.jsonl", "device_connected") == 1
+
+
+def test_restarted_agent_takes_over_a_connection_that_stopped_answering(tmp_path, workspace):
+    """A half-open connection (the agent rebooted or lost its network) must not lock the device out."""
+
+    async def scenario():
+        async with gateway(tmp_path) as gw, connected_agent(tmp_path, workspace, gw) as remote:
+            gw.hub.takeover_probe_seconds = 0.5
+            stale = gw.hub.connection(DEVICE)
+            stale.ws.transport.pause_reading()  # nothing more from the old agent reaches the gateway
+            restarted = duplicate_of(remote, tmp_path)
+            task = asyncio.create_task(restarted.run())
+            try:
+                await asyncio.wait_for(restarted.connected.wait(), 5)
+                fresh = gw.hub.connection(DEVICE)
+                assert fresh is not stale and stale.dropped
+                stale.ws.transport.resume_reading()
+                # The old agent is told it was replaced; when it comes back, it is the duplicate.
+                await wait_for(lambda: count(gw.audit_path, "device_duplicate_refused") >= 1, timeout=10)
+                assert gw.hub.connection(DEVICE) is fresh
+                result = await gw.hub.call(DEVICE, "read_file", {"path": "docs/notes.md"}, None)
+                assert result["content"].startswith("alpha")
+            finally:
+                restarted.stop()
+                await asyncio.wait_for(task, 10)
+
+    asyncio.run(scenario())
+    reasons = [e["reason"] for e in events(tmp_path / "gateway-audit.jsonl") if e["event"] == "device_disconnected"]
+    assert "the previous connection stopped answering" in reasons
+    served = [e["tool"] for e in events(tmp_path / "duplicate-audit.jsonl") if e["event"] == "requested"]
+    assert served == ["read_file"]
+
+
+def test_only_one_newcomer_takes_over_a_stale_connection(tmp_path, workspace):
+    async def scenario():
+        async with gateway(tmp_path) as gw, connected_agent(tmp_path, workspace, gw) as remote:
+            gw.hub.takeover_probe_seconds = 0.5
+            stale = gw.hub.connection(DEVICE)
+            stale.ws.transport.pause_reading()
+            newcomers = [duplicate_of(remote, tmp_path) for _ in range(2)]
+            tasks = [asyncio.create_task(agent.run()) for agent in newcomers]
+            try:
+                await wait_for(lambda: count(gw.audit_path, "device_duplicate_refused") >= 1, timeout=10)
+                winners = [agent for agent in newcomers if agent.connected.is_set()]
+                assert len(winners) == 1
+                result = await gw.hub.call(DEVICE, "read_file", {"path": "docs/notes.md"}, None)
+                assert result["content"].startswith("alpha")
+            finally:
+                stale.ws.transport.resume_reading()
+                for agent in newcomers:
+                    agent.stop()
+                await asyncio.wait_for(asyncio.gather(*tasks), 10)
+
+    asyncio.run(scenario())
+
+
+def test_agent_reconnects_promptly_after_a_long_outage(tmp_path, workspace, monkeypatch):
+    """Backoff built up while the device could not get in must not delay its next reconnect."""
+    from contextbridge.remote import agent as agent_module
+
+    monkeypatch.setattr(agent_module, "random", SimpleNamespace(uniform=lambda low, high: 0.04))
+
+    async def scenario():
+        async with gateway(tmp_path) as gw, connected_agent(tmp_path, workspace, gw) as remote:
+            waiting = duplicate_of(remote, tmp_path)
+            task = asyncio.create_task(waiting.run())
+            try:
+                # After six refusals its backoff is at the ceiling (60s, scaled to 2.4s here).
+                await wait_for(lambda: count(gw.audit_path, "device_duplicate_refused") >= 7, timeout=15)
+                remote.agent.stop()
+                await asyncio.wait_for(remote.task, 10)
+                await asyncio.wait_for(waiting.connected.wait(), 10)
+                conn = gw.hub.connection(DEVICE)
+                dropped_at = time.monotonic()
+                gw.hub._disconnect(conn, "heartbeat", "no heartbeat received")
+                await wait_for(lambda: gw.hub.connection(DEVICE) not in (None, conn), timeout=10)
+                return time.monotonic() - dropped_at
+            finally:
+                waiting.stop()
+                await asyncio.wait_for(task, 10)
+
+    assert asyncio.run(scenario()) < 1.0  # the 1s base backoff, not the ceiling (both scaled by 0.04)
+
+
 def test_remote_session_exit_reaches_the_gateway_audit(tmp_path, workspace):
     async def scenario():
         async with gateway(tmp_path) as gw, connected_agent(tmp_path, workspace, gw):
