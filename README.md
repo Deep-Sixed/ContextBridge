@@ -178,6 +178,8 @@ export CONTEXTBRIDGE_COMPUTER_TOKEN="$(openssl rand -hex 32)"   # keep it in you
 ./scripts/run-computer.sh                                       # http://127.0.0.1:8791/mcp
 ```
 
+Set `CONTEXTBRIDGE_COMPUTER_CONFIG` to use another config file.
+
 Local MCP clients connect with the token as a bearer header. For example, in Claude Code:
 
 ```sh
@@ -199,7 +201,7 @@ These checks run on **every tool call**, at the moment it executes:
 
 - **Paths.** Every path resolves through symlinks before it is checked, so neither `..` nor a symlink can escape `filesystem.roots`. Writes are allowed only inside `filesystem.writable_roots`. Any path with a component matching a `deny` glob (`.ssh`, `.env*`, `*.pem`, `*.kdbx`, and so on) is hidden from listings and searches and refused for reads and writes. The policy file and the audit log can never be written or moved through ContextBridge.
 - **Limits.** Reads, writes, search results, and search time all have caps. Rewrites are atomic and preserve file mode. `edit_block` fails unless the match count is exactly what the caller expected.
-- **Commands.** `allowlist` mode runs one program per call without a shell. The program must be on the allowlist, and pipes, redirects, `;` and `&&` are refused before anything runs. `unrestricted` mode runs through `bash -c`. The working directory must be inside a readable root. Every command has a hard timeout (`max_timeout_seconds` caps whatever the caller asks for), and a timed-out command is killed along with every process it started. Output is capped in memory, keeping the head and the tail. Variables that look like credentials (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`, …) are removed from the child's environment. `MCP_AUTH_TOKEN` and `CONTEXTBRIDGE_COMPUTER_TOKEN` are always removed, even with a custom `env_strip` list; `CONTEXTBRIDGE_FS_AUTH_TOKEN` is removed only by a `*TOKEN*`-style pattern.
+- **Commands.** `allowlist` mode runs one program per call without a shell. The program must be on the allowlist, and pipes, redirects, `;` and `&&` are refused before anything runs. `unrestricted` mode runs through a shell: `bash -c` by default (PowerShell on Windows), or whatever `commands.shell` names (`bash`, `sh`, `powershell`, `pwsh`, `cmd`, or an argv list). The working directory must be inside a readable root. Every command has a hard timeout (`max_timeout_seconds` caps whatever the caller asks for), and a timed-out command is killed along with every process it started. Output is capped in memory, keeping the head and the tail. Variables that look like credentials (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`, …) are removed from the child's environment. `MCP_AUTH_TOKEN` and `CONTEXTBRIDGE_COMPUTER_TOKEN` are always removed, even with a custom `env_strip` list; `CONTEXTBRIDGE_FS_AUTH_TOKEN` is removed only by a `*TOKEN*`-style pattern.
 - **Sessions.** `start_process` runs long or interactive programs in the background. Concurrent sessions are capped (`max_sessions`) and each is killed when it reaches `max_session_seconds`.
 - **Deletes.** `delete_file` works only inside writable roots. It never deletes a root, a protected or hidden path, or a folder holding anything the file tools may not see (a `.ssh` or `.env` inside, say). A non-empty folder needs `recursive: true` and is capped at `max_delete_entries` (10,000).
   - **`delete: trash` (default):** the item moves to `.contextbridge-trash/<trash_id>/` in its writable root, beside a `<trash_id>.json` record of where it came from. `list_deleted` shows the trash and `restore_deleted` puts an item back, but no file tool can read, change, or empty the trash, so a client cannot make its own deletions permanent. Empty it on the host. The layout is the [filesystem route](#filesystem-route)'s, so a folder both routes serve has one trash.
@@ -277,7 +279,7 @@ contextbridge-admin --config configs/computer.yaml pair thanatos            # pr
 On the device, copy `configs/agent.yaml` and set:
 - `name`;
 - `gateway.url` (`wss://<gateway IP>:8792`);
-- `gateway.fingerprint` (from the `pair` output);
+- `gateway.fingerprint` (from the `pair` output), or `gateway.ca_file` if the gateway's certificate is signed by a CA you run;
 - the machine's own `filesystem` / `commands` / `processes` policy.
 
 Then:
@@ -286,6 +288,8 @@ Then:
 ./scripts/run-agent.sh enroll --code ABCD-EFGH-IJKL-MNOP   # once: creates the device key (identity file, mode 0600)
 ./scripts/run-agent.sh                                     # stays connected, reconnects with backoff
 ```
+
+Set `CONTEXTBRIDGE_AGENT_CONFIG` to use another config file.
 
 Manage devices from the gateway host:
 
@@ -303,7 +307,7 @@ Pairing is deliberately an admin CLI on the gateway host and not an MCP tool, so
 - **Authentication on every connection.** The gateway sends a fresh 32-byte nonce. The agent signs it, bound to the device id and the gateway id. Unknown, revoked, or wrongly signed devices are refused. Agents refuse a gateway whose id differs from the one they enrolled with.
 - **Encryption.**
   - **TLS rules.** The listener must use TLS unless it is on loopback. Agents require `wss://` unless the gateway is on the same machine.
-  - **Certificate pinning.** Agents check the gateway certificate's SHA-256 fingerprint before sending anything.
+  - **Certificate pinning.** With `gateway.fingerprint` set, agents check the gateway certificate's SHA-256 fingerprint before sending anything. Without it, the certificate and host name are verified against `gateway.ca_file`, or the system's CA store if that is unset too.
   - **Allowed bind addresses.** The listener binds only a specific loopback, LAN, or overlay (e.g. Tailscale) address. `0.0.0.0`, `::`, public IPs, and hostnames are refused.
 - **Replay protection.** Calls carry a sequence number that must increase on each connection, and a request id the agent never accepts twice.
 - **Liveness.** Agents send heartbeats. A device that misses three is dropped and shown offline, and its pending calls fail. Agents reconnect with exponential backoff (reset once a connection is accepted, so a blip after a long outage is retried within a second) and stop permanently once revoked.
