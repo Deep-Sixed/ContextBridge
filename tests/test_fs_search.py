@@ -288,7 +288,8 @@ def test_running_searches_are_capped(
         manager.start(str(tree), "main")
     assert excinfo.value.code == "busy"
     manager.stop(slow["search_id"])
-    assert manager.start(str(tree), "main")["status"] == "completed"
+    restarted = manager.start(str(tree), "main")
+    assert _wait_finished(manager, restarted["search_id"])["status"] == "completed"
 
 
 def test_old_finished_sessions_are_evicted(

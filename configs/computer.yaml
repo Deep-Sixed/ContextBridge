@@ -66,9 +66,10 @@ commands:
   mode: allowlist          # disabled | allowlist | unrestricted
   # Allowlist mode runs one program per call without a shell. It limits WHICH programs
   # run, not what they touch: commands run with this OS user's full permissions and are
-  # not subject to the filesystem deny list. Adding a shell or interpreter (bash, python3,
-  # powershell) makes allowlist mode equivalent to unrestricted.
-  allow: [git, ls, df, du, ps, uptime, whoami, hostname, uname, date, pwd]
+  # not subject to the filesystem deny list. Adding a program that can run other programs
+  # makes allowlist mode equivalent to unrestricted: a shell or interpreter (bash, python3,
+  # powershell), or git, whose -c options and aliases run any command.
+  allow: [ls, df, du, ps, uptime, whoami, hostname, uname, date, pwd]
   default_timeout_seconds: 30
   max_timeout_seconds: 600
   max_output_bytes: 65536
