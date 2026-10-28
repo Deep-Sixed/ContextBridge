@@ -13,9 +13,14 @@
     To verify reboot recovery: reboot, sign in only if you use -AtLogOn, wait two minutes, run this
     script. The "boot to gateway_connected" line is the measurement.
 
+.PARAMETER Config
+    Agent config to check. Defaults to the --config the scheduled task (-TaskName) passes to the
+    agent, so the check looks at the agent that actually runs here. Falls back to configs\agent.yaml.
+
 .PARAMETER RecoveryTest
-    DISRUPTIVE. Kills the running agent, then times how long the scheduled task takes to relaunch it
-    and reconnect to the gateway. Asks for confirmation unless -Yes is given.
+    DISRUPTIVE. Kills the agent started with the checked config (agents using other configs are left
+    alone), then times how long the scheduled task takes to relaunch it and reconnect to the gateway.
+    Asks for confirmation unless -Yes is given.
 
 .EXAMPLE
     .\scripts\healthcheck\check-agent.ps1
@@ -26,7 +31,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Config = (Join-Path $PSScriptRoot '..\..\configs\agent.yaml'),
+    [string]$Config = '',
     [string]$Python = '',
     [string]$TaskName = 'ContextBridge Agent',
     [double]$Hours = 24,
@@ -40,7 +45,43 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Continue'
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+
+# Pull a flag's value (quoted or bare) out of a command line; resolve a path against a base folder.
+function Get-ArgValue([string]$CommandLine, [string]$Name) {
+    if ($CommandLine -match ([regex]::Escape($Name) + '\s+(?:"([^"]*)"|(\S+))')) {
+        if ($Matches[1]) { return $Matches[1] } else { return $Matches[2] }
+    }
+    return $null
+}
+function Resolve-ArgPath([string]$Path, [string]$Base) {
+    if (-not $Path) { return $null }
+    try {
+        if (-not [IO.Path]::IsPathRooted($Path)) { $Path = Join-Path $Base $Path }
+        return [IO.Path]::GetFullPath($Path)
+    } catch { return $null }
+}
+
+# Default to the config and log file the scheduled task passes to the agent, so the check looks at
+# the agent that actually runs here rather than the template config.
+$task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+$taskArgs = ''
+$taskDir = $root
+if ($task) {
+    $taskAction = @($task.Actions) | Select-Object -First 1
+    try {
+        $taskArgs = "$($taskAction.Arguments)"
+        if ($taskAction.WorkingDirectory) { $taskDir = $taskAction.WorkingDirectory }
+    } catch { }
+}
+$taskConfig = Resolve-ArgPath (Get-ArgValue $taskArgs '--config') $taskDir
+$configSource = 'from -Config'
+if (-not $Config) {
+    if ($taskConfig) { $Config = $taskConfig; $configSource = "from scheduled task '$TaskName'" }
+    else { $Config = Join-Path $root 'configs\agent.yaml'; $configSource = 'default; no --config found in the scheduled task' }
+}
 $configPath = (Resolve-Path $Config).Path
+$taskLog = Resolve-ArgPath (Get-ArgValue $taskArgs '--log-file') $taskDir
+$agentLog = if ($taskLog -and $taskConfig -eq $configPath) { $taskLog } else { Join-Path $root 'audit\agent.log' }
 if (-not $Python) {
     $venvPython = Join-Path $root '.venv\Scripts\python.exe'
     $Python = if (Test-Path $venvPython) { $venvPython } else { (Get-Command python.exe -ErrorAction Stop).Source }
@@ -64,13 +105,14 @@ function Line([string]$Level, [string]$Check, [string]$Detail) {
 }
 
 Write-Host "ContextBridge agent check on $env:COMPUTERNAME at $stamp"
-Write-Host "config: $configPath"
+Write-Host "config: $configPath ($configSource)"
 Write-Host ''
 
 # ------------------------------------------------------------ 1. code revision
 Push-Location $root
 try {
-    if ($Fetch) { git fetch --quiet origin main 2>$null; if ($LASTEXITCODE -ne 0) { Line 'WARN' 'git fetch' 'could not reach origin' } }
+    # Explicit refspec so origin/main is updated even in a clone that tracks only some branches.
+    if ($Fetch) { git fetch --quiet origin '+refs/heads/main:refs/remotes/origin/main' 2>$null; if ($LASTEXITCODE -ne 0) { Line 'WARN' 'git fetch' 'could not reach origin' } }
     $head = (git rev-parse --short HEAD 2>$null)
     $branch = (git rev-parse --abbrev-ref HEAD 2>$null)
     $main = (git rev-parse --short origin/main 2>$null)
@@ -104,7 +146,6 @@ if (-not $summary) {
 }
 
 # ------------------------------------------------------------ 3. scheduled task
-$task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if (-not $task) {
     Line 'FAIL' 'scheduled task' "'$TaskName' not installed"
 } else {
@@ -122,23 +163,37 @@ function Get-AgentProcesses {
     @(Get-CimInstance Win32_Process -Filter "Name like 'python%.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -like '*contextbridge.remote.agent*run*' })
 }
-$procs = Get-AgentProcesses
-switch ($procs.Count) {
-    0 { Line 'FAIL' 'agent process' 'not running' }
+function Test-UsesConfig($Process) {
+    (Resolve-ArgPath (Get-ArgValue $Process.CommandLine '--config') $root) -eq $configPath
+}
+function Get-ConfigAgentProcesses { @(Get-AgentProcesses | Where-Object { Test-UsesConfig $_ }) }
+# On Windows a venv's python.exe / pythonw.exe is a launcher that starts the base interpreter as a
+# child with the same command line, so one agent shows up as two processes. Count launchers only.
+function Get-AgentInstances([object[]]$Processes) {
+    $ids = @($Processes | ForEach-Object ProcessId)
+    @($Processes | Where-Object { $ids -notcontains $_.ParentProcessId })
+}
+$procs = @(Get-AgentProcesses)
+$mine = @(Get-AgentInstances @($procs | Where-Object { Test-UsesConfig $_ }))
+$others = @(Get-AgentInstances @($procs | Where-Object { -not (Test-UsesConfig $_) }))
+switch ($mine.Count) {
+    0 { Line 'FAIL' 'agent process' 'no agent running with this config' }
     1 {
-        $p = $procs[0]
+        $p = $mine[0]
         $up = (Get-Date) - $p.CreationDate
         Line 'PASS' 'agent process' ("pid {0}, up {1:d\.hh\:mm\:ss}" -f $p.ProcessId, $up)
     }
-    default { Line 'WARN' 'agent process' "$($procs.Count) agent processes: $(($procs | ForEach-Object ProcessId) -join ', ')" }
+    default { Line 'WARN' 'agent process' "$($mine.Count) agents with this config: pids $(($mine | ForEach-Object ProcessId) -join ', ')" }
 }
-$agentLog = Join-Path $root 'audit\agent.log'
+foreach ($p in $others) {
+    Line 'WARN' 'other agent process' ("pid {0}, started {1:yyyy-MM-dd HH:mm}, config {2}" -f $p.ProcessId, $p.CreationDate, (Get-ArgValue $p.CommandLine '--config'))
+}
 if (Test-Path $agentLog) {
     $dupes = @(Select-String -Path $agentLog -SimpleMatch 'another ContextBridge agent is already running' -ErrorAction SilentlyContinue).Count
     $level = if ($dupes -gt 0) { 'WARN' } else { 'PASS' }
-    Line $level 'duplicate launches (all time)' "$dupes refused by the instance lock in audit\agent.log"
+    Line $level 'duplicate launches (all time)' "$dupes refused by the instance lock in $agentLog"
 } else {
-    Line 'SKIP' 'duplicate launches' 'audit\agent.log not found'
+    Line 'SKIP' 'duplicate launches' "$agentLog not found"
 }
 try {
     $since = (Get-Date).AddHours(-$Hours)
@@ -220,9 +275,9 @@ if ($RecoveryTest) {
     }
 }
 if ($RecoveryTest) {
-    $before = Get-AgentProcesses
+    $before = @(Get-ConfigAgentProcesses)
     if (-not $before.Count) {
-        Line 'SKIP' 'kill recovery' 'no agent running to kill'
+        Line 'SKIP' 'kill recovery' 'no agent running with this config to kill'
     } else {
         $t0 = (Get-Date).ToUniversalTime()
         $t0Iso = $t0.ToString('yyyy-MM-ddTHH:mm:ssZ')
@@ -233,7 +288,7 @@ if ($RecoveryTest) {
         while (((Get-Date).ToUniversalTime() - $t0).TotalSeconds -lt $TimeoutSeconds) {
             Start-Sleep -Seconds 2
             $elapsed = [math]::Round(((Get-Date).ToUniversalTime() - $t0).TotalSeconds, 1)
-            if ($null -eq $relaunchS -and @(Get-AgentProcesses | Where-Object { $oldIds -notcontains $_.ProcessId }).Count) { $relaunchS = $elapsed }
+            if ($null -eq $relaunchS -and @(Get-ConfigAgentProcesses | Where-Object { $oldIds -notcontains $_.ProcessId }).Count) { $relaunchS = $elapsed }
             if ($relaunchS -ne $null -and $auditPath -and (Test-Path $auditPath)) {
                 $hit = Get-Content $auditPath -Tail 50 | Where-Object { $_ -match '"event":"gateway_connected"' } |
                     ForEach-Object { ($_ | ConvertFrom-Json) } | Where-Object { $_.ts -ge $t0Iso } | Select-Object -First 1
@@ -244,8 +299,8 @@ if ($RecoveryTest) {
         else { Line 'PASS' 'kill recovery: relaunch' "new agent process after ${relaunchS}s" }
         if ($null -eq $connectS) { Line 'FAIL' 'kill recovery: reconnect' "no gateway_connected within ${TimeoutSeconds}s" }
         else { Line 'PASS' 'kill recovery: reconnect' "gateway_connected after ${connectS}s (kill at $t0Iso)" }
-        $after = Get-AgentProcesses
-        if ($after.Count -gt 1) { Line 'WARN' 'kill recovery: duplicates' "$($after.Count) agent processes after relaunch" }
+        $after = @(Get-AgentInstances @(Get-ConfigAgentProcesses))
+        if ($after.Count -gt 1) { Line 'WARN' 'kill recovery: duplicates' "$($after.Count) agents with this config after relaunch" }
         Write-Host "Next: on the gateway, run  contextbridge-failover --config configs/computer.yaml --device $($summary.device_name)"
     }
 }

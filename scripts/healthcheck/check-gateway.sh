@@ -63,7 +63,8 @@ echo
 
 # ---------------------------------------------------------------- 1. code revision
 cd "$ROOT" || exit 2
-if [[ $FETCH -eq 1 ]]; then git fetch --quiet origin main 2>/dev/null || line WARN "git fetch" "could not reach origin"; fi
+# Explicit refspec so origin/main is updated even in a clone that tracks only some branches.
+if [[ $FETCH -eq 1 ]]; then git fetch --quiet origin '+refs/heads/main:refs/remotes/origin/main' 2>/dev/null || line WARN "git fetch" "could not reach origin"; fi
 HEAD_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo '?')"
 BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
 MAIN_SHA="$(git rev-parse --short origin/main 2>/dev/null || echo '?')"
