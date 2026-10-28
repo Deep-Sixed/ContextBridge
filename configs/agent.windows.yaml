@@ -17,17 +17,19 @@ filesystem:
   writable_roots: []       # e.g. "~/Projects" to allow edits there
   delete: trash            # trash (undo with restore_deleted) | permanent | disabled; writable roots only
   max_document_bytes: 20971520   # PDF, Word, and Excel files larger than this are not opened
-  # Built-in deny list (always applied unless you set `deny`): .ssh, .env*, *.pem, *.key, *.kdbx, plus on
-  # Windows NTUSER.DAT*, DPAPI/credential stores (Protect, Credentials, Vault), browser secrets
-  # (Login Data, Cookies, Local State), *.ppk, .azure.
+  # Built-in deny list (always applied unless you set `deny`): .ssh, .env*, *.pem, *.key, *.kdbx, .npmrc,
+  # .pypirc, Firefox's key4.db and cookies.sqlite, PowerShell's ConsoleHost_history.txt, *identity.json
+  # (device keys), plus on Windows NTUSER.DAT*, DPAPI/credential stores (Protect, Credentials, Vault),
+  # browser secrets (Login Data, Cookies, Local State), *.ppk, .azure.
 
 commands:
   mode: allowlist
   # Allowlist mode runs one .exe/.com program per call, found on PATH (never in the current directory).
   # cmd.exe built-ins (dir, type, echo) are not programs, and .bat/.cmd scripts are refused because
-  # cmd.exe would re-parse their arguments. Adding a shell or interpreter (powershell, cmd, python)
-  # makes allowlist mode equivalent to unrestricted.
-  allow: [git, where, whoami, hostname, ipconfig, systeminfo, tasklist]
+  # cmd.exe would re-parse their arguments. Adding a program that can run other programs makes allowlist
+  # mode equivalent to unrestricted: a shell or interpreter (powershell, cmd, python), or git, whose -c
+  # options and aliases run any command.
+  allow: [where, whoami, hostname, ipconfig, systeminfo, tasklist]
   # To run PowerShell or cmd commands, switch to unrestricted and pick the shell:
   # mode: unrestricted
   # shell: powershell      # powershell (default) | pwsh | cmd
