@@ -1,0 +1,20 @@
+{
+  "interface": {
+    "capabilities": [],
+    "defaultPrompt": "Show me the tools available from ContextBridge.",
+    "developerName": "Charles Snyder",
+    "displayName": "ContextBridge",
+    "longDescription": "Connects ChatGPT to the supplied ContextBridge MCP endpoint. Available tools and authentication are determined by the server.",
+    "shortDescription": "Connect to ContextBridge",
+    "category": "Other"
+  },
+  "name": "nexus-agi",
+  "version": "0.1.2",
+  "description": "Connect to the user-provided ContextBridge MCP server.",
+  "author": {
+    "name": "Charles Snyder",
+    "email": "csnyderiii@gmail.com"
+  },
+  "keywords": [],
+  "mcpServers": "./.mcp.json"
+}

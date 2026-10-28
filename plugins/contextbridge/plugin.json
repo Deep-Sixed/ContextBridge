@@ -1,0 +1,22 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "author": {
+    "email": "csnyderiii@gmail.com",
+    "name": "Charles Snyder"
+  },
+  "description": "Connect to the user-provided ContextBridge MCP server.",
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "capabilities": [],
+        "defaultPrompt": "Show me the tools available from ContextBridge.",
+        "developerName": "Charles Snyder",
+        "displayName": "ContextBridge",
+        "longDescription": "Connects ChatGPT to the supplied ContextBridge MCP endpoint. Available tools and authentication are determined by the server.",
+        "shortDescription": "Connect to ContextBridge"
+      }
+    }
+  },
+  "name": "nexus-agi",
+  "version": "0.1.2"
+}

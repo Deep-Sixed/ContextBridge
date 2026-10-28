@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "contextbridge": {
+      "type": "streamable-http",
+      "url": "https://nexusagi.tail9cb382.ts.net:8443/mcp",
+      "headers": {}
+    }
+  }
+}
