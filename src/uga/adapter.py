@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -23,9 +22,10 @@ class DatacoreRecordNotFound(LookupError):
 
 
 _REQUIRED_FIELDS = ("id", "title", "text", "url")
-# Approved top-level fields beyond the required ones. Anything else in a JSONL
-# record is dropped at load time so it can never reach a client.
-_OPTIONAL_TOP_LEVEL_FIELDS = frozenset(
+# Approved fields beyond the required ones, both at the top level of a record and
+# inside its ``metadata`` object. Any other key is dropped at load time so it can
+# never reach a client. An approved field keeps its whole value, nested or not.
+_APPROVED_FIELDS = frozenset(
     {
         "canonical_id",
         "bank_id",
@@ -92,19 +92,21 @@ def _validate_record(raw: dict[str, Any], *, line_no: int) -> DatacoreFetchRecor
     record_id = raw["id"]
     if isinstance(record_id, bool) or not isinstance(record_id, (str, int)) or record_id == "":
         raise DatacoreRecordError(f"line {line_no}: id must be a non-empty string or integer")
+    not_strings = [f for f in ("title", "text", "url") if not isinstance(raw[f], str)]
+    if not_strings:
+        raise DatacoreRecordError(f"line {line_no}: {', '.join(not_strings)} must be string(s)")
     metadata = raw.get("metadata")
     if metadata is None:
         metadata = {}
     if not isinstance(metadata, dict):
         raise DatacoreRecordError(f"line {line_no}: metadata must be an object")
-    extra = {k: v for k, v in raw.items() if k in _OPTIONAL_TOP_LEVEL_FIELDS}
     return DatacoreFetchRecord(
         id=str(record_id),
-        title=str(raw["title"]),
-        text=str(raw["text"]),
-        url=str(raw["url"]),
-        metadata=dict(metadata),
-        extra=extra,
+        title=raw["title"],
+        text=raw["text"],
+        url=raw["url"],
+        metadata={k: v for k, v in metadata.items() if k in _APPROVED_FIELDS},
+        extra={k: v for k, v in raw.items() if k in _APPROVED_FIELDS},
     )
 
 
@@ -142,12 +144,20 @@ def _scalar_values(value: Any) -> Iterator[str]:
         yield str(value)
 
 
+_FIELD_SEPARATOR = "\0"
+# Records scanned between the None markers iter_search yields.
+_SCAN_CHUNK = 512
+
+
 def _search_text(record: DatacoreFetchRecord) -> str:
     parts = [record.title, record.text, record.url]
     parts.extend(_scalar_values(record.metadata))
     parts.extend(_scalar_values(record.extra))
-    # NUL keeps a query from matching across two adjacent fields.
-    return "\0".join(parts).casefold()
+    # The separator keeps a query from matching across two adjacent fields. It is
+    # removed from the field values so it only ever appears between fields.
+    return _FIELD_SEPARATOR.join(
+        part.replace(_FIELD_SEPARATOR, " ") for part in parts
+    ).casefold()
 
 
 class DatacoreStore:
@@ -164,18 +174,31 @@ class DatacoreStore:
     def from_jsonl(cls, path: Path | str) -> DatacoreStore:
         return cls(load_records(path))
 
-    def search_records(self, query: str, *, limit: int | None = None) -> list[dict[str, Any]]:
+    def iter_search(
+        self, query: str, *, limit: int | None = None
+    ) -> Iterator[dict[str, Any] | None]:
+        """Yield search hits in record order, and ``None`` after each chunk scanned.
+
+        The ``None`` markers let an async caller yield to the event loop during a
+        long scan, so a timeout can stop it. An empty query matches every record.
+        """
         max_results = None if limit is None else max(0, limit)
-        if max_results == 0:
-            return []
         needle = (query or "").strip().casefold()
-        if needle:
-            matches: Iterator[DatacoreFetchRecord] = (
-                record for text, record in self._search_index if needle in text
-            )
-        else:
-            matches = iter(self._records.values())
-        return [record.search_hit() for record in islice(matches, max_results)]
+        if max_results == 0 or _FIELD_SEPARATOR in needle:
+            # No single field contains the separator, so such a query can't match.
+            return
+        found = 0
+        for scanned, (text, record) in enumerate(self._search_index, start=1):
+            if needle in text:
+                yield record.search_hit()
+                found += 1
+                if found == max_results:
+                    return
+            if scanned % _SCAN_CHUNK == 0:
+                yield None
+
+    def search_records(self, query: str, *, limit: int | None = None) -> list[dict[str, Any]]:
+        return [hit for hit in self.iter_search(query, limit=limit) if hit is not None]
 
     def fetch_record(self, record_id: str) -> dict[str, Any]:
         record = self._records.get(record_id)

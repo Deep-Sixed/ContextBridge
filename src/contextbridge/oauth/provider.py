@@ -53,6 +53,7 @@ from ..computer.server import (
     SCOPE_PROCESS,
     SCOPE_READ,
     SCOPE_DESKTOP_OBSERVE,
+    SCOPE_MEDIA_DISCOVER,
     SCOPE_WRITE,
 )
 from .store import OAuthStateError, OAuthStore, new_token
@@ -61,9 +62,10 @@ CODE_SECONDS = 300
 PENDING_SECONDS = 600
 MAX_PENDING = 100
 SCOPE_DESCRIPTIONS = {
-    SCOPE_READ: "Read files, search, see system info, processes, and devices",
+    SCOPE_READ: "Read files and documents, search, see system info, processes, and devices",
     SCOPE_DESKTOP_OBSERVE: "Observe window titles and IDs on authorized desktops",
-    SCOPE_WRITE: "Create, edit, and move files in writable folders",
+    SCOPE_MEDIA_DISCOVER: "Inspect media-device availability without recording",
+    SCOPE_WRITE: "Create, edit, move, and delete files and documents in writable folders",
     SCOPE_EXECUTE: "Run commands and interactive sessions",
     SCOPE_PROCESS: "Terminate processes",
 }

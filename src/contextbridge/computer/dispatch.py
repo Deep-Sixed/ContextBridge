@@ -8,12 +8,13 @@ so an agent never trusts the shape of what the gateway sends.
 
 from __future__ import annotations
 
+import importlib.util
 from collections.abc import Callable
 from typing import Any
 
 from pydantic import ValidationError, validate_call
 
-from . import commands, files, desktop
+from . import commands, desktop, documents, files, media, trash
 from .commands import ExitCallback, SessionManager
 from .policy import ComputerPolicy, PolicyViolation
 from .system import system_info
@@ -26,9 +27,24 @@ COMMAND_TOOLS = frozenset(
     {"run_command", "start_process", "read_process_output", "interact_with_process", "force_terminate", "list_sessions"}
 )
 DESKTOP_TOOLS = frozenset({"list_windows"})
+MEDIA_TOOLS = frozenset({"media_inventory"})
 PROCESS_LIST_TOOL = "list_processes"
 PROCESS_KILL_TOOL = "kill_process"
-ENGINE_TOOLS = READ_TOOLS | WRITE_TOOLS | COMMAND_TOOLS | DESKTOP_TOOLS | {PROCESS_LIST_TOOL, PROCESS_KILL_TOOL}
+DOCUMENT_READ_TOOLS = frozenset({"read_document"})
+DOCUMENT_WRITE_TOOLS = frozenset({"write_document", "edit_document", "write_spreadsheet", "edit_pdf"})
+DELETE_TOOL = "delete_file"
+TRASH_READ_TOOL = "list_deleted"
+TRASH_RESTORE_TOOL = "restore_deleted"
+ENGINE_TOOLS = (
+    READ_TOOLS | WRITE_TOOLS | COMMAND_TOOLS | DESKTOP_TOOLS | MEDIA_TOOLS
+    | DOCUMENT_READ_TOOLS | DOCUMENT_WRITE_TOOLS
+    | {PROCESS_LIST_TOOL, PROCESS_KILL_TOOL, DELETE_TOOL, TRASH_READ_TOOL, TRASH_RESTORE_TOOL}
+)
+_DOCUMENT_LIBRARIES = ("pypdf", "docx", "openpyxl", "reportlab")
+
+def documents_available() -> bool:
+    return all(importlib.util.find_spec(name) is not None for name in _DOCUMENT_LIBRARIES)
+
 
 
 class InvalidArguments(ValueError):
@@ -45,10 +61,21 @@ def call_succeeded(tool: str, result: Any) -> bool:
 def available_tools(policy: ComputerPolicy) -> frozenset[str]:
     """The exact tool surface ``policy`` permits."""
     names = set(READ_TOOLS)
+    docs = documents_available()
+    if docs:
+        names |= DOCUMENT_READ_TOOLS
     if policy.can_write:
         names |= WRITE_TOOLS
+        if docs:
+            names |= DOCUMENT_WRITE_TOOLS
+    if policy.can_delete:
+        names.add(DELETE_TOOL)
+        if policy.delete_mode == "trash":
+            names |= {TRASH_READ_TOOL, TRASH_RESTORE_TOOL}
     if policy.commands_enabled:
         names |= COMMAND_TOOLS
+    if policy.media_discover:
+        names |= MEDIA_TOOLS
     if policy.desktop_observe:
         names |= DESKTOP_TOOLS
     if policy.list_processes:
@@ -162,6 +189,92 @@ def _move_file(engine: Any, source: str, destination: str) -> dict[str, Any]:
     return files.move_file(engine.policy, source, destination)
 
 
+@_handler("delete_file")
+def _delete_file(engine: Any, path: str, recursive: bool = False) -> dict[str, Any]:
+    return trash.delete_file(engine.policy, path, recursive=recursive)
+
+
+@_handler("list_deleted")
+def _list_deleted(engine: Any, limit: int = 50) -> dict[str, Any]:
+    return trash.list_deleted(engine.policy, limit=limit)
+
+
+@_handler("restore_deleted")
+def _restore_deleted(engine: Any, trash_id: str) -> dict[str, Any]:
+    return trash.restore_deleted(engine.policy, trash_id)
+
+
+@_handler("read_document")
+def _read_document(
+    engine: Any,
+    path: str,
+    pages: str | None = None,
+    sheet: str | None = None,
+    cell_range: str | None = None,
+    find: str | None = None,
+    formulas: bool = False,
+    max_chars: int | None = None,
+) -> dict[str, Any]:
+    return documents.read_document(
+        engine.policy,
+        path,
+        pages=pages,
+        sheet=sheet,
+        cell_range=cell_range,
+        find=find,
+        formulas=formulas,
+        max_chars=max_chars,
+    )
+
+
+@_handler("write_document")
+def _write_document(engine: Any, path: str, content: str, title: str | None = None) -> dict[str, Any]:
+    return documents.write_document(engine.policy, path, content, title=title)
+
+
+@_handler("edit_document")
+def _edit_document(
+    engine: Any, path: str, old_text: str, new_text: str, expected_replacements: int = 1
+) -> dict[str, Any]:
+    return documents.edit_document(
+        engine.policy, path, old_text, new_text, expected_replacements=expected_replacements
+    )
+
+
+@_handler("write_spreadsheet")
+def _write_spreadsheet(
+    engine: Any,
+    path: str,
+    rows: list[list[str | int | float | bool | None]],
+    sheet: str | None = None,
+    start_cell: str = "A1",
+) -> dict[str, Any]:
+    return documents.write_spreadsheet(engine.policy, path, rows, sheet=sheet, start_cell=start_cell)
+
+
+@_handler("edit_pdf")
+def _edit_pdf(
+    engine: Any,
+    path: str,
+    delete_pages: str | None = None,
+    rotate_pages: str | None = None,
+    rotate_degrees: int = 90,
+    insert_pdf: str | None = None,
+    insert_at: int | None = None,
+    output_path: str | None = None,
+) -> dict[str, Any]:
+    return documents.edit_pdf(
+        engine.policy,
+        path,
+        delete_pages=delete_pages,
+        rotate_pages=rotate_pages,
+        rotate_degrees=rotate_degrees,
+        insert_pdf=insert_pdf,
+        insert_at=insert_at,
+        output_path=output_path,
+    )
+
+
 @_handler("run_command")
 def _run_command(
     engine: Any, command: str, cwd: str | None = None, timeout_seconds: float | None = None
@@ -200,6 +313,11 @@ def _force_terminate(engine: Any, session_id: str) -> dict[str, Any]:
 @_handler("list_sessions")
 def _list_sessions(engine: Any) -> dict[str, Any]:
     return {"sessions": engine.sessions.list()}
+
+
+@_handler("media_inventory")
+def _media_inventory(engine: Any) -> dict[str, Any]:
+    return media.media_inventory(authorized=engine.policy.media_discover)
 
 
 @_handler("list_windows")

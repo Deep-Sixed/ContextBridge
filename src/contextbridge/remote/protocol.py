@@ -35,7 +35,8 @@ MAX_MESSAGE_BYTES = 16 * 1024 * 1024
 HANDSHAKE_TIMEOUT_SECONDS = 10.0
 AUTH_CONTEXT = b"contextbridge-agent-auth-v1"
 
-# Error codes after which an agent must stop reconnecting.
+# Error codes after which an agent must stop reconnecting. Any other code (such as
+# "already_connected" or "replaced") is retried with backoff.
 FATAL_ERRORS = frozenset({"revoked", "unknown_device", "bad_signature", "bad_code", "protocol", "version"})
 
 

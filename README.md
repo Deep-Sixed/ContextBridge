@@ -1,15 +1,16 @@
 # ContextBridge
 
-A self-hosted MCP gateway that gives AI assistants authenticated, policy-controlled access to approved knowledge and to your own computers. ContextBridge has no runtime dependency on Desktop Commander or any hosted relay, so it keeps working if those go away or lose their permissions.
+A self-hosted MCP gateway that gives AI assistants authenticated, policy-controlled access to approved knowledge and to your own computers. ContextBridge has no runtime dependency on any hosted relay: its own gateway, agents, and transport do the work.
 
-It has two routes, each with its own server, port, and credential:
+It has three routes, each with its own server, port, and credential:
 
 | Route | Module | Tools | Credential |
 |---|---|---|---|
 | Knowledge (UGA) | `uga.gateway` | `search`, `fetch` over approved JSONL records | `MCP_AUTH_TOKEN` |
+| Filesystem | `uga.fs_gateway` | file tools inside configured directories (see [Filesystem route](#filesystem-route)) | `CONTEXTBRIDGE_FS_AUTH_TOKEN` |
 | Computer | `contextbridge.computer` | files, commands, sessions, processes | `CONTEXTBRIDGE_COMPUTER_TOKEN` |
 
-Being able to read knowledge never grants computer access. The computer route won't start if its token matches `MCP_AUTH_TOKEN`, and each route rejects the other's token.
+Being able to read knowledge never grants file or computer access. Each route accepts only its own token. The computer route won't start if its token matches `MCP_AUTH_TOKEN`, and the filesystem route checks the same when both are set in its environment.
 
 The computer route can also serve ChatGPT, Claude, and other remote MCP clients through a second, OAuth-protected endpoint. Each client gets only the permissions and devices you approve for it (see [Remote MCP clients](#remote-mcp-clients-chatgpt-claude)).
 
@@ -20,11 +21,13 @@ python3 -m pip install -e '.[test]'
 python3 -m pytest        # includes acceptance tests that launch the gateways and an agent as real processes
 ```
 
-ContextBridge requires FastMCP 3.x (`fastmcp>=3,<4`). It has no runtime dependency on Desktop Commander, Node, or npx, and the acceptance tests run both gateways in an environment without them.
+ContextBridge requires Python 3.11+ and FastMCP 3.x (`fastmcp>=3,<4`). It has no runtime dependency on Node or npx, and the acceptance tests run both gateways in an environment without them.
+
+`tests/test_contract.py` pins the knowledge route's MCP contract: the exact tool set, annotations, input schemas, reported version, server instructions, and policy denial. `tests/test_entrypoint.py` starts the real `python -m uga.gateway` entrypoint and checks bearer auth over HTTP. `tests/test_fs.py` covers the filesystem operations and path rules, and `tests/test_fs_gateway.py` pins the filesystem route's MCP contract and starts its entrypoint. CI runs the whole suite on Ubuntu and Windows, with Python 3.11 against the oldest supported FastMCP (3.0.0) and Python 3.13 against the newest 3.x release.
 
 ## Knowledge route
 
-**Security model:** exactly two operations (`search` and `fetch`), default-deny tool middleware, read-only annotations, audit logging, and a static bearer token (at least 32 characters) required at startup. Error details are masked from clients, and only allowlisted record fields are served. It binds only to the loopback interface by default.
+**Security model:** exactly two operations (`search` and `fetch`), default-deny policy for tools and every other MCP method, read-only annotations, audit logging, and a static bearer token (at least 32 characters) required at startup. Error details are masked from clients. Only allowlisted record fields are served, at the top level and inside `metadata`. It binds only to the loopback interface by default.
 
 ```sh
 export MCP_AUTH_TOKEN="<strong random secret provided by secret manager>"
@@ -36,26 +39,134 @@ export UGA_DATACORE_JSONL="/path/to/approved/datacore.fetch.v1.jsonl"
 
 The data export is required: set `UGA_DATACORE_JSONL`, or `datacore_jsonl` in the config file (a relative path is resolved against the config file's directory). The environment variable wins. The export is loaded and validated at startup, and the gateway refuses to start if it is missing or invalid.
 
+`scripts/run-contextbridge.sh` always uses `configs/contextbridge.yaml`. To use another config file, run `python3 -m uga.gateway --config <path>`.
+
+### Connecting
+
+MCP clients connect over streamable HTTP to `http://127.0.0.1:8790/mcp` (the `serve.host` and `serve.port` from the config) and send `Authorization: Bearer <MCP_AUTH_TOKEN>`.
+
+Every HTTP route requires the token, including `GET /`, which returns the service name, the MCP path, and the tool names. A request without a valid token gets `401` and is audited as `auth`. The filesystem route applies the same rule with its own token.
+
+### Configuration
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `MCP_AUTH_TOKEN` | required | Bearer token clients must send; at least 32 characters |
+| `UGA_DATACORE_JSONL` or `datacore_jsonl` | one is required | JSONL export to serve |
+| `serve.host` | `127.0.0.1` | Listen address |
+| `serve.port` | required | Listen port (`8790` in `configs/contextbridge.yaml`) |
+| `name` | `Nexus UGA` | Server name reported in `serverInfo` and by `GET /` |
+| `UGA_AUDIT_LOG` or `serve.audit_log` | unset | Audit log file (see [Audit log](#audit-log)) |
+| `UGA_AUDIT_LOG_QUERY_TEXT` | off | `1`, `true`, or `yes` also logs a query preview |
+| `UGA_AUDIT_HASH_KEY` | random per run | Key for the audit log's query hash |
+| `serve.forwarded_allow_ips` | unset | Proxy addresses whose `X-Forwarded-For` is trusted for the audited `peer` |
+| `UGA_MCP_SEARCH_LIMIT` | `10` | Maximum `search` results |
+| `UGA_MCP_FETCH_MAX_CHARS` | `100000` | Maximum characters of `text` that `fetch` returns |
+| `UGA_MCP_TOOL_TIMEOUT_SECONDS` | `10` | Timeout for a tool call |
+| `UGA_MCP_METADATA_TIMEOUT_SECONDS` | `5` | Timeout for `initialize` and `tools/list` |
+
+Where a setting has both an environment variable and a config key, the environment variable wins. An unset, unparsable, or non-positive value for the last four falls back to the default. A relative `serve.audit_log` is resolved against the config file's directory.
+
 ### Data format
 
-Each JSONL line is one approved record with `id` (a non-empty string or integer), `title`, `text`, and `url`, plus an optional `metadata` object. Of the other top-level keys, only the approved fields listed in `_OPTIONAL_TOP_LEVEL_FIELDS` in `src/uga/adapter.py` are kept; any other key is dropped at load time and is never served or searched. Search matches field values, not JSON key names.
+Each JSONL line is one approved record with `id` (a non-empty string or integer) and the strings `title`, `text`, and `url`, plus an optional `metadata` object. An integer `id` is served as a string (record `7` is fetched as `"7"`). Other keys, at the top level or inside `metadata`, are kept only if they are approved fields listed in `_APPROVED_FIELDS` in `src/uga/adapter.py`; any other key is dropped at load time and is never served or searched. An approved field keeps its whole value, including nested objects.
+
+Blank lines are skipped. Invalid JSON, a missing or non-string `title`, `text`, or `url`, or a duplicate `id` stops startup.
+
+### Tools
+
+| Tool | Input | Returns |
+| --- | --- | --- |
+| `search` | `query` | `{"results": [...]}` with up to `UGA_MCP_SEARCH_LIMIT` hits. Each hit has `id`, `title`, and `url`, plus whichever of `summary`, `snippet`, `bank_id`, `record_kind`, `status`, and `updated_at` the record has (top-level field first, then `metadata`). |
+| `fetch` | `id` | The full record: `id`, `title`, `text`, `url`, `metadata`, and the approved top-level fields it has. |
+
+Search is a case-insensitive substring match against the values of `title`, `text`, `url`, `metadata`, and the approved fields; it does not match the `id` or JSON key names, and never matches across two fields. An empty query returns the first records in file order. `fetch` of an unknown id fails with `Record not found: <id>`.
+
+`fetch` returns at most `UGA_MCP_FETCH_MAX_CHARS` characters of a record's `text`. A longer text is cut to that length, and the response adds `truncated: true` and the full `text_length`. Other fields are returned as exported.
+
+Both tools declare `readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`, and `openWorldHint=false`. They only read the snapshot loaded at startup, so changes to the JSONL file take effect on restart. The server reports the package version (`uga.__version__`) in `serverInfo`, and its MCP `instructions` tell agents to search, then fetch by id, and to treat record text as data rather than instructions.
+
+Other MCP methods follow the same default-deny policy: `resources/list`, `resources/templates/list` and `prompts/list` return empty lists, `ping` is answered, and every other request (for example `resources/read`, `prompts/get`, `logging/setLevel`) is rejected.
 
 ### Audit log
 
-Every request is written as one JSON line to stderr and, if `UGA_AUDIT_LOG` (or `serve.audit_log` in the config) is set, to that file, which is created with mode `0600`. A tool call produces two lines (one from the policy middleware, one from the tool) that share a `request_id`. Rejected HTTP requests are logged as `tool: "auth"` with `missing_token` or `invalid_token`. Queries are recorded as a hash and length only; set `UGA_AUDIT_LOG_QUERY_TEXT=1` to also log the first 80 characters.
+Each MCP request except `ping`, and each HTTP request rejected by auth, is written as one JSON line to stderr (prefixed with `[uga audit] `) and, if `UGA_AUDIT_LOG` (or `serve.audit_log` in the config, resolved against the config file's directory) is set, to that file. Missing parent directories are created. The file is opened without following symlinks, must be a regular file, and is set to mode `0600`, including when it already exists. An authenticated `GET /` is not audited.
+
+Each line has a `request_id` that is unique per request, and a tool call's line carries what the tool recorded (`record_id`, `result_count`, the query hash). Denied tools and methods are logged with `detail: "policy_denied"`, and their arguments are not logged. Requests rejected by bearer auth are logged as `tool: "auth"` with `missing_token`, `invalid_token`, or `forbidden`. Methods the MCP SDK does not implement at all are rejected by the SDK and not logged. Client-supplied strings such as tool names and record ids are cut to 200 characters.
+
+Queries are recorded as their length and a keyed hash (the first 16 hex digits of an HMAC-SHA256); set `UGA_AUDIT_LOG_QUERY_TEXT=1` to also log a preview of up to 80 characters. Set `UGA_AUDIT_HASH_KEY` to a random secret to make the hash of the same query stable across restarts; without it a random key is used for each run, and the hash cannot be reversed by hashing guesses without the key.
+
+The `peer` field is the address of the TCP connection. `X-Forwarded-For` is ignored unless the proxy's address is listed in `serve.forwarded_allow_ips`. If you serve `create_uga_server().http_app()` with your own uvicorn, pass `proxy_headers=False` (uvicorn trusts the header from 127.0.0.1 by default).
+
+## Filesystem route
+
+`python -m uga.fs_gateway` (or `./scripts/run-contextbridge-fs.sh`) is a separate MCP server on port 8794. It gives agents file access inside the directories listed under `filesystem.roots` in `configs/contextbridge-fs.yaml`. The shipped config lists none, so the route refuses to start until you add some.
+
+```sh
+export CONTEXTBRIDGE_FS_AUTH_TOKEN="<a different strong secret>"
+./scripts/run-contextbridge-fs.sh
+```
+
+`CONTEXTBRIDGE_FS_AUTH_TOKEN` follows the same rules as `MCP_AUTH_TOKEN` and must differ from it; the route checks this when both are set in its environment. Set `CONTEXTBRIDGE_FS_CONFIG` to use another config file. The config takes the same `name` (default `ContextBridge Files`) and `serve` keys as the gateway's, plus the `filesystem` section.
+
+**Path rules:** every path must be absolute or start with `~` (the server user's home directory). It is resolved with symlinks followed and must land inside a root, so `..` and symlinks cannot reach outside. Roots are read-only unless they set `writable: true`, must exist, and must not overlap. The server's MCP `instructions` list each root and whether it is writable. Write tools are only advertised when at least one root is writable, and calls to any tool outside the advertised set are denied and audited.
+
+| Tool | Input | Notes |
+| --- | --- | --- |
+| `read_file` | `path`, `offset`, `length` | UTF-8 text by line; a negative `offset` reads the last lines; `length` defaults to 1000 |
+| `read_multiple_files` | `paths` | Up to 50 files; one file's error does not fail the rest |
+| `list_directory` | `path`, `depth` | `depth` 1–10, default 2; symlinks are listed, not followed |
+| `get_file_info` | `path` | Size, timestamps, permissions, type, whether it is a symlink |
+| `write_file` | `path`, `content`, `mode` | `rewrite` (replaces an existing file atomically, keeping its permissions) or `append`; the parent must exist |
+| `edit_block` | `file_path`, `old_string`, `new_string`, `expected_replacements` | Exact text; fails unless the match count equals `expected_replacements` (default 1) |
+| `create_directory` | `path` | Creates missing parents |
+| `move_file` | `source`, `destination` | Moves or renames; refuses a destination that already exists |
+| `delete_file` | `path`, `recursive` | Moves the item to `<root>/.contextbridge-trash/`; a non-empty directory needs `recursive` |
+| `start_search` | `path`, `pattern`, `search_type`, `file_pattern`, `ignore_case`, `literal`, `include_hidden`, `context_lines`, `max_results`, `timeout_ms` | Starts a recursive search in the background and returns a `search_id`, its status, and the first 100 results |
+| `get_more_search_results` | `search_id`, `offset`, `length` | A page of results (up to 500); a negative `offset` counts from the end |
+| `stop_search` | `search_id` | Stops a running search; the results found so far stay available |
+| `list_searches` | none | Recent searches with their status and result counts |
+
+Read tools, including the four search tools, are annotated read-only and are offered even when every root is read-only. `write_file`, `edit_block` and `delete_file` are marked destructive.
+
+**Search:** `search_type` is `files` (the default) or `content`.
+
+- A `files` search matches file and directory names. The pattern is a glob if it contains `*`, `?` or `[`, and a substring otherwise.
+- A `content` search matches each line of a text file against a regular expression (Python `re` syntax), or against a plain string with `literal: true`. Results have the `path`, the 1-based `line` number and the line's `text`, plus `before` and `after` lists when `context_lines` (0–10) is set.
+- `ignore_case` defaults to true. `file_pattern` limits which files are searched, for example `*.py` or `*.{ts,tsx}|*.md`, and is matched against file names case-insensitively. With `file_pattern` set, a `files` search reports only files, not directories.
+- Hidden entries (names starting with `.`) are skipped unless `include_hidden` is true.
+
+The search starts at `path` (a directory, or a single file for a `content` search) and walks every level below it. Symlinks are reported by a `files` search but never followed, and the trash is never searched. A `content` search skips binary files (a NUL byte in the first 8 KiB) and files over `max_search_file_bytes`, and reports the counts in `skipped`. Lines longer than 500 characters are cut, and a match on a cut line is marked `truncated`.
+
+`start_search` waits up to one second, so a quick search returns complete. A longer one keeps running, and `get_more_search_results` returns its results so far, with `status: "running"` and `has_more: true` until it finishes. The final status is `completed`, `cancelled`, `timed_out` or `failed`; `limit_reached` is true when `max_results` (default 500, at most 5000) or the 8 MiB per-search cap stopped it early.
+
+Each search runs in its own worker process (`src/uga/fs_search_worker.py`, started with `python -I`), so `stop_search` and `timeout_ms` (default 30000, at most 300000) stop it even inside a slow regular expression. On Linux and macOS the worker also sets an alarm a few seconds past its timeout, so it ends even if the server dies first. At most 4 searches run at once. The 10 most recent are kept in memory, and the oldest finished one is dropped to make room, so search ids are not kept across restarts. Searches are shared: every client with the route's token can list, page through and stop them.
+
+**Deletion is recoverable:** each deleted item is kept under `.contextbridge-trash/<trash_id>/`, next to a `<trash_id>.json` file recording its original path. No tool can read, list, change or empty the trash; recover or purge items from the host.
+
+**Limits:** `max_read_bytes` and `max_write_bytes` (1 MiB each by default) cap a response and a write, `max_list_entries` (1000) caps a listing, and `max_search_file_bytes` (10 MiB) is the largest file a content search reads. Calls use the same `UGA_MCP_TOOL_TIMEOUT_SECONDS` and `UGA_MCP_METADATA_TIMEOUT_SECONDS` settings as the gateway. Text must be UTF-8; binary files are refused.
+
+**Audit:** lines go to stderr and to `CONTEXTBRIDGE_FS_AUDIT_LOG` (or `serve.audit_log`, resolved against the config file's directory) with `route: "fs"`. As on the gateway, each request is one line, and `X-Forwarded-For` is ignored unless `serve.forwarded_allow_ips` lists the proxy. Paths are logged as the client sent them, with byte counts for reads and writes and the trash location for deletes. Refused paths are logged with `detail: "path_denied"`. Search events include `search_id` and result counts; patterns are logged only by length and hash.
+
+
+**Known limits:** checks run before each operation, so another local process that swaps a symlink in between can still redirect it; only the final component is opened with `O_NOFOLLOW`. Likewise, a destination created between `move_file`'s check and the rename is replaced. Hard links that already exist inside a root are not detected.
 
 ## Computer route
 
-The computer route is an independent replacement for Desktop Commander's tools, including its remote-machine support. Every tool takes a `device` argument: `local` (the gateway's own machine, the default) or the name of an enrolled remote device (see [Remote devices](#remote-devices)). `list_devices` shows what is reachable. A tool is offered only when some device's policy enables it:
+The computer route serves files, search, commands, processes, and documents on the gateway's own machine and on enrolled remote devices. Every tool takes a `device` argument: `local` (the gateway's own machine, the default) or the name of an enrolled remote device (see [Remote devices](#remote-devices)). `list_devices` shows what is reachable. A tool is offered only when some device's policy enables it:
 
-| Tool | Desktop Commander equivalent | Enabled on a device when |
-|---|---|---|
-| `list_directory`, `read_file`, `get_file_info`, `search_files`, `search_code`, `get_system_info` | same names / `get_config` | always (read-only) |
-| `write_file`, `edit_block`, `create_directory`, `move_file` | same names | `filesystem.writable_roots` is non-empty |
-| `run_command`, `start_process`, `read_process_output`, `interact_with_process`, `force_terminate`, `list_sessions` | same names (`run_command` is a one-shot convenience) | `commands.mode` is not `disabled` |
-| `list_processes` | same | `processes.list: true` |
-| `kill_process` | same | `processes.allow_kill: true` |
-| `list_devices` | remote device list | always |
+| Tool | Enabled on a device when |
+|---|---|
+| `list_directory`, `read_file`, `get_file_info`, `search_files`, `search_code`, `get_system_info` | always (read-only) |
+| `write_file`, `edit_block`, `create_directory`, `move_file` | `filesystem.writable_roots` is non-empty |
+| `delete_file` | writable roots, and `filesystem.delete` is `trash` (default) or `permanent` |
+| `list_deleted`, `restore_deleted` | `filesystem.delete: trash` |
+| `read_document` | always (read-only) |
+| `write_document`, `edit_document`, `write_spreadsheet`, `edit_pdf` | `filesystem.writable_roots` is non-empty |
+| `run_command`, `start_process`, `read_process_output`, `interact_with_process`, `force_terminate`, `list_sessions` | `commands.mode` is not `disabled` |
+| `list_processes` | `processes.list: true` |
+| `kill_process` | `processes.allow_kill: true` |
+| `list_devices` | always |
 
 ### Running it
 
@@ -67,6 +178,7 @@ export CONTEXTBRIDGE_COMPUTER_TOKEN="$(openssl rand -hex 32)"   # keep it in you
 ```
 
 Local MCP clients connect with the token as a bearer header. For example, in Claude Code:
+
 
 ```sh
 claude mcp add --transport http contextbridge http://127.0.0.1:8791/mcp \
@@ -89,6 +201,26 @@ These checks run on **every tool call**, at the moment it executes:
 - **Limits.** Reads, writes, search results, and search time all have caps. Rewrites are atomic and preserve file mode. `edit_block` fails unless the match count is exactly what the caller expected.
 - **Commands.** `allowlist` mode runs one program per call without a shell. The program must be on the allowlist, and pipes, redirects, `;` and `&&` are refused before anything runs. `unrestricted` mode runs through `bash -c`. The working directory must be inside a readable root. Every command has a hard timeout (`max_timeout_seconds` caps whatever the caller asks for), and a timed-out command is killed along with every process it started. Output is capped in memory, keeping the head and the tail. Variables that look like credentials (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`, …) are removed from the child's environment, and both gateway tokens are always removed.
 - **Sessions.** `start_process` runs long or interactive programs in the background. Concurrent sessions are capped (`max_sessions`) and each is killed when it reaches `max_session_seconds`.
+- **Deletes.** `delete_file` works only inside writable roots. It never deletes a root, a protected or hidden path, or a folder holding anything the file tools may not see (a `.ssh` or `.env` inside, say). A non-empty folder needs `recursive: true` and is capped at `max_delete_entries` (10,000).
+  - **`delete: trash` (default):** the item moves to `.contextbridge-trash/<trash_id>/` in its writable root, beside a `<trash_id>.json` record of where it came from. `list_deleted` shows the trash and `restore_deleted` puts an item back, but no file tool can read, change, or empty the trash, so a client cannot make its own deletions permanent. Empty it on the host. The layout is the [filesystem route](#filesystem-route)'s, so a folder both routes serve has one trash.
+  - **`delete: permanent`:** removes the item outright.
+  - **`delete: disabled`:** removes the tool.
+
+### Documents
+
+`read_document` reads PDF, Word (`.docx`), and Excel (`.xlsx`, `.xlsm`) files; `read_file` is for text and points to it.
+- **PDF:** text per page, with `pages` like `1-3,7` (50 pages per call).
+- **Word:** the document as Markdown (headings, lists, and tables) plus a heading outline.
+- **Excel:** sheet names and cell values for a `sheet` and `cell_range` (10,000 cells per call). `formulas: true` shows formulas instead of the values Excel last calculated.
+- **`find`:** searches inside any of them and returns the pages, blocks, or cells that match.
+
+Writing needs a writable root:
+- **`write_document`:** creates or replaces a `.docx` or `.pdf` from simple Markdown (`#` headings, `-` and `1.` lists, `| a | b |` tables, paragraphs). PDFs use a Unicode font when the machine has one (DejaVu, Segoe UI, or Arial).
+- **`edit_document`:** replaces exact text in a `.docx` (body, tables, headers, and footers). Like `edit_block`, it fails unless the match count is exactly what the caller expected. Formatting is kept when a match sits inside one formatted run; a match spanning runs takes the paragraph's first run's formatting. Text inside hyperlinks and fields is not matched.
+- **`write_spreadsheet`:** writes rows of values into a sheet starting at `start_cell`, creating the `.xlsx` or the sheet if needed and keeping everything else. A string starting with `=` is stored as a formula. New workbooks must be `.xlsx`; existing `.xlsm` files keep their macros.
+- **`edit_pdf`:** deletes, rotates, or inserts pages (from another PDF), in place or into `output_path`.
+
+Documents go through the same path policy as every file tool. Files over `max_document_bytes` (20 MiB) are not opened. Word and Excel files are checked for zip bombs before parsing, and XML is parsed without entity expansion. The libraries (pypdf, python-docx, openpyxl, reportlab, defusedxml) are dependencies. A device without them doesn't offer the document tools.
 
 **Know the boundary.** The command allowlist controls *which programs* run, not *what they touch*. `git diff --no-index` can read any file the OS user can, for example. Allowing a program that can run other programs makes allowlist mode equivalent to unrestricted: a shell, an interpreter, or git, whose `-c` options and aliases run any command, so the example configs leave git out. The filesystem deny list applies to the file tools, not to commands. For a hard boundary, run the computer route as a dedicated OS user that can only reach what you intend to share.
 
@@ -163,12 +295,13 @@ Pairing is deliberately an admin CLI on the gateway host and not an MCP tool, so
   - **Certificate pinning.** Agents check the gateway certificate's SHA-256 fingerprint before sending anything.
   - **Allowed bind addresses.** The listener binds only a specific loopback, LAN, or overlay (e.g. Tailscale) address. `0.0.0.0`, `::`, public IPs, and hostnames are refused.
 - **Replay protection.** Calls carry a sequence number that must increase on each connection, and a request id the agent never accepts twice.
-- **Liveness.** Agents send heartbeats. A device that misses three is dropped and shown offline, and its pending calls fail. Agents reconnect with exponential backoff and stop permanently once revoked.
+- **Liveness.** Agents send heartbeats. A device that misses three is dropped and shown offline, and its pending calls fail. Agents reconnect with exponential backoff (reset once a connection is accepted, so a blip after a long outage is retried within a second) and stop permanently once revoked.
+- **One connection per device.** An agent refuses to start while another agent with the same identity file is running on that machine. If a second agent holding the same key connects anyway, the gateway pings the established connection: while it answers, the newcomer is refused (`already_connected`, retried with backoff) and the established connection keeps serving. A connection that does not answer within 5 seconds is replaced, so a restarted agent is never locked out by a half-open one.
 - **Revocation.** `revoke` marks the device in the registry. The gateway refuses the next call to it and drops its live connection within a second.
 - **Secrets stay hidden.** The local device can never read the TLS private key or the device registry, and an agent can never read its own identity file.
 - **Audit on both sides.**
   - **Shared request ids.** A remote call carries the same `request_id` in the gateway's audit log and the agent's.
-  - **Gateway events.** The gateway's log also records `device_enrolled`, `device_connected`, `device_disconnected`, `device_auth_failed`, `device_revoked`, and `device_heartbeat_lost`.
+  - **Gateway events.** The gateway's log also records `device_enrolled`, `device_connected`, `device_disconnected`, `device_auth_failed`, `device_duplicate_refused`, `device_revoked`, and `device_heartbeat_lost`.
   - **`started` comes from the agent.** The agent reports `started` only after its own checks pass and its own log has recorded it.
 
 ### Windows devices (Thanatos)
@@ -188,7 +321,7 @@ copy configs\agent.windows.yaml configs\agent.yaml     # then set name, gateway.
 **Running as a scheduled task.** `install-agent.ps1` registers a scheduled task that runs the agent as *your* account, never SYSTEM, so commands have exactly your permissions within the agent's policy.
 - **Default:** starts at boot whether or not you are signed in. It uses S4U, so no password is stored, but registering it needs an elevated shell.
 - **`-AtLogOn`:** starts at sign-in instead, and needs no elevation.
-- **Either way:** the task restarts the agent if it exits.
+- **Either way:** a second trigger repeats every minute from installation on, so an agent that exits is relaunched within a minute; a running one is left alone. To keep the agent stopped, disable the task (`Disable-ScheduledTask`); stopping it lasts only until the next repeat.
 - **Logs:** go to `audit\agent.log`, plus the agent's audit log.
 - **Removal:** `-Uninstall`.
 
@@ -290,16 +423,78 @@ contextbridge-admin --config configs/computer.yaml oauth-unlock               # 
 - **Keep remote clients read-only** unless you need more, and prefer `allowlist` mode.
 - **Device names are visible.** The consent page shows the names of the devices you allow remotely to anyone who starts an authorization.
 
+## Failover
+
+ContextBridge serves every device through its own gateway, agents, permissions, and transport. The failover drill checks that on a live deployment, and CI checks it on a jailed one.
+
+### The failover drill
+
+Run the drill on the gateway host (Friday) with the ContextBridge gateway and the Thanatos agent running.
+
+```sh
+export CONTEXTBRIDGE_COMPUTER_TOKEN=...                                      # the local listener's token
+contextbridge-failover --config configs/computer.yaml                        # read-only probes
+contextbridge-failover --config configs/computer.yaml --write                # plus a write round trip
+contextbridge-failover --config configs/computer.yaml --device thanatos --json
+```
+
+It prints PASS, FAIL, or skip for each check:
+
+1. **The gateway answers.** It serves the computer tool surface over MCP, using your token.
+2. **Every device is online and working.** By default that is `local` plus each enrolled agent; `--device` limits it. On each device the drill runs:
+   - **Read checks:** system info, a directory listing, a file-name search, and a file read.
+   - **Commands:** a harmless command (the first of `hostname`, `whoami`, `uname`, `pwd`, `date` the device's policy allows), run once directly and once as a session.
+   - **Processes:** a process listing.
+   - **Writes (`--write` only):** all inside `<first writable root>/.contextbridge-failover/`:
+     - create, write, edit, move, read back, file info, and content search;
+     - Word, PDF, and Excel files written and read back;
+     - a file deleted and then restored from the trash, where the device keeps one.
+
+No process is killed, and the only file deleted is the drill's own. The exit status is `0` for READY, `1` for NOT READY, and `2` if the drill could not run.
+
+### What CI proves
+
+`tests/test_failover.py` runs the whole deployment from its shipped entry points on Ubuntu and Windows: the knowledge gateway, the computer gateway with its agent and OAuth listeners, and an agent standing in for Thanatos. Everything runs inside a jail:
+
+- **Tripwires:** `npx` and `node` programs come first on `PATH` and record any call.
+- **Network jail:** `tests/failover_jail/sitecustomize.py` refuses and records every network destination off the machine, so no hosted relay, registry, or update check can be reached.
+
+Then the test checks each of these:
+- **Drill:** passes on both devices, including `--write`.
+- **Every tool:** every computer tool works on both devices, apart from `list_windows` and `media_inventory`, which the test's device policies leave off.
+- **Remote client:** a Claude/ChatGPT-style OAuth client reads from both devices and is refused anything it wasn't granted.
+- **Knowledge route:** `search` and `fetch` work.
+- **Restart:** after a gateway restart, the agent reconnects on its own and the OAuth token still works.
+- **Audit:** both machines' audit logs show the same requests.
+- **Isolation:** nothing touched a tripwire or the network.
+
+### What the computer route leaves out
+
+Some operations are deliberately not tools:
+- **Changing policy** happens only on the host, so a client cannot widen its own access.
+- **Usage statistics and call history** are in the host's JSONL audit log.
+- **Collecting a pending result** is never needed: every call finishes within `call_timeout_seconds`.
+- **Stopping an agent** is done on the host, with `contextbridge-admin revoke` or by stopping the agent's service.
+- **The caller's identity** is recorded in the audit log but not returned to the client.
+
+Beyond individual tools, the checklist in `docs/capability-roadmap.pdf` also lists capabilities the computer route does not have yet:
+- **asynchronous, paged search** sessions;
+- legacy **`.xls`** workbooks, images, and fetching URLs;
+- the **synchronization** layer (transfer, sync, checksums, conflicts).
+
+Native delete and the PDF, Word, and Excel tools arrived in phase 7 (see [Documents](#documents) and the **Deletes** policy above).
+
 ## Network exposure
 
-Neither route depends on Authentik.
-- **Knowledge route:** binds to loopback by default.
+No route depends on Authentik.
+- **Knowledge route:** binds to loopback by default; do not set `serve.host` to a public interface. It has no OAuth front end; the remote endpoint serves only the computer route.
+- **Filesystem route (8794):** binds to loopback by default, and the same `serve.host` rule applies. It has no OAuth front end either.
 - **Computer MCP endpoints:** refuse any non-loopback address; there is no override.
   - **Local listener (8791):** accepts only the static token.
   - **Remote listener (8793):** accepts only OAuth tokens. It is meant to be published only through a TLS tunnel.
 - **Agent listener:** TLS-only, limited to private addresses, and accepts only enrolled devices.
 
-Do not forward ports 8790, 8791, or 8792 to the internet. Publish 8793 only through a TLS tunnel, and only once `owner-init` is done.
+Do not forward ports 8790, 8791, 8792, or 8794 to the internet. Publish 8793 only through a TLS tunnel, and only once `owner-init` is done.
 
 ## Roadmap
 
@@ -308,17 +503,30 @@ Do not forward ports 8790, 8791, or 8792 to the internet. Publish 8793 only thro
 3. ~~Remote agent transport and device registration (outbound agent connections, heartbeats, revocation)~~
 4. ~~Windows agent for Thanatos (native agent, job-object process trees, scheduled-task install, Windows CI)~~
 5. ~~Authenticated remote MCP endpoint for ChatGPT and Claude (OAuth front end, per-device permissions)~~
-6. Failover acceptance test with Desktop Commander fully stopped
+6. ~~Failover acceptance test (drill + jailed CI test)~~
+7. ~~Native delete (trash with restore) and document tools (PDF, Word, Excel)~~
 
 ## Documentation
 
-`docs/desktop-commander-inventory.pdf` lists the Desktop Commander functionality ContextBridge targets, with an implementation checklist. To rebuild it after editing `scripts/build-inventory-pdf.py` (requires the DejaVu fonts):
+The PDFs in `docs/` are planning documents. The filesystem and computer routes implement the roadmap's filesystem operations; the filesystem route now also offers asynchronous file and content search. The computer route covers search, commands, processes, remote devices, documents (PDF, Word, Excel) and native recoverable delete. Synchronization remains unimplemented. The read-only knowledge route rejects these operations. The documents refer to Friday (Linux) and Thanatos (Windows).
+
+
+- `docs/capability-roadmap.pdf` lists the capabilities ContextBridge targets, with an implementation checklist. The checklist is a blank tracker, not a status report. It is generated by `scripts/build-roadmap-pdf.py`.
+- `docs/local-health-check.md` is the on-host checklist for Friday and Thanatos: deployed revision, service and enrollment state, exposure, and crash, restart, reboot and half-open recovery tests. Its scripts are in `scripts/healthcheck/`.
+- `docs/computer-use-linux-review.pdf` evaluates `agent-sh/computer-use-linux` as a Linux desktop-control engine for ContextBridge. It is generated by `scripts/build-review-pdf.py`.
+
+Both scripts share `scripts/pdf_common.py`. To rebuild a PDF after editing its script (requires the DejaVu fonts; set `CONTEXTBRIDGE_FONT_DIR` if they are not in a standard font directory):
 
 ```sh
 python3 -m pip install -e '.[docs]'
-./scripts/build-inventory-pdf.py
+./scripts/build-roadmap-pdf.py
+./scripts/build-review-pdf.py
 ```
 
 ## Status
 
-The knowledge route is a standalone extraction from an archived UGA implementation. Authentication-front/sidecar deployments and systemd services were intentionally left out. Neither route is production-validated yet.
+The knowledge route is a standalone extraction from an archived UGA (Unidirectional Gateway Appliance) implementation. That is why the package is `uga`, environment variables start with `UGA_`, the gateway's default name is `Nexus UGA`, and its timeout errors say "Nexus Datacore". Authentication-front/sidecar deployments and systemd services were intentionally left out. No route is production-validated yet.
+
+## License
+
+ContextBridge is released under the MIT License; see [`LICENSE`](LICENSE).

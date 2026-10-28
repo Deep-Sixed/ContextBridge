@@ -17,6 +17,8 @@ from contextbridge.computer.policy import PolicyError, load_policy
 from contextbridge.computer.server import (
     ALL_SCOPES,
     COMMAND_TOOLS,
+    DOCUMENT_READ_TOOLS,
+    DOCUMENT_WRITE_TOOLS,
     READ_TOOLS,
     SCOPE_READ,
     SERVER_TOOLS,
@@ -80,20 +82,28 @@ def run(server, fn):
 def test_read_only_policy_exposes_only_read_tools(workspace, audit):
     policy = load_policy({"filesystem": {"roots": [str(workspace)]}, "processes": {"list": False}})
     server = create_computer_server(policy, audit=audit, authorize=allow_scopes(*ALL_SCOPES))
-    assert computer_tool_names(policy) == READ_TOOLS
+    readable = READ_TOOLS | DOCUMENT_READ_TOOLS
+    assert computer_tool_names(policy) == readable
     assert advertised_tool_names(server) == SERVER_TOOLS  # registered once; filtered per caller and device
 
     async def listed(client):
         return {t.name for t in await client.list_tools()}
 
-    assert run(server, listed) == READ_TOOLS | {"list_devices"}
+    assert run(server, listed) == readable | {"list_devices"}
 
 
 def test_full_policy_surface(make_policy, audit):
     policy = make_policy(processes={"allow_kill": True})
-    expected = READ_TOOLS | WRITE_TOOLS | COMMAND_TOOLS | {"list_processes", "kill_process"}
+    expected = (
+        READ_TOOLS
+        | WRITE_TOOLS
+        | COMMAND_TOOLS
+        | DOCUMENT_READ_TOOLS
+        | DOCUMENT_WRITE_TOOLS
+        | {"list_processes", "kill_process", "delete_file", "list_deleted", "restore_deleted"}
+    )
     assert computer_tool_names(policy) == expected
-    assert set(TOOL_SCOPES) == expected | {"list_devices", "list_windows"} == SERVER_TOOLS
+    assert set(TOOL_SCOPES) == expected | {"list_devices", "list_windows", "media_inventory"} == SERVER_TOOLS
     server = create_computer_server(policy, audit=audit, authorize=allow_scopes(*ALL_SCOPES))
 
     async def listed(client):

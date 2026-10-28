@@ -47,8 +47,20 @@ _AUDITED_ARGS = (
     "force",
     "timeout_seconds",
     "device",
+    "recursive",
+    "trash_id",
+    "pages",
+    "sheet",
+    "cell_range",
+    "start_cell",
+    "find",
+    "delete_pages",
+    "rotate_pages",
+    "insert_pdf",
+    "insert_at",
+    "output_path",
 )
-_DIGESTED_ARGS = ("content", "old_string", "new_string", "input")
+_DIGESTED_ARGS = ("content", "old_string", "new_string", "input", "old_text", "new_text", "rows")
 _OUTCOME_FIELDS = ("pid", "session_id", "exit_code", "timed_out", "stdout_truncated", "stderr_truncated")
 MAX_AUDIT_VALUE = 1000
 
@@ -66,8 +78,9 @@ def summarize_args(arguments: dict[str, Any] | None) -> dict[str, Any]:
         fields[key] = value
     for key in _DIGESTED_ARGS:
         value = args.get(key)
-        if isinstance(value, str):
-            data = value.encode("utf-8")
+        if value is not None:
+            text = value if isinstance(value, str) else json.dumps(value, default=str, sort_keys=True)
+            data = text.encode("utf-8")
             fields[f"{key}_bytes"] = len(data)
             fields[f"{key}_sha256"] = hashlib.sha256(data).hexdigest()[:16]
     return fields

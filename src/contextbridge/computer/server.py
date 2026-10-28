@@ -44,8 +44,10 @@ from fastmcp.server.auth import StaticTokenVerifier
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.tools.tool import Tool
 from mcp.types import ToolAnnotations
+from starlette.middleware import Middleware as ASGIMiddleware
 
-from ..net import is_loopback, is_private_bind
+from .. import __version__
+from ..net import HostOriginGuard, is_loopback, is_private_bind
 from .audit import (
     MAX_AUDIT_VALUE,
     AuditError,
@@ -61,11 +63,17 @@ from .audit import (
 from .commands import CommandError
 from .dispatch import (
     COMMAND_TOOLS,
+    DELETE_TOOL,
+    DOCUMENT_READ_TOOLS,
+    DOCUMENT_WRITE_TOOLS,
     ENGINE_TOOLS,
     PROCESS_KILL_TOOL,
     PROCESS_LIST_TOOL,
     READ_TOOLS,
+    TRASH_READ_TOOL,
+    TRASH_RESTORE_TOOL,
     DESKTOP_TOOLS,
+    MEDIA_TOOLS,
     WRITE_TOOLS,
     Engine,
     InvalidArguments,
@@ -88,14 +96,19 @@ SCOPE_WRITE = "computer:write"
 SCOPE_EXECUTE = "computer:execute"
 SCOPE_PROCESS = "computer:process"
 SCOPE_DESKTOP_OBSERVE = "desktop:observe"
-ALL_SCOPES = (SCOPE_READ, SCOPE_WRITE, SCOPE_EXECUTE, SCOPE_PROCESS, SCOPE_DESKTOP_OBSERVE)
+SCOPE_MEDIA_DISCOVER = "media:discover"
+ALL_SCOPES = (SCOPE_READ, SCOPE_WRITE, SCOPE_EXECUTE, SCOPE_PROCESS, SCOPE_DESKTOP_OBSERVE, SCOPE_MEDIA_DISCOVER)
 
 TOOL_SCOPES: dict[str, str] = {
-    **{name: SCOPE_READ for name in READ_TOOLS},
+    **{name: SCOPE_READ for name in READ_TOOLS | DOCUMENT_READ_TOOLS},
     PROCESS_LIST_TOOL: SCOPE_READ,
     **{name: SCOPE_DESKTOP_OBSERVE for name in DESKTOP_TOOLS},
+    **{name: SCOPE_MEDIA_DISCOVER for name in MEDIA_TOOLS},
     LIST_DEVICES_TOOL: SCOPE_READ,
-    **{name: SCOPE_WRITE for name in WRITE_TOOLS},
+    TRASH_READ_TOOL: SCOPE_READ,
+    **{name: SCOPE_WRITE for name in WRITE_TOOLS | DOCUMENT_WRITE_TOOLS},
+    DELETE_TOOL: SCOPE_WRITE,
+    TRASH_RESTORE_TOOL: SCOPE_WRITE,
     **{name: SCOPE_EXECUTE for name in COMMAND_TOOLS},
     PROCESS_KILL_TOOL: SCOPE_PROCESS,
 }
@@ -105,6 +118,7 @@ _READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
 _WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False)
 _ADDITIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False)
 _EXECUTE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True)
+_RESTORE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False)
 _DEVICE_DOC = " device: 'local' (default) or a name from list_devices."
 
 
@@ -349,7 +363,13 @@ def _instructions(policy: ComputerPolicy | None, remote: bool) -> str:
             cmds = "allowlist only: " + ", ".join(sorted(policy.command_allow)) + " (no shell operators)"
         else:
             cmds = policy.command_mode
-        parts.append(f"On 'local': readable roots {roots}; writable roots {writable}; commands {cmds}.")
+        deletes = {"trash": "to a trash (undo with restore_deleted)", "permanent": "permanently"}.get(
+            policy.delete_mode if policy.can_write else "disabled", "disabled"
+        )
+        parts.append(
+            f"On 'local': readable roots {roots}; writable roots {writable}; commands {cmds}; deletes {deletes}."
+        )
+        parts.append("Use read_document for PDF, Word, and Excel files; read_file is for text.")
     else:
         parts.append("This gateway has no local device.")
     if remote:
@@ -393,7 +413,7 @@ def create_computer_server(
     if router is None:
         router = build_router(policy, audit=audit, hub=hub)
     policy = router.local.policy if router.local is not None else None
-    server = FastMCP(name=name, instructions=_instructions(policy, router.hub is not None))
+    server = FastMCP(name=name, version=__version__, instructions=_instructions(policy, router.hub is not None))
     run = functools.partial(_invoke, router)
 
     # ------------------------------------------------------------ read tools
@@ -463,6 +483,11 @@ def create_computer_server(
         """List visible top-level window titles and IDs, only with desktop:observe host and client permissions."""
         return await run(device, "list_windows", {})
 
+    @server.tool(annotations=_READ_ONLY)
+    async def media_inventory(device: str = LOCAL_DEVICE) -> dict[str, Any]:
+        """Inspect media-device availability hints only with media:discover permission; no recording."""
+        return await run(device, "media_inventory", {})
+
     # ----------------------------------------------------------- write tools
 
     @server.tool(annotations=_WRITE)
@@ -494,6 +519,110 @@ def create_computer_server(
     async def move_file(source: str, destination: str, device: str = LOCAL_DEVICE) -> dict[str, Any]:
         """Move or rename a file or directory. The destination must not already exist."""
         return await run(device, "move_file", {"source": source, "destination": destination})
+
+    @server.tool(annotations=_WRITE)
+    async def delete_file(path: str, recursive: bool = False, device: str = LOCAL_DEVICE) -> dict[str, Any]:
+        """Delete a file, symlink, or folder in a writable root. Folders with contents need recursive=true.
+        Where the device keeps a trash (the default), the item can be brought back with restore_deleted
+        using the returned trash_id. Refused for roots and for folders holding protected or hidden files."""
+        return await run(device, "delete_file", {"path": path, "recursive": recursive})
+
+    @server.tool(annotations=_READ_ONLY)
+    async def list_deleted(limit: int = 50, device: str = LOCAL_DEVICE) -> dict[str, Any]:
+        """List items in a device's trash, newest first, with trash_id and original path."""
+        return await run(device, "list_deleted", {"limit": limit})
+
+    @server.tool(annotations=_RESTORE)
+    async def restore_deleted(trash_id: str, device: str = LOCAL_DEVICE) -> dict[str, Any]:
+        """Put a deleted item back at its original path. Fails if something now exists there."""
+        return await run(device, "restore_deleted", {"trash_id": trash_id})
+
+    # -------------------------------------------------------- document tools
+
+    @server.tool(annotations=_READ_ONLY)
+    async def read_document(
+        path: str,
+        pages: str | None = None,
+        sheet: str | None = None,
+        cell_range: str | None = None,
+        find: str | None = None,
+        formulas: bool = False,
+        max_chars: int | None = None,
+        device: str = LOCAL_DEVICE,
+    ) -> dict[str, Any]:
+        """Read a PDF, Word (.docx), or Excel (.xlsx/.xlsm) file.
+        PDF: text per page; pages like "1-3,7". Word: Markdown text with headings, lists, and tables, plus
+        an outline. Excel: sheet names and cell values for sheet and cell_range (A1 notation); formulas=true
+        shows formulas instead of cached values. find searches inside instead of returning everything."""
+        args = {
+            "path": path,
+            "pages": pages,
+            "sheet": sheet,
+            "cell_range": cell_range,
+            "find": find,
+            "formulas": formulas,
+            "max_chars": max_chars,
+        }
+        return await run(device, "read_document", args)
+
+    @server.tool(annotations=_WRITE)
+    async def write_document(
+        path: str, content: str, title: str | None = None, device: str = LOCAL_DEVICE
+    ) -> dict[str, Any]:
+        """Create or replace a .docx or .pdf from simple Markdown: # headings, - and 1. lists,
+        | a | b | tables, and paragraphs separated by blank lines."""
+        return await run(device, "write_document", {"path": path, "content": content, "title": title})
+
+    @server.tool(annotations=_WRITE)
+    async def edit_document(
+        path: str, old_text: str, new_text: str, expected_replacements: int = 1, device: str = LOCAL_DEVICE
+    ) -> dict[str, Any]:
+        """Replace exact text in a Word (.docx) file: body, tables, headers, and footers. Fails unless
+        old_text occurs exactly expected_replacements times. Formatting is kept when a match sits in one run."""
+        args = {
+            "path": path,
+            "old_text": old_text,
+            "new_text": new_text,
+            "expected_replacements": expected_replacements,
+        }
+        return await run(device, "edit_document", args)
+
+    @server.tool(annotations=_WRITE)
+    async def write_spreadsheet(
+        path: str,
+        rows: list[list[str | int | float | bool | None]],
+        sheet: str | None = None,
+        start_cell: str = "A1",
+        device: str = LOCAL_DEVICE,
+    ) -> dict[str, Any]:
+        """Write rows of values into an Excel sheet starting at start_cell, creating the .xlsx file or the
+        sheet if needed and keeping everything else. A string starting with = is stored as a formula."""
+        args = {"path": path, "rows": rows, "sheet": sheet, "start_cell": start_cell}
+        return await run(device, "write_spreadsheet", args)
+
+    @server.tool(annotations=_WRITE)
+    async def edit_pdf(
+        path: str,
+        delete_pages: str | None = None,
+        rotate_pages: str | None = None,
+        rotate_degrees: int = 90,
+        insert_pdf: str | None = None,
+        insert_at: int | None = None,
+        output_path: str | None = None,
+        device: str = LOCAL_DEVICE,
+    ) -> dict[str, Any]:
+        """Change a PDF's pages: delete_pages and rotate_pages take ranges like "2,5-7"; insert_pdf adds
+        another PDF's pages before page insert_at (default: at the end). Writes to output_path if given."""
+        args = {
+            "path": path,
+            "delete_pages": delete_pages,
+            "rotate_pages": rotate_pages,
+            "rotate_degrees": rotate_degrees,
+            "insert_pdf": insert_pdf,
+            "insert_at": insert_at,
+            "output_path": output_path,
+        }
+        return await run(device, "edit_pdf", args)
 
     # --------------------------------------------------------- command tools
 
@@ -731,15 +860,12 @@ class RemoteListenerConfig:
         return urlsplit(self.public_url).hostname or ""
 
     def http_options(self) -> dict[str, Any]:
-        """Bind and Host/Origin-guard settings: loopback names plus the public name the tunnel forwards."""
+        """Bind address plus a Host/Origin guard that also admits the public name the tunnel forwards."""
         public = urlsplit(self.public_url)
-        return {
-            "host": self.host,
-            "port": self.port,
-            "host_origin_protection": True,
-            "allowed_hosts": [self.host, self.public_host],
-            "allowed_origins": [f"{public.scheme}://{public.netloc}"],
-        }
+        guard = ASGIMiddleware(
+            HostOriginGuard, hosts=[self.host, self.public_host], origins=[f"{public.scheme}://{public.netloc}"]
+        )
+        return {"host": self.host, "port": self.port, "middleware": [guard]}
 
     @property
     def secret_paths(self) -> list[Path]:
@@ -901,8 +1027,9 @@ def main(argv: list[str] | None = None) -> None:
             await hub.start(listener.host, listener.port, ssl_context)
             scheme = "wss" if ssl_context else "ws"
             print(f"[computer] agents on {scheme}://{listener.host}:{hub.port}", file=sys.stderr, flush=True)
-        # Host/Origin guard on (FastMCP leaves it off by default): refuses DNS-rebinding requests.
-        listeners = [(server, {"host": host, "port": port, "host_origin_protection": True})]
+        # The Host/Origin guard refuses DNS-rebinding requests (FastMCP's own is off by default or absent).
+        local_options = {"host": host, "port": port, "middleware": [ASGIMiddleware(HostOriginGuard, hosts=[host])]}
+        listeners = [(server, local_options)]
         if remote_server is not None:
             listeners.append((remote_server, remote.http_options()))
         running = len(listeners)

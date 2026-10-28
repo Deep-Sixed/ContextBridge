@@ -1,0 +1,18 @@
+name: ContextBridge Files
+serve:
+  transport: http
+  host: 127.0.0.1
+  port: 8794
+filesystem:
+  # The route refuses to start until at least one root is listed. Roots are
+  # read-only unless writable is true, must exist, and must not overlap. A
+  # relative path is resolved against this file's directory.
+  roots: []
+  # roots:
+  #   - path: /srv/contextbridge/projects
+  #   - path: /srv/contextbridge/scratch
+  #     writable: true
+  # max_read_bytes: 1048576
+  # max_write_bytes: 1048576
+  # max_list_entries: 1000
+  # max_search_file_bytes: 10485760

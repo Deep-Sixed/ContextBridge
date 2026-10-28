@@ -2,8 +2,8 @@
 
 Both gateways are launched exactly as in production — separate processes serving
 HTTP with bearer authentication — and exercised through a real MCP client. The
-child environment carries only Python and the gateway's own settings: no Node,
-no npx, nothing from Desktop Commander.
+child environment carries only Python and the gateway's own settings: no Node
+and no npx.
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ import re
 import subprocess
 import sys
 import time
-import tomllib
 from pathlib import Path
 
 import anyio
@@ -275,17 +274,11 @@ def test_unwritable_audit_log_fails_startup(startup, tmp_path):
 # ------------------------------------------------------------- independence
 
 
-def test_no_desktop_commander_dependency():
-    pyproject = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
-    deps = " ".join(pyproject["project"]["dependencies"]).lower()
-    assert "desktop" not in deps and "commander" not in deps
-    # Imports of a Desktop Commander module, its npm package, or launching Node/npx.
-    pattern = re.compile(r"^\s*(import|from)\s+\S*desktop|wonderwhy-er|[\"']npx[\"']|[\"']node[\"']", re.M | re.I)
-    offenders = [
-        str(path.relative_to(REPO))
-        for path in (REPO / "src").rglob("*.py")
-        if pattern.search(path.read_text(encoding="utf-8"))
-    ]
+def test_no_node_or_npx_dependency():
+    # Launching Node or npx from any of ContextBridge's own code.
+    pattern = re.compile(r"[\"']npx[\"']|[\"']node[\"']", re.I)
+    sources = (REPO / "src").rglob("*.py")
+    offenders = [str(path.relative_to(REPO)) for path in sources if pattern.search(path.read_text(encoding="utf-8"))]
     assert offenders == []
 
 

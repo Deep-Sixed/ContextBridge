@@ -45,6 +45,8 @@ from .tailnet import TailnetAdmissionDenied, verify_local_tailnet_peer
 
 MONITOR_INTERVAL_SECONDS = 0.5
 FAILED_ENROLL_DELAY_SECONDS = 1.0
+# Well inside the agent's wait for "welcome" (HANDSHAKE_TIMEOUT_SECONDS).
+TAKEOVER_PROBE_SECONDS = 5.0
 _MAX_ERROR_TEXT = 2000
 _INFO_KEYS = ("hostname", "platform", "agent_version", "python")
 _RESERVED_AUDIT_KEYS = frozenset({"request_id", "tool", "device", "client", "event", "ts", "route"})
@@ -116,6 +118,7 @@ class AgentHub:
         *,
         heartbeat_seconds: float = 15.0,
         call_timeout_seconds: float = 660.0,
+        takeover_probe_seconds: float = TAKEOVER_PROBE_SECONDS,
         allowed_tailnet_node_ids: frozenset[str] | None = None,
     ) -> None:
         self.registry = registry
@@ -123,7 +126,9 @@ class AgentHub:
         self.audit = audit
         self.heartbeat_seconds = heartbeat_seconds
         self.call_timeout_seconds = call_timeout_seconds
+        self.takeover_probe_seconds = takeover_probe_seconds
         self._connections: dict[str, AgentConnection] = {}
+        self._admitting: dict[str, asyncio.Lock] = {}
         self._last_seen_wall: dict[str, float] = {}
         self._server: Server | None = None
         self._monitor_task: asyncio.Task[None] | None = None
@@ -330,12 +335,24 @@ class AgentHub:
             info=_clean_info(caps.get("info")),
             policy=caps.get("policy") if isinstance(caps.get("policy"), dict) else {},
         )
-        previous = self._connections.get(device.device_id)
-        if previous is not None:
-            self._disconnect(previous, "replaced", "a newer connection for this device was accepted")
-        self._connections[device.device_id] = conn
-        self._last_seen_wall[device.device_id] = time.time()
-        await conn.send({"type": "welcome", "heartbeat_seconds": self.heartbeat_seconds})
+        # One admission per device at a time, so two newcomers cannot both get past a live connection.
+        async with self._admitting.setdefault(device.device_id, asyncio.Lock()):
+            previous = self._connections.get(device.device_id)
+            if previous is not None:
+                # The established connection wins while it is alive: a duplicate agent must not
+                # displace it. Only a connection that stopped answering is replaced.
+                if await self._answers(previous):
+                    self._log("device_duplicate_refused", device=device.name, device_id=device.device_id, peer=peer)
+                    await self._refuse(ws, "already_connected", "this device already has a live connection")
+                    return None
+                self._disconnect(previous, "replaced", "the previous connection stopped answering")
+            self._connections[device.device_id] = conn
+            self._last_seen_wall[device.device_id] = time.time()
+            try:
+                await conn.send({"type": "welcome", "heartbeat_seconds": self.heartbeat_seconds})
+            except ConnectionClosed:
+                self._drop(conn, "connection lost")
+                raise
         self._log(
             "device_connected",
             device=device.name,
@@ -383,6 +400,19 @@ class AgentHub:
             pending.call.mark_started(**{str(k): v for k, v in fields.items() if k not in _RESERVED_AUDIT_KEYS})
         except AuditError as exc:
             print(f"[computer] could not audit remote start: {exc}", file=sys.stderr, flush=True)
+
+    async def _answers(self, conn: AgentConnection) -> bool:
+        """Whether an established connection still answers a ping in time."""
+
+        async def ping() -> None:
+            pong = await conn.ws.ping()
+            await pong
+
+        try:
+            await asyncio.wait_for(ping(), self.takeover_probe_seconds)
+        except (TimeoutError, ConnectionClosed, OSError):
+            return False
+        return True
 
     def _drop(self, conn: AgentConnection, reason: str) -> None:
         if conn.dropped:

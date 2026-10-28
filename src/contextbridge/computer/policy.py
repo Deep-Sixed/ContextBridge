@@ -29,6 +29,10 @@ from .oscompat import (
 )
 
 COMMAND_MODES = ("disabled", "allowlist", "unrestricted")
+DELETE_MODES = ("trash", "permanent", "disabled")
+# Deleted items move here, inside the writable root that held them. No file tool may
+# read, list, write, or delete anything under it, so a client cannot purge the trash.
+TRASH_DIRNAME = ".contextbridge-trash"
 
 DEFAULT_DENY: tuple[str, ...] = (
     ".ssh",
@@ -162,7 +166,11 @@ class ComputerPolicy:
     env_strip: tuple[str, ...] = DEFAULT_ENV_STRIP
     list_processes: bool = True
     allow_kill: bool = False
+    delete_mode: str = "trash"
+    max_delete_entries: int = 10_000
+    max_document_bytes: int = 20 * 1024 * 1024
     desktop_observe: bool = False
+    media_discover: bool = False
     windows: bool = IS_WINDOWS
 
     # ------------------------------------------------------------------ paths
@@ -171,12 +179,27 @@ class ComputerPolicy:
     def can_write(self) -> bool:
         return bool(self.writable_roots)
 
+    @property
+    def can_delete(self) -> bool:
+        return self.can_write and self.delete_mode != "disabled"
+
+    def writable_root_for(self, path: Path) -> Path | None:
+        """The innermost writable root containing ``path`` (already resolved)."""
+        containing = [r for r in self.writable_roots if path == r or path.is_relative_to(r)]
+        return max(containing, key=lambda r: len(r.parts)) if containing else None
+
     def _is_denied(self, path: Path) -> bool:
         for part in path.parts[1:]:
+            if (part.casefold() if self.windows else part) == TRASH_DIRNAME:
+                return True
             for pattern in self.deny:
                 if fnmatch.fnmatch(part, pattern):
                     return True
         return False
+
+    def is_untouchable(self, path: Path) -> bool:
+        """True for a path no file tool may read, write, or delete (denied, hidden, or protected)."""
+        return self._is_denied(path) or path in self.protected
 
     def resolve(self, raw: str, *, write: bool = False, follow_symlinks: bool = True) -> Path:
         """Resolve ``raw`` and verify it is inside the readable (or writable) roots.
@@ -316,7 +339,10 @@ class ComputerPolicy:
             "max_sessions": self.max_sessions,
             "list_processes": self.list_processes,
             "allow_kill": self.allow_kill,
+            "delete": self.delete_mode if self.can_write else "disabled",
+            "max_document_bytes": self.max_document_bytes,
             "desktop_observe": self.desktop_observe,
+            "media_discover": self.media_discover,
         }
 
 
@@ -360,7 +386,8 @@ def load_policy(
     cmds = cfg.get("commands") or {}
     procs = cfg.get("processes") or {}
     desktop_cfg = cfg.get("desktop") or {}
-    if not all(isinstance(s, dict) for s in (fs, cmds, procs, desktop_cfg)):
+    media_cfg = cfg.get("media") or {}
+    if not all(isinstance(s, dict) for s in (fs, cmds, procs, desktop_cfg, media_cfg)):
         raise PolicyError("filesystem, commands, and processes must be mappings")
 
     roots: list[Path] = []
@@ -380,6 +407,10 @@ def load_policy(
         if _within(root, tuple(roots)) is None:
             raise PolicyError(f"filesystem.writable_roots: {raw} must be inside a readable root")
         writable.append(root)
+
+    delete_mode = fs.get("delete", "trash")
+    if delete_mode not in DELETE_MODES:
+        raise PolicyError(f"filesystem.delete must be one of {', '.join(DELETE_MODES)}")
 
     mode = cmds.get("mode", "disabled")
     if mode not in COMMAND_MODES:
@@ -423,7 +454,11 @@ def load_policy(
         env_strip=_str_list(cmds, "env_strip", DEFAULT_ENV_STRIP),
         list_processes=bool(procs.get("list", True)),
         allow_kill=bool(procs.get("allow_kill", False)),
+        delete_mode=delete_mode,
+        max_delete_entries=_positive(fs, "max_delete_entries", 10_000),
+        max_document_bytes=_positive(fs, "max_document_bytes", 20 * 1024 * 1024),
         desktop_observe=desktop_cfg.get("observe", False) is True,
+        media_discover=media_cfg.get("discover", False) is True,
         windows=windows,
     )
     return policy

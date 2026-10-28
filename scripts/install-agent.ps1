@@ -10,8 +10,10 @@
     Registering an S4U task needs an elevated PowerShell. With -AtLogOn it starts when you sign in instead,
     which needs no elevation.
 
-    The task restarts the agent if it exits, and has no run-time limit. Stopping the task ends the agent and,
-    through its Windows job objects, every process the agent started.
+    A second trigger repeats every minute from installation on, so an agent that exits is relaunched within a
+    minute; a running one is left alone. The task has no run-time limit. Stopping the task ends the agent and,
+    through its Windows job objects, every process the agent started; the next repeat starts it again, so
+    disable the task (Disable-ScheduledTask) to keep it stopped.
 
     Enroll the device first:  .\scripts\run-agent.ps1 enroll -Code ABCD-EFGH-IJKL-MNOP
 
@@ -79,6 +81,10 @@ if ($AtLogOn) {
     $trigger = New-ScheduledTaskTrigger -AtStartup
     $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U -RunLevel Limited
 }
+# Restart-on-failure only covers a task that fails to start, not an agent that exits, so a second trigger fires
+# every minute from now on, indefinitely; MultipleInstances IgnoreNew leaves a running agent alone. (Repeating the
+# boot or logon trigger instead would only take effect after the next boot or sign-in.)
+$relaunch = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1)
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
@@ -87,7 +93,7 @@ $settings = New-ScheduledTaskSettingsSet `
     -RestartInterval (New-TimeSpan -Minutes 1) `
     -ExecutionTimeLimit ([TimeSpan]::Zero) `
     -MultipleInstances IgnoreNew
-$task = New-ScheduledTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
+$task = New-ScheduledTask -Action $action -Trigger $trigger, $relaunch -Principal $principal -Settings $settings `
     -Description 'ContextBridge agent: connects this machine to the ContextBridge gateway under its local policy.'
 
 if ($DryRun) {
@@ -96,6 +102,7 @@ if ($DryRun) {
         User             = $user
         LogonType        = $principal.LogonType
         Trigger          = if ($AtLogOn) { 'AtLogOn' } else { 'AtStartup' }
+        Repeat           = $relaunch.Repetition.Interval
         Execute          = $executable
         Arguments        = $arguments
         WorkingDirectory = $root
