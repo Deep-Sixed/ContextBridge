@@ -211,27 +211,39 @@ if [[ -n "$RESTART_CMD" ]]; then
   echo
   echo ">>> RECOVERY TEST: restarting the gateway with: $RESTART_CMD"
   T0="$(date -u +%s)"; T0_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  if bash -c "$RESTART_CMD"; then
-    DEADLINE=$((T0 + TIMEOUT)); RECONNECTED=""
-    while [[ $(date -u +%s) -lt $DEADLINE ]]; do
-      RECONNECTED="$("$PY" - "$AUDIT_LOG" "$T0_ISO" <<'EOF'
+  # Every active enrolled device must reconnect; one device coming back is not enough.
+  EXPECTED="$(awk '$3 == "active" {print $1}' "$WORK/devices.txt" 2>/dev/null | tr '\n' ' ')"
+  if [[ -z "${EXPECTED// /}" ]]; then
+    line FAIL "gateway restart recovery" "no active enrolled devices to wait for; not restarting"
+  elif bash -c "$RESTART_CMD"; then
+    DEADLINE=$((T0 + TIMEOUT)); STATE=""
+    while :; do
+      # Prints "<reconnected device@seconds ...>\t<missing device ...>"
+      STATE="$("$PY" - "$AUDIT_LOG" "$T0_ISO" "$T0" $EXPECTED <<'EOF'
 import json, sys
-seen = []
-for raw in open(sys.argv[1], encoding="utf-8", errors="replace"):
+from datetime import datetime, timezone
+log, t0_iso, t0, expected = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4:]
+first = {}
+for raw in open(log, encoding="utf-8", errors="replace"):
     try: e = json.loads(raw)
     except ValueError: continue
-    if e.get("event") == "device_connected" and e.get("ts", "") >= sys.argv[2]:
-        seen.append(f"{e.get('device')}@{e['ts']}")
-print(" ".join(seen))
+    dev, ts = e.get("device"), e.get("ts", "")
+    if e.get("event") == "device_connected" and ts >= t0_iso and dev in expected and dev not in first:
+        secs = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp() - t0
+        first[dev] = int(secs)
+done = " ".join(f"{d}@{first[d]}s" for d in expected if d in first)
+missing = " ".join(d for d in expected if d not in first)
+print(f"{done}\t{missing}")
 EOF
 )"
-      [[ -n "$RECONNECTED" ]] && break
+      [[ -z "${STATE#*$'\t'}" || $(date -u +%s) -ge $DEADLINE ]] && break
       sleep 2
     done
-    if [[ -n "$RECONNECTED" ]]; then
-      line PASS "gateway restart recovery" "reconnected within $(( $(date -u +%s) - T0 ))s: $RECONNECTED"
+    DONE="${STATE%%$'\t'*}"; MISSING="${STATE#*$'\t'}"
+    if [[ -z "$MISSING" ]]; then
+      line PASS "gateway restart recovery" "all devices reconnected: $DONE"
     else
-      line FAIL "gateway restart recovery" "no device_connected within ${TIMEOUT}s of restart"
+      line FAIL "gateway restart recovery" "not reconnected within ${TIMEOUT}s: $MISSING (reconnected: ${DONE:-none})"
     fi
   else
     line FAIL "gateway restart recovery" "restart command failed"
