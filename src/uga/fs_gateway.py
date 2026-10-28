@@ -47,6 +47,7 @@ from .gateway import (
 from .policy import FS_READ_TOOLS, FS_WRITE_TOOLS
 
 TOKEN_ENV = "CONTEXTBRIDGE_FS_AUTH_TOKEN"
+COMPUTER_TOKEN_ENV = "CONTEXTBRIDGE_COMPUTER_TOKEN"
 AUDIT_ENV = "CONTEXTBRIDGE_FS_AUDIT_LOG"
 DEFAULT_NAME = "ContextBridge Files"
 
@@ -300,8 +301,9 @@ def main() -> None:
         token = _require_token(os.environ.get(TOKEN_ENV), name=TOKEN_ENV)
     except ValueError as exc:
         raise SystemExit(str(exc)) from None
-    if token == os.environ.get("MCP_AUTH_TOKEN"):
-        raise SystemExit(f"{TOKEN_ENV} must differ from MCP_AUTH_TOKEN.")
+    for other in ("MCP_AUTH_TOKEN", COMPUTER_TOKEN_ENV):
+        if token == os.environ.get(other):
+            raise SystemExit(f"{TOKEN_ENV} must differ from {other}.")
 
     serve = cfg.get("serve") or {}
     host = serve.get("host", "127.0.0.1")

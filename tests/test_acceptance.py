@@ -240,7 +240,8 @@ def startup(tmp_path, workspace, monkeypatch):
     [
         ({"CONTEXTBRIDGE_COMPUTER_TOKEN": None}, "must be set"),
         ({"CONTEXTBRIDGE_COMPUTER_TOKEN": "short"}, "at least 32"),
-        ({"MCP_AUTH_TOKEN": COMPUTER_TOKEN}, "must differ"),
+        ({"MCP_AUTH_TOKEN": COMPUTER_TOKEN}, "must differ from MCP_AUTH_TOKEN"),
+        ({"CONTEXTBRIDGE_FS_AUTH_TOKEN": COMPUTER_TOKEN}, "must differ from CONTEXTBRIDGE_FS_AUTH_TOKEN"),
     ],
 )
 def test_missing_or_weak_credentials_fail_startup(startup, monkeypatch, env, message):

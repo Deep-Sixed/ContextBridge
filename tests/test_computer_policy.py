@@ -193,6 +193,16 @@ def test_gateway_tokens_are_stripped_even_with_empty_env_strip(make_policy, monk
     assert "MCP_AUTH_TOKEN" not in policy.child_env()
 
 
+def test_route_tokens_are_stripped_with_a_custom_env_strip(make_policy, monkeypatch):
+    route_tokens = {"MCP_AUTH_TOKEN", "CONTEXTBRIDGE_FS_AUTH_TOKEN", "CONTEXTBRIDGE_COMPUTER_TOKEN"}
+    for key in route_tokens:
+        monkeypatch.setenv(key, "secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "kept")
+    env = make_policy(commands={"env_strip": ["*PASSWORD*"]}).child_env()
+    assert not route_tokens & env.keys()
+    assert env["GITHUB_TOKEN"] == "kept"  # the custom list replaced the default *TOKEN* glob
+
+
 def test_default_timeout_follows_a_lower_max(make_policy):
     assert make_policy(commands={"max_timeout_seconds": 5}).default_timeout_seconds == 5
     with pytest.raises(PolicyError, match="cannot exceed"):
