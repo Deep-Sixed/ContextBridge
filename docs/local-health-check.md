@@ -22,15 +22,17 @@ scripts/healthcheck/check-gateway.sh --fetch --drill
 
 `--drill` runs `contextbridge-failover` (read-only probes on every device) and needs `CONTEXTBRIDGE_COMPUTER_TOKEN` in the shell. `--hours N` / `-Hours N` changes the audit window from 24 hours.
 
+`check-agent.ps1` checks the config and log file that the `ContextBridge Agent` scheduled task passes to the agent (`--config`, `--log-file`), so it looks at the agent that actually runs on the machine. Pass `-Config` to check a different one. It falls back to `configs\agent.yaml` only when the task is missing or has no `--config`.
+
 | Area | Friday (`check-gateway.sh`) | Thanatos (`check-agent.ps1`) |
 |---|---|---|
 | Deployed revision | HEAD compared with `origin/main`; uncommitted changes; installed package version | Same |
-| Service running | One gateway process; no stray local agents or leftover test processes | Scheduled task state, last result, logon type (S4U or sign-in); exactly one agent process |
+| Service running | One gateway process; no stray local agents or leftover test processes | Scheduled task state, last result, logon type (S4U or sign-in); exactly one agent running the checked config (a venv launcher and its child process count as one); a warning for each agent running a different config |
 | Listeners and exposure | 8791 (and 8793 if enabled) on loopback; agent listener on its tailnet IP; no 8790–8794 on `0.0.0.0`; Tailscale Funnel off | Gateway reachable over TCP; firewall profiles on; no inbound allow rule for Python |
 | Enrollment | `contextbridge-admin devices` (active and pending); `tailnet_node_ids` pinned | Identity file present; gateway fingerprint is not the placeholder |
 | Connection history | `device_connected`, `disconnected`, `heartbeat_lost`, `auth_failed`, `duplicate_refused`, `tailnet_admission_denied`; each device's last connect and agent version | `gateway_connected`, `disconnected`, `unreachable`, `result_undelivered`; restarts since boot |
 | Reboot recovery | n/a | Seconds from boot to first `gateway_connected` (WARN over 180 s) |
-| Duplicate launches | `device_duplicate_refused` count | Instance-lock refusals in `audit\agent.log`; Task Scheduler start, skip and failure counts |
+| Duplicate launches | `device_duplicate_refused` count | Instance-lock refusals in the task's agent log (`audit\agent.log` by default); Task Scheduler start, skip and failure counts |
 | Tailscale | Backend running; Thanatos peer online | Backend running; unattended mode (`ForceDaemon`) on |
 | Known open issues | `git` in the allowlist (#29); filesystem token missing from `ALWAYS_STRIPPED_ENV` (#33); remote endpoint and `allow_devices: "*"` | `git` or a shell in the agent allowlist (#29) |
 
@@ -40,7 +42,7 @@ The known-issue lines should turn `PASS` once the matching PR is merged and depl
 
 Run these in a maintenance window, one at a time, and keep both reports.
 
-**a. Agent crash recovery (Thanatos).** Kills the agent and times the scheduled task's relaunch and the new gateway connection. Expect a relaunch within about 60 s (the task repeats every minute).
+**a. Agent crash recovery (Thanatos).** Kills the agent running the checked config (agents using other configs are left alone) and times the scheduled task's relaunch and the new gateway connection. Expect a relaunch within about 60 s (the task repeats every minute).
 
 ```powershell
 .\scripts\healthcheck\check-agent.ps1 -RecoveryTest
