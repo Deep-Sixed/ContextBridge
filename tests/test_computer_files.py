@@ -284,3 +284,14 @@ def test_utf8_bom_is_preserved_on_edit(policy, workspace):
     assert files.read_file(policy, "work/bom.txt")["content"] == "hello\r\n"
     files.edit_block(policy, "work/bom.txt", "hello", "bye")
     assert target.read_bytes() == b"\xef\xbb\xbfbye\r\n"
+
+
+def test_search_code_regex_timeout_does_not_block_gateway(make_policy, workspace):
+    import time
+
+    (workspace / "work" / "evil.txt").write_text("x" * 35 + "z\\n", encoding="utf-8")
+    policy = make_policy(filesystem={"max_search_seconds": 1})
+    started = time.monotonic()
+    result = files.search_code(policy, "work/evil.txt", r"^(x+)+y", regex=True)
+    assert time.monotonic() - started < 4
+    assert result["timed_out"] is True
