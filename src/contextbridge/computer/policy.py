@@ -91,6 +91,11 @@ DEFAULT_ENV_STRIP: tuple[str, ...] = (
     "*CREDENTIAL*",
 )
 
+# Programs that print the environment of other processes ("ps e", "ps -E"). Child
+# processes start without credentials, but every other process this user runs still
+# has its own, so allowlisting one of these hands them out.
+ENVIRONMENT_READERS: frozenset[str] = frozenset({"ps"})
+
 # Gateway credentials are never passed to child processes, whatever env_strip says.
 ALWAYS_STRIPPED_ENV: frozenset[str] = frozenset(
     {"MCP_AUTH_TOKEN", "CONTEXTBRIDGE_FS_AUTH_TOKEN", "CONTEXTBRIDGE_COMPUTER_TOKEN"}
@@ -308,6 +313,17 @@ class ComputerPolicy:
             kind = " as an .exe or .com file" if self.windows else ""
             raise PolicyViolation(f"Program {program!r} was not found on PATH{kind}.")
         return [executable, *argv[1:]]
+
+    def allowlist_warnings(self) -> list[str]:
+        """Allowlisted programs that defeat the credential stripping, worth telling the operator about."""
+        if self.command_mode != "allowlist":
+            return []
+        names = {program_name(os.path.basename(p.replace("\\", "/")), windows=self.windows) for p in self.command_allow}
+        return [
+            f"commands.allow includes '{name}', which can print the environment (tokens, API keys) of every "
+            "process this user runs; remove it unless you accept that."
+            for name in sorted(names & ENVIRONMENT_READERS)
+        ]
 
     def child_env(self) -> dict[str, str]:
         """Environment for child processes with credentials removed."""

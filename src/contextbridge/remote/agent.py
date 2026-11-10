@@ -49,6 +49,7 @@ from ..computer.audit import (
 )
 from ..computer.dispatch import Engine, call_succeeded
 from ..computer.policy import ComputerPolicy, PolicyError, PolicyViolation, load_policy
+from ..hardening import protect_process_secrets
 from ..net import is_loopback
 from .protocol import (
     FATAL_ERRORS,
@@ -367,6 +368,8 @@ class Agent:
             }
             await ws.send(encode({"type": "auth", "signature": signature, "capabilities": capabilities}))
             welcome = await _expect(ws, "welcome")
+            if self._stopping.is_set():
+                return  # stop() may have run before the handshake published self._ws.
             heartbeat = min(max(float(welcome.get("heartbeat_seconds") or 15), 1.0), 300.0)
 
             self._ws = ws
@@ -585,6 +588,11 @@ def main(argv: list[str] | None = None) -> None:
             raise SystemExit(f"could not reach the gateway: {exc}") from None
         print(f"[agent] enrolled as {identity.name} ({identity.device_id}); identity saved to {config.identity_path}")
         return
+
+    # Commands this agent runs must not be able to read its device key or environment out of /proc.
+    protect_process_secrets()
+    for warning in config.policy.allowlist_warnings():
+        print(f"[agent] WARNING: {warning}", file=sys.stderr, flush=True)
 
     try:
         identity = Identity.load(config.identity_path)

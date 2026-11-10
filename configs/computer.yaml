@@ -71,8 +71,10 @@ commands:
   # run, not what they touch: commands run with this OS user's full permissions and are
   # not subject to the filesystem deny list. Adding a program that can run other programs
   # makes allowlist mode equivalent to unrestricted: a shell or interpreter (bash, python3,
-  # powershell), or git, whose -c options and aliases run any command.
-  allow: [ls, df, du, ps, uptime, whoami, hostname, uname, date, pwd]
+  # powershell), or git, whose -c options and aliases run any command. ps is left out
+  # because "ps e" prints the environment (tokens, API keys) of every process you run;
+  # the list_processes tool shows processes without it.
+  allow: [ls, df, du, uptime, whoami, hostname, uname, date, pwd]
   default_timeout_seconds: 30
   max_timeout_seconds: 600
   max_output_bytes: 65536

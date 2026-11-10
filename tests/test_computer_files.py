@@ -107,6 +107,59 @@ def test_search_code_skips_symlinks_out_of_roots(policy, workspace):
     assert files.search_code(policy, str(workspace), "outside")["matches"] == []
 
 
+def test_search_code_regex_matches_like_a_literal_search(policy, workspace):
+    """The regex worker applies the same file rules as the in-process literal search."""
+    (workspace / "docs" / "big.txt").write_text("alpha\n" * 50, encoding="utf-8")
+    (workspace / "docs" / "utf16.txt").write_text("alpha wide\n", encoding="utf-16")
+    (workspace / "docs" / "blob.bin").write_bytes(b"alpha\x00\x01")
+    literal = files.search_code(policy, str(workspace), "alpha", context_lines=2)
+    regex = files.search_code(policy, str(workspace), "alpha", regex=True, context_lines=2)
+    assert regex == literal
+    assert regex["files_scanned"] == 4  # notes.md, big.txt, utf16.txt, app.py; not blob.bin, .env or .ssh
+    only_md = files.search_code(policy, str(workspace), "al.ha", regex=True, file_pattern="*.md")
+    assert {m["path"] for m in only_md["matches"]} == {str(workspace / "docs" / "notes.md")}
+    one_file = files.search_code(policy, str(workspace / "docs" / "notes.md"), "^beta$", regex=True)
+    assert [m["line"] for m in one_file["matches"]] == [2]
+    assert files.search_code(policy, str(workspace), "PRIVATE|SECRET", regex=True)["matches"] == []
+
+
+def test_search_code_regex_stops_at_the_result_limit(policy, workspace):
+    (workspace / "docs" / "big.txt").write_text("alpha\n" * 50, encoding="utf-8")
+    result = files.search_code(policy, str(workspace), "a+", regex=True, max_results=7)
+    assert len(result["matches"]) == 7
+    assert result["truncated"] is True and result["timed_out"] is False
+
+
+def test_search_code_slow_regex_is_killed_without_stalling_other_threads(make_policy, workspace):
+    """A backtracking pattern runs in a worker process, so it neither outlives the deadline nor holds the GIL here."""
+    import threading
+    import time
+
+    policy = make_policy(filesystem={"max_search_seconds": 1})
+    # docs/notes.md sorts before docs/slow.txt, so its match is found first.
+    (workspace / "docs" / "slow.txt").write_text("x" * 60 + "\n", encoding="utf-8")
+    ticks: list[float] = []
+    done = threading.Event()
+
+    def tick() -> None:
+        while not done.is_set():
+            ticks.append(time.monotonic())
+            time.sleep(0.02)
+
+    ticker = threading.Thread(target=tick, daemon=True)
+    ticker.start()
+    started = time.monotonic()
+    try:
+        result = files.search_code(policy, str(workspace), r"^(x+)+y|^alpha$", regex=True)
+    finally:
+        done.set()
+        ticker.join()
+    assert time.monotonic() - started < 5
+    assert result["timed_out"] is True and result["truncated"] is True
+    assert [m["text"] for m in result["matches"]] == ["alpha"]  # found before the slow line; kept
+    assert max(b - a for a, b in zip(ticks, ticks[1:])) < 0.5
+
+
 def test_write_file_rewrite_and_append(policy, workspace):
     target = workspace / "work" / "out.txt"
     first = files.write_file(policy, "work/out.txt", "one\n")

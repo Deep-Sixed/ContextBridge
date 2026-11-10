@@ -23,7 +23,9 @@ filesystem:
 commands:
   mode: allowlist
   # No shells, interpreters, or git: each can run any command (git through its -c options and aliases).
-  allow: [ls, df, du, ps, uptime, whoami, hostname, uname, date, pwd]
+  # No ps: "ps e" prints the environment (tokens, API keys) of every process you run; the
+  # list_processes tool shows processes without it.
+  allow: [ls, df, du, uptime, whoami, hostname, uname, date, pwd]
   max_timeout_seconds: 600
 
 processes:

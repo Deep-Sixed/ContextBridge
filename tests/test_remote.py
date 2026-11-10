@@ -567,6 +567,40 @@ def test_only_one_newcomer_takes_over_a_stale_connection(tmp_path, workspace):
     asyncio.run(scenario())
 
 
+def test_stop_during_welcome_handshake_exits_without_serving(tmp_path, workspace, monkeypatch):
+    """A stop after the hub has admitted the agent, but before _ws is set, must end run()."""
+    from contextbridge.remote import agent as agent_module
+
+    async def scenario():
+        async with gateway(tmp_path) as gw:
+            code, _ = gw.registry.create_enrollment(DEVICE, list(ALL_SCOPES))
+            config = load_agent_config(write_agent_config(tmp_path, workspace, gw.url))
+            identity = await enroll(config, code)
+            agent = Agent(config, identity, audit=ComputerAuditLog(config.audit_path, route="agent", echo=False))
+            original_expect = agent_module._expect
+            saw_welcome = asyncio.Event()
+
+            async def stop_at_welcome(ws, kind):
+                reply = await original_expect(ws, kind)
+                if kind == "welcome":
+                    # The hub considers the device connected, but _session has not
+                    # yet published _ws. Reproduces a shutdown in that window.
+                    assert agent._ws is None
+                    agent.stop()
+                    saw_welcome.set()
+                return reply
+
+            monkeypatch.setattr(agent_module, "_expect", stop_at_welcome)
+            await asyncio.wait_for(agent.run(), 5)
+            assert saw_welcome.is_set()
+            assert agent._stopping.is_set()
+            assert not agent.connected.is_set()
+            assert agent._ws is None
+            await wait_for(lambda: gw.hub.connection(DEVICE) is None)
+
+    asyncio.run(scenario())
+
+
 def test_agent_reconnects_promptly_after_a_long_outage(tmp_path, workspace, monkeypatch):
     """Backoff built up while the device could not get in must not delay its next reconnect."""
     from contextbridge.remote import agent as agent_module
