@@ -38,6 +38,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from contextbridge.hardening import protect_process_secrets
+
 from . import __version__
 from .adapter import DatacoreRecordNotFound, DatacoreStore
 from .audit import UgaAuditLog, clip
@@ -562,6 +564,8 @@ def main() -> None:
     with open(args.config, encoding="utf-8") as fh:
         cfg = yaml.safe_load(fh) or {}
 
+    # Other processes of this user (a computer-route command, say) must not read the token from /proc.
+    protect_process_secrets()
     try:
         token = _require_token(os.environ.get("MCP_AUTH_TOKEN"))
     except ValueError as exc:

@@ -8,23 +8,33 @@ entries the policy hides.
 from __future__ import annotations
 
 import fnmatch
+import json
 import os
 import re
 import shutil
 import stat
+import subprocess
+import sys
 import tempfile
+import threading
 import time
+from collections.abc import Iterator
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from . import search_worker
 from .audit import mark_started
 from .policy import ComputerPolicy, PolicyViolation
+from .proctree import ProcessTree
+from .search_worker import text_encoding as _text_encoding
 
-_BINARY_SNIFF_BYTES = 8192
-_MAX_LINE_CHARS = 2000
 _MAX_DEPTH = 5
+_SEARCH_WORKER = Path(search_worker.__file__)
+# How long past the search deadline the worker's own alarm waits, in case nobody is left to kill it.
+_WORKER_ALARM_GRACE_SECONDS = 5.0
+_WORKER_EXIT_SECONDS = 0.5
 
 
 # Binary formats the document tools read; read_file points callers there.
@@ -49,36 +59,11 @@ def _kind(st: os.stat_result) -> str:
     return "other"
 
 
-def _text_encoding(path: Path) -> str | None:
-    """The encoding to read ``path`` with, or None if it looks binary.
-
-    Recognizes byte-order marks, so UTF-16 files (what Windows PowerShell's ``>``
-    writes) and UTF-8 files with a BOM are text.
-    """
-    with path.open("rb") as fh:
-        head = fh.read(_BINARY_SNIFF_BYTES)
-    if head.startswith(b"\xef\xbb\xbf"):
-        return "utf-8-sig"
-    if head.startswith((b"\xff\xfe", b"\xfe\xff")):
-        return "utf-16"
-    if b"\x00" in head:
-        return None
-    return "utf-8"
-
-
-def _is_binary(path: Path) -> bool:
-    return _text_encoding(path) is None
-
-
 def _require_file(path: Path, raw: str) -> None:
     if not path.exists():
         raise FileNotFoundError(f"No such file: {raw}")
     if not path.is_file():
         raise FileOperationError(f"Not a regular file: {raw}")
-
-
-def _clip(line: str) -> str:
-    return line if len(line) <= _MAX_LINE_CHARS else line[:_MAX_LINE_CHARS] + "…"
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
@@ -290,7 +275,12 @@ def search_code(
     context_lines: int = 0,
     max_results: int | None = None,
 ) -> dict[str, Any]:
-    """Search text file contents under ``path``; binary and oversized files are skipped."""
+    """Search text file contents under ``path``; binary and oversized files are skipped.
+
+    A regular expression is matched in a separate worker process that is killed at the
+    search deadline, because a slow pattern would otherwise stall this whole process
+    (see :mod:`.search_worker`). Literal searches cannot backtrack and run here.
+    """
     root = policy.resolve(path)
     if not pattern:
         raise FileOperationError("A search pattern is required.")
@@ -312,42 +302,41 @@ def search_code(
         raise FileNotFoundError(f"No such file or directory: {path}")
     mark_started(path=str(root))
 
-    matches: list[dict[str, Any]] = []
-    files_scanned = 0
-    truncated = False
-    for candidate, is_dir in candidates:
-        if is_dir:
-            continue
-        if time.monotonic() > deadline or truncated:
-            break
-        if file_glob and not fnmatch.fnmatchcase(candidate.name.casefold(), file_glob):
-            continue
-        try:
-            if not candidate.is_file():  # never open FIFOs or devices
+    def targets() -> Iterator[str]:
+        for candidate, is_dir in candidates:
+            if is_dir:
                 continue
-            if candidate.stat().st_size > policy.max_read_bytes:
+            if file_glob and not fnmatch.fnmatchcase(candidate.name.casefold(), file_glob):
                 continue
-            encoding = _text_encoding(candidate)
-            if encoding is None:
-                continue
-            with candidate.open("r", encoding=encoding, errors="replace") as fh:
-                lines = fh.read().splitlines()
-        except OSError:
-            continue
-        files_scanned += 1
-        for index, line in enumerate(lines):
-            if not matcher.search(line):
-                continue
-            if len(matches) >= limit:
-                truncated = True
+            yield str(candidate)
+
+    if regex:
+        job = {
+            "pattern": pattern,
+            "case_sensitive": case_sensitive,
+            "context_lines": context_lines,
+            "limit": limit,
+            "max_bytes": policy.max_read_bytes,
+            "hard_deadline_seconds": policy.max_search_seconds + _WORKER_ALARM_GRACE_SECONDS,
+        }
+        matches, files_scanned, truncated, killed = _search_in_worker(job, targets(), deadline)
+    else:
+        matches, files_scanned, truncated, killed = [], 0, False, False
+        for target in targets():
+            if time.monotonic() > deadline or truncated:
                 break
-            hit: dict[str, Any] = {"path": str(candidate), "line": index + 1, "text": _clip(line)}
-            if context_lines:
-                lo = max(0, index - context_lines)
-                hit["before"] = [_clip(x) for x in lines[lo:index]]
-                hit["after"] = [_clip(x) for x in lines[index + 1 : index + 1 + context_lines]]
-            matches.append(hit)
-    timed_out = time.monotonic() > deadline
+            lines = search_worker.read_lines(target, policy.max_read_bytes)
+            if lines is None:
+                continue
+            files_scanned += 1
+            for hit in search_worker.line_hits(target, lines, matcher, context_lines):
+                if len(matches) >= limit:
+                    truncated = True
+                    break
+                matches.append(hit)
+    # A killed worker is a timeout whatever the clock reads: time.monotonic() ticks every ~16 ms on
+    # Windows before Python 3.13, so it can still equal the deadline just after the timer fired.
+    timed_out = killed or time.monotonic() > deadline
     return {
         "path": str(root),
         "matches": matches,
@@ -355,6 +344,93 @@ def search_code(
         "truncated": truncated or timed_out,
         "timed_out": timed_out,
     }
+
+
+def _search_in_worker(
+    job: dict[str, Any], targets: Iterator[str], deadline: float
+) -> tuple[list[dict[str, Any]], int, bool, bool]:
+    """Run a regular-expression search in a worker process.
+
+    Returns (matches, files_scanned, truncated, killed). The worker is killed at ``deadline``,
+    even in the middle of a match (``killed``). What it reported before then is kept.
+    """
+    try:
+        # -I: the worker needs nothing from the environment or the user's site-packages.
+        tree = ProcessTree(
+            [sys.executable, "-I", str(_SEARCH_WORKER)],
+            cwd=None,
+            env=None,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        raise FileOperationError(f"Could not start the search worker: {exc}") from None
+    proc = tree.proc
+    assert proc.stdin is not None and proc.stdout is not None
+    killed = threading.Event()
+
+    def expire() -> None:
+        killed.set()
+        tree.kill()
+
+    def feed() -> None:
+        # Paths are sent as they are found, so the worker searches while the walk continues.
+        try:
+            proc.stdin.write(json.dumps(job).encode("ascii") + b"\n")
+            for target in targets:
+                proc.stdin.write(json.dumps(target).encode("ascii") + b"\n")
+                proc.stdin.flush()
+        except (OSError, ValueError):
+            pass  # the worker finished early (result limit) or was killed
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
+    timer = threading.Timer(max(0.0, deadline - time.monotonic()), expire)
+    timer.daemon = True
+    feeder = threading.Thread(target=feed, daemon=True)
+    matches: list[dict[str, Any]] = []
+    files_scanned = 0
+    truncated = False
+    limit = job["limit"]
+    exit_code: int | None = None
+    try:
+        timer.start()
+        feeder.start()
+        for raw in proc.stdout:
+            try:
+                message = json.loads(raw)
+            except ValueError:
+                break  # a line cut short when the worker was killed
+            if "hit" in message:
+                if len(matches) >= limit:
+                    truncated = True
+                    break
+                matches.append(message["hit"])
+            elif "scanned" in message:
+                files_scanned = message["scanned"]
+            elif message.get("truncated"):
+                truncated = True
+        else:
+            # stdout closed: the worker is exiting on its own (or the timer killed it).
+            try:
+                exit_code = proc.wait(timeout=_WORKER_EXIT_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
+    finally:
+        timer.cancel()
+        if proc.poll() is None:
+            tree.kill()
+        proc.wait()
+        tree.release()
+        proc.stdout.close()
+        feeder.join(_WORKER_EXIT_SECONDS)
+    if exit_code not in (None, 0) and not killed.is_set():
+        raise FileOperationError("The search worker failed.")
+    return matches, files_scanned, truncated, killed.is_set()
 
 
 # ------------------------------------------------------------------ writing

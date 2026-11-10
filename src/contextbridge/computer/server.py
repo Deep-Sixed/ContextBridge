@@ -47,6 +47,7 @@ from mcp.types import ToolAnnotations
 from starlette.middleware import Middleware as ASGIMiddleware
 
 from .. import __version__
+from ..hardening import protect_process_secrets
 from ..net import HostOriginGuard, is_loopback, is_private_bind
 from .audit import (
     MAX_AUDIT_VALUE,
@@ -896,6 +897,9 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--config", required=True)
     args = ap.parse_args(argv)
 
+    # Before anything else: commands this gateway runs must not be able to read its tokens back
+    # out of /proc (e.g. "ps e").
+    protect_process_secrets()
     token = _require_token()
 
     config_path = Path(args.config).expanduser().resolve()
@@ -940,6 +944,8 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(f"{config_path}: {exc}") from None
     if policy is None and listener is None:
         raise SystemExit(f"{config_path}: configure a local device (filesystem) and/or enable agents.")
+    for warning in policy.allowlist_warnings() if policy else ():
+        print(f"[computer] WARNING: {warning}", file=sys.stderr, flush=True)
     ssl_context = listener.ssl_context() if listener else None
     try:
         audit = ComputerAuditLog(audit_path)
