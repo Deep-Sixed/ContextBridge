@@ -319,9 +319,9 @@ def search_code(
             "max_bytes": policy.max_read_bytes,
             "hard_deadline_seconds": policy.max_search_seconds + _WORKER_ALARM_GRACE_SECONDS,
         }
-        matches, files_scanned, truncated = _search_in_worker(job, targets(), deadline)
+        matches, files_scanned, truncated, killed = _search_in_worker(job, targets(), deadline)
     else:
-        matches, files_scanned, truncated = [], 0, False
+        matches, files_scanned, truncated, killed = [], 0, False, False
         for target in targets():
             if time.monotonic() > deadline or truncated:
                 break
@@ -334,7 +334,9 @@ def search_code(
                     truncated = True
                     break
                 matches.append(hit)
-    timed_out = time.monotonic() > deadline
+    # A killed worker is a timeout whatever the clock reads: time.monotonic() ticks every ~16 ms on
+    # Windows before Python 3.13, so it can still equal the deadline just after the timer fired.
+    timed_out = killed or time.monotonic() > deadline
     return {
         "path": str(root),
         "matches": matches,
@@ -346,11 +348,11 @@ def search_code(
 
 def _search_in_worker(
     job: dict[str, Any], targets: Iterator[str], deadline: float
-) -> tuple[list[dict[str, Any]], int, bool]:
-    """Run a regular-expression search in a worker process; returns (matches, files_scanned, truncated).
+) -> tuple[list[dict[str, Any]], int, bool, bool]:
+    """Run a regular-expression search in a worker process.
 
-    The worker is killed at ``deadline``, even in the middle of a match. What it reported
-    before then is kept.
+    Returns (matches, files_scanned, truncated, killed). The worker is killed at ``deadline``,
+    even in the middle of a match (``killed``). What it reported before then is kept.
     """
     try:
         # -I: the worker needs nothing from the environment or the user's site-packages.
@@ -428,7 +430,7 @@ def _search_in_worker(
         feeder.join(_WORKER_EXIT_SECONDS)
     if exit_code not in (None, 0) and not killed.is_set():
         raise FileOperationError("The search worker failed.")
-    return matches, files_scanned, truncated
+    return matches, files_scanned, truncated, killed.is_set()
 
 
 # ------------------------------------------------------------------ writing
