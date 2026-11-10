@@ -8,8 +8,11 @@ entries the policy hides.
 from __future__ import annotations
 
 import fnmatch
+import json
 import os
 import re
+import subprocess
+import sys
 import shutil
 import stat
 import tempfile
@@ -296,7 +299,7 @@ def search_code(
         raise FileOperationError("A search pattern is required.")
     flags = 0 if case_sensitive else re.IGNORECASE
     try:
-        matcher = re.compile(pattern if regex else re.escape(pattern), flags)
+        re.compile(pattern if regex else re.escape(pattern), flags)
     except re.error as exc:
         raise FileOperationError(f"Invalid regular expression: {exc}") from None
     limit = min(max_results or policy.max_results, policy.max_results)
@@ -330,23 +333,59 @@ def search_code(
             encoding = _text_encoding(candidate)
             if encoding is None:
                 continue
-            with candidate.open("r", encoding=encoding, errors="replace") as fh:
-                lines = fh.read().splitlines()
         except OSError:
             continue
+
+        # Execute regex matching only in the killable filesystem worker.
+        # Send individual ComputerPolicy-approved files: the worker does not
+        # implement the computer route's deny rules during directory walks.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        job = {
+            "search_type": "content",
+            "start": str(candidate),
+            "pattern": pattern,
+            "literal": not regex,
+            "ignore_case": not case_sensitive,
+            "max_results": limit - len(matches) + 1,
+            "max_file_bytes": policy.max_read_bytes,
+            "max_line_chars": _MAX_LINE_CHARS,
+            "context_lines": context_lines,
+            "deadline_seconds": remaining,
+            "hard_deadline_seconds": remaining,
+            "computer_encoding": encoding,
+        }
+        worker = Path(__file__).resolve().parents[2] / "uga" / "fs_search_worker.py"
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-I", str(worker)],
+                input=json.dumps(job), text=True, capture_output=True,
+                timeout=remaining, check=False,
+            )
+        except subprocess.TimeoutExpired:
+            break  # subprocess.run kills and reaps the worker.
+        if completed.returncode != 0 and not completed.stdout:
+            raise FileOperationError("Search worker failed.")
         files_scanned += 1
-        for index, line in enumerate(lines):
-            if not matcher.search(line):
+        for line in completed.stdout.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                raise FileOperationError("Invalid search worker output.") from None
+            if "error" in event:
+                raise FileOperationError("Search worker failed: " + str(event["error"]))
+            if "result" not in event:
                 continue
             if len(matches) >= limit:
                 truncated = True
                 break
-            hit: dict[str, Any] = {"path": str(candidate), "line": index + 1, "text": _clip(line)}
-            if context_lines:
-                lo = max(0, index - context_lines)
-                hit["before"] = [_clip(x) for x in lines[lo:index]]
-                hit["after"] = [_clip(x) for x in lines[index + 1 : index + 1 + context_lines]]
+            hit = event["result"]
+            if hit.pop("truncated", False):
+                hit["text"] += "…"
             matches.append(hit)
+        if truncated:
+            break
     timed_out = time.monotonic() > deadline
     return {
         "path": str(root),
