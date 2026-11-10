@@ -156,6 +156,9 @@ class _Search:
         if len(data) > self.max_file_bytes:
             self.skipped["too_large"] += 1
             return None
+        encoding = self.job.get("computer_encoding")
+        if encoding in ("utf-16", "utf-8-sig"):
+            return data.decode(encoding, errors="replace")
         if b"\0" in data[:_BINARY_SNIFF_BYTES]:
             self.skipped["binary"] += 1
             return None
