@@ -306,6 +306,18 @@ def test_main_refuses_shared_or_missing_token(
         _run_main(monkeypatch, config)
 
 
+def test_main_refuses_the_computer_routes_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "data").mkdir()
+    config = _write_config(tmp_path, 1, "    - path: data\n")
+
+    monkeypatch.setenv("CONTEXTBRIDGE_FS_AUTH_TOKEN", TOKEN)
+    monkeypatch.setenv("CONTEXTBRIDGE_COMPUTER_TOKEN", TOKEN)
+    with pytest.raises(SystemExit, match="must differ from CONTEXTBRIDGE_COMPUTER_TOKEN"):
+        _run_main(monkeypatch, config)
+
+
 def test_main_refuses_bad_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CONTEXTBRIDGE_FS_AUTH_TOKEN", TOKEN)
     config = _write_config(tmp_path, 1, "    - path: missing\n")

@@ -441,13 +441,16 @@ def _page(body: str, *, status: int = 200, raw: bool = False, form_action: str =
     )
     # The form posts to this page, which redirects to the client; browsers apply form-action to that redirect.
     form_sources = " ".join(filter(None, ["'self'", form_action]))
+    # same-origin, not no-referrer: under no-referrer a browser sends "Origin: null" with the form's POST
+    # back to this page, and HostOriginGuard rejects that (403). Cross-origin requests, including the
+    # redirect to the client, still carry no Referer, so the consent URL and its request id stay private.
     headers = {
         "Content-Security-Policy": (
             "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; "
             f"form-action {form_sources}"
         ),
         "X-Frame-Options": "DENY",
-        "Referrer-Policy": "no-referrer",
+        "Referrer-Policy": "same-origin",
         "Cache-Control": "no-store",
         "X-Content-Type-Options": "nosniff",
     }

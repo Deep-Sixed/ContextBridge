@@ -54,6 +54,15 @@ DEFAULT_DENY: tuple[str, ...] = (
     "id_rsa*",
     "id_ecdsa*",
     "id_ed25519*",
+    # Registry tokens, Firefox's password keys and cookies, PowerShell history, and
+    # ContextBridge device keys, including other agents' on the same machine.
+    ".npmrc",
+    ".pypirc",
+    "key3.db",
+    "key4.db",
+    "cookies.sqlite",
+    "ConsoleHost_history.txt",
+    "*identity.json",
 )
 
 # Added on Windows: registry hives, DPAPI keys and credential stores, browser
@@ -83,7 +92,9 @@ DEFAULT_ENV_STRIP: tuple[str, ...] = (
 )
 
 # Gateway credentials are never passed to child processes, whatever env_strip says.
-ALWAYS_STRIPPED_ENV: frozenset[str] = frozenset({"MCP_AUTH_TOKEN", "CONTEXTBRIDGE_COMPUTER_TOKEN"})
+ALWAYS_STRIPPED_ENV: frozenset[str] = frozenset(
+    {"MCP_AUTH_TOKEN", "CONTEXTBRIDGE_FS_AUTH_TOKEN", "CONTEXTBRIDGE_COMPUTER_TOKEN"}
+)
 
 _UNQUOTED_OPERATORS = frozenset("|&<>")
 

@@ -10,7 +10,7 @@ It has three routes, each with its own server, port, and credential:
 | Filesystem | `uga.fs_gateway` | file tools inside configured directories (see [Filesystem route](#filesystem-route)) | `CONTEXTBRIDGE_FS_AUTH_TOKEN` |
 | Computer | `contextbridge.computer` | files, search, documents, commands, sessions, processes, devices; opt-in window and media inventory | `CONTEXTBRIDGE_COMPUTER_TOKEN` |
 
-Being able to read knowledge never grants file or computer access. Each route accepts only its own token. The computer route won't start if its token matches `MCP_AUTH_TOKEN`, and the filesystem route checks the same when both are set in its environment.
+Being able to read knowledge never grants file or computer access. Each route accepts only its own token. The filesystem and computer routes each refuse to start if their token matches either other route's token, when both are set in their environment.
 
 The computer route can also serve ChatGPT, Claude, and other remote MCP clients through a second, OAuth-protected endpoint. Each client gets only the permissions and devices you approve for it (see [Remote MCP clients](#remote-mcp-clients-chatgpt-claude)).
 
@@ -107,7 +107,7 @@ export CONTEXTBRIDGE_FS_AUTH_TOKEN="<a different strong secret>"
 ./scripts/run-contextbridge-fs.sh
 ```
 
-`CONTEXTBRIDGE_FS_AUTH_TOKEN` follows the same rules as `MCP_AUTH_TOKEN` and must differ from it; the route checks this when both are set in its environment. Set `CONTEXTBRIDGE_FS_CONFIG` to use another config file. The config takes the same `name` (default `ContextBridge Files`) and `serve` keys as the gateway's, plus the `filesystem` section.
+`CONTEXTBRIDGE_FS_AUTH_TOKEN` follows the same rules as `MCP_AUTH_TOKEN` and must differ from it and from `CONTEXTBRIDGE_COMPUTER_TOKEN`; the route checks each of those that is set in its environment. Set `CONTEXTBRIDGE_FS_CONFIG` to use another config file. The config takes the same `name` (default `ContextBridge Files`) and `serve` keys as the gateway's, plus the `filesystem` section.
 
 **Path rules:** every path must be absolute or start with `~` (the server user's home directory). It is resolved with symlinks followed and must land inside a root, so `..` and symlinks cannot reach outside. Roots are read-only unless they set `writable: true`, must exist, and must not overlap. The server's MCP `instructions` list each root and whether it is writable. Write tools are only advertised when at least one root is writable, and calls to any tool outside the advertised set are denied and audited.
 
@@ -201,7 +201,7 @@ These checks run on **every tool call**, at the moment it executes:
 
 - **Paths.** Every path resolves through symlinks before it is checked, so neither `..` nor a symlink can escape `filesystem.roots`. Writes are allowed only inside `filesystem.writable_roots`. Any path with a component matching a `deny` glob (`.ssh`, `.env*`, `*.pem`, `*.kdbx`, and so on) is hidden from listings and searches and refused for reads and writes. The policy file and the audit log can never be written or moved through ContextBridge.
 - **Limits.** Reads, writes, search results, and search time all have caps. Rewrites are atomic and preserve file mode. `edit_block` fails unless the match count is exactly what the caller expected.
-- **Commands.** `allowlist` mode runs one program per call without a shell. The program must be on the allowlist, and pipes, redirects, `;` and `&&` are refused before anything runs. `unrestricted` mode runs through a shell: `bash -c` by default (PowerShell on Windows), or whatever `commands.shell` names (`bash`, `sh`, `powershell`, `pwsh`, `cmd`, or an argv list). The working directory must be inside a readable root. Every command has a hard timeout (`max_timeout_seconds` caps whatever the caller asks for), and a timed-out command is killed along with every process it started. Output is capped in memory, keeping the head and the tail. Variables that look like credentials (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`, …) are removed from the child's environment. `MCP_AUTH_TOKEN` and `CONTEXTBRIDGE_COMPUTER_TOKEN` are always removed, even with a custom `env_strip` list; `CONTEXTBRIDGE_FS_AUTH_TOKEN` is removed only by a `*TOKEN*`-style pattern.
+- **Commands.** `allowlist` mode runs one program per call without a shell. The program must be on the allowlist, and pipes, redirects, `;` and `&&` are refused before anything runs. `unrestricted` mode runs through a shell: `bash -c` by default (PowerShell on Windows), or whatever `commands.shell` names (`bash`, `sh`, `powershell`, `pwsh`, `cmd`, or an argv list). The working directory must be inside a readable root. Every command has a hard timeout (`max_timeout_seconds` caps whatever the caller asks for), and a timed-out command is killed along with every process it started. Output is capped in memory, keeping the head and the tail. Variables that look like credentials (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`, …) are removed from the child's environment, and all three route tokens (`MCP_AUTH_TOKEN`, `CONTEXTBRIDGE_FS_AUTH_TOKEN`, `CONTEXTBRIDGE_COMPUTER_TOKEN`) are always removed, whatever `env_strip` says.
 - **Sessions.** `start_process` runs long or interactive programs in the background. Concurrent sessions are capped (`max_sessions`) and each is killed when it reaches `max_session_seconds`.
 - **Deletes.** `delete_file` works only inside writable roots. It never deletes a root, a protected or hidden path, or a folder holding anything the file tools may not see (a `.ssh` or `.env` inside, say). A non-empty folder needs `recursive: true` and is capped at `max_delete_entries` (10,000).
   - **`delete: trash` (default):** the item moves to `.contextbridge-trash/<trash_id>/` in its writable root, beside a `<trash_id>.json` record of where it came from. `list_deleted` shows the trash and `restore_deleted` puts an item back, but no file tool can read, change, or empty the trash, so a client cannot make its own deletions permanent. Empty it on the host. The layout is the [filesystem route](#filesystem-route)'s, so a folder both routes serve has one trash.
@@ -224,7 +224,7 @@ Writing needs a writable root:
 
 Documents go through the same path policy as every file tool. Files over `max_document_bytes` (20 MiB) are not opened. Word and Excel files are checked for zip bombs before parsing, and XML is parsed without entity expansion. The libraries (pypdf, python-docx, openpyxl, reportlab, defusedxml) are dependencies. A device without them doesn't offer the document tools.
 
-**Know the boundary.** The command allowlist controls *which programs* run, not *what they touch*. `git diff --no-index` can read any file the OS user can, for example, and allowing a shell or an interpreter makes allowlist mode equivalent to unrestricted. The filesystem deny list applies to the file tools, not to commands. For a hard boundary, run the computer route as a dedicated OS user that can only reach what you intend to share.
+**Know the boundary.** The command allowlist controls *which programs* run, not *what they touch*. `git diff --no-index` can read any file the OS user can, for example. Allowing a program that can run other programs makes allowlist mode equivalent to unrestricted: a shell, an interpreter, or git, whose `-c` options and aliases run any command, so the example configs leave git out. The filesystem deny list applies to the file tools, not to commands. For a hard boundary, run the computer route as a dedicated OS user that can only reach what you intend to share.
 
 ### Desktop and media inventory
 
@@ -342,7 +342,7 @@ copy configs\agent.windows.yaml configs\agent.yaml     # then set name, gateway.
 
 **What changes on Windows:**
 - **Process trees.** Every command runs inside a Windows Job Object. A timeout, `force_terminate`, or `kill` ends the command and everything it started. When a command exits, anything it left running in the background is ended too. If the agent itself is stopped, even by Task Scheduler, every process it started goes with it. Commands run without a console window.
-- **Allowlist mode.** Programs must be `.exe`/`.com` files found on `PATH`. The current directory is never searched. Names are case-insensitive (`git` matches `Git.EXE`).
+- **Allowlist mode.** Programs must be `.exe`/`.com` files found on `PATH`. The current directory is never searched. Names are case-insensitive (`whoami` matches `WHOAMI.EXE`).
   - **Not programs:** `cmd.exe` built-ins (`dir`, `type`, `echo`) aren't programs, so they can't be allowlisted.
   - **Refused:** `.bat`/`.cmd` scripts, because `cmd.exe` re-parses their arguments, which allows command injection.
   - **Quoting:** command lines are split with Windows rules, so `git -C "C:\Program Files\repo" status` works as written.
@@ -527,6 +527,7 @@ The files in `docs/` are planning documents. The filesystem and computer routes 
 
 - `docs/phase-2-desktop-plan.md` plans desktop interaction. Its first step, `list_windows`, is implemented (see [Desktop and media inventory](#desktop-and-media-inventory)); the rest is not. Its phase numbers are its own and don't match the [Roadmap](#roadmap) above.
 - `docs/capability-roadmap.pdf` lists the capabilities ContextBridge targets, with an implementation checklist. The checklist is a blank tracker, not a status report. It is generated by `scripts/build-roadmap-pdf.py`.
+- `docs/local-health-check.md` is the on-host checklist for Friday and Thanatos: deployed revision, service and enrollment state, exposure, and crash, restart, reboot and half-open recovery tests. Its scripts are in `scripts/healthcheck/`.
 - `docs/computer-use-linux-review.pdf` evaluates `agent-sh/computer-use-linux` as a Linux desktop-control engine for ContextBridge. It is generated by `scripts/build-review-pdf.py`.
 
 Both scripts share `scripts/pdf_common.py`. To rebuild a PDF after editing its script (requires the DejaVu fonts; set `CONTEXTBRIDGE_FONT_DIR` if they are not in a standard font directory):

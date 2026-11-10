@@ -4,7 +4,8 @@ import os
 from pathlib import Path
 
 import pytest
-from helpers import symlink_or_skip
+import yaml
+from helpers import REPO, symlink_or_skip
 
 from contextbridge.computer.policy import PolicyError, PolicyViolation, load_policy
 
@@ -49,6 +50,36 @@ def test_denied_patterns_apply_to_every_path_component(policy, workspace):
     for raw in (".ssh/id_ed25519", ".ssh", ".env", "docs/server.pem"):
         with pytest.raises(PolicyViolation, match="denied"):
             policy.resolve(raw)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        ".npmrc",
+        ".pypirc",
+        "firefox/key4.db",
+        "firefox/key3.db",
+        "firefox/cookies.sqlite",
+        "PSReadLine/ConsoleHost_history.txt",
+        "state/agent-identity.json",
+        "state/identity.json",
+    ],
+)
+def test_default_deny_covers_common_credential_files(policy, raw):
+    with pytest.raises(PolicyViolation, match="denied"):
+        policy.resolve(raw)
+
+
+# Each of these makes allowlist mode unrestricted: git through its -c options and aliases.
+_RUNS_OTHER_PROGRAMS = {"git", "bash", "sh", "zsh", "cmd", "powershell", "pwsh", "python", "python3", "py", "node"}
+
+
+def test_example_configs_allowlist_no_program_that_runs_others():
+    for path in sorted((REPO / "configs").glob("*.yaml")):
+        cfg = yaml.safe_load(path.read_text(encoding="utf-8"))
+        commands = (cfg.get("commands") if isinstance(cfg, dict) else None) or {}
+        allowed = {name.lower().removesuffix(".exe") for name in commands.get("allow") or []}
+        assert not allowed & _RUNS_OTHER_PROGRAMS, f"{path.name} allowlists {sorted(allowed & _RUNS_OTHER_PROGRAMS)}"
 
 
 def test_write_requires_writable_root(policy, workspace):
@@ -160,6 +191,16 @@ def test_gateway_tokens_are_stripped_even_with_empty_env_strip(make_policy, monk
     monkeypatch.setenv("MCP_AUTH_TOKEN", "t1")
     policy = make_policy(commands={"env_strip": []})
     assert "MCP_AUTH_TOKEN" not in policy.child_env()
+
+
+def test_route_tokens_are_stripped_with_a_custom_env_strip(make_policy, monkeypatch):
+    route_tokens = {"MCP_AUTH_TOKEN", "CONTEXTBRIDGE_FS_AUTH_TOKEN", "CONTEXTBRIDGE_COMPUTER_TOKEN"}
+    for key in route_tokens:
+        monkeypatch.setenv(key, "secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "kept")
+    env = make_policy(commands={"env_strip": ["*PASSWORD*"]}).child_env()
+    assert not route_tokens & env.keys()
+    assert env["GITHUB_TOKEN"] == "kept"  # the custom list replaced the default *TOKEN* glob
 
 
 def test_default_timeout_follows_a_lower_max(make_policy):

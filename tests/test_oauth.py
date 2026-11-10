@@ -278,7 +278,9 @@ async def register(http: httpx.AsyncClient, *, redirect: str = REDIRECT, name: s
     return await http.post("/register", json=body)
 
 
-async def start_authorization(http: httpx.AsyncClient, client_id: str, *, scope: str | None = None, state="s1"):
+async def start_authorization(
+    http: httpx.AsyncClient, client_id: str, *, scope: str | None = None, state="s1", resource=PUBLIC + "/mcp"
+):
     verifier, challenge = pkce()
     params = {
         "response_type": "code",
@@ -287,7 +289,7 @@ async def start_authorization(http: httpx.AsyncClient, client_id: str, *, scope:
         "code_challenge": challenge,
         "code_challenge_method": "S256",
         "state": state,
-        "resource": PUBLIC + "/mcp",
+        "resource": resource,
     }
     if scope:
         params["scope"] = scope
@@ -473,22 +475,34 @@ def test_refresh_rotates_and_reuse_revokes_the_grant(remote):
     assert "oauth_refresh_reuse_detected" in events
 
 
-def test_tunnel_host_passes_the_guard_and_strangers_do_not(policy, tmp_path, store):
+@pytest.fixture
+def tunnel_app(policy, tmp_path, store):
+    """The remote app as served behind a tunnel: loopback listener, public URL, HostOriginGuard in front."""
     from contextbridge.computer.server import RemoteListenerConfig
 
     remote_cfg = RemoteListenerConfig(
         {"port": 8793, "public_url": "https://friday.example.ts.net", "state": "oauth.json"}, tmp_path, tmp_path
     )
     options = remote_cfg.http_options()
-    audit = ComputerAuditLog(tmp_path / "audit.jsonl", echo=False)
+    audit_path = tmp_path / "audit.jsonl"
+    audit = ComputerAuditLog(audit_path, echo=False)
     server = create_remote_server(
         build_router(policy, audit=audit), audit=audit, settings=remote_cfg.settings(), store=store
     )
     app = server.http_app(middleware=options["middleware"])
 
-    async def scenario():
+    def client(**kwargs) -> httpx.AsyncClient:
         transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 50000))
-        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8793") as http:
+        return httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8793", **kwargs)
+
+    return SimpleNamespace(client=client, options=options, store=store, audit_path=audit_path)
+
+
+def test_tunnel_host_passes_the_guard_and_strangers_do_not(tunnel_app):
+    options = tunnel_app.options
+
+    async def scenario():
+        async with tunnel_app.client() as http:
             tunnel = {"host": "friday.example.ts.net", "origin": "https://friday.example.ts.net"}
             ok = await http.get("/.well-known/oauth-authorization-server", headers=tunnel)
             consent = await http.post("/consent", headers=tunnel, data={"request": "x"})
@@ -502,6 +516,41 @@ def test_tunnel_host_passes_the_guard_and_strangers_do_not(policy, tmp_path, sto
     assert consent.status_code == 400  # reached the consent handler (unknown request), not the guard
     assert rebinding.status_code == 421
     assert foreign.status_code == 403
+
+
+def test_browser_approval_through_the_tunnel_reaches_the_client(tunnel_app):
+    """Regression: every browser approval behind the tunnel used to fail with 403 Forbidden Origin."""
+    public_origin = "https://friday.example.ts.net"
+
+    async def scenario():
+        async with tunnel_app.client(headers={"host": "friday.example.ts.net"}) as http:
+            client_id = (await register(http)).json()["client_id"]
+            _, page = await start_authorization(http, client_id, resource=public_origin + "/mcp")
+            data = {
+                **form_fields(page.text),
+                "scope": [SCOPE_READ],
+                "device": ["local"],
+                "passphrase": PASSPHRASE,
+                "totp": next_code(tunnel_app.store),
+                "action": "approve",
+            }
+            # What a browser sends for the form POST when the page's referrer policy is no-referrer.
+            null_origin = await http.post("/consent", headers={"origin": "null"}, data=data)
+            # What it sends under same-origin: the page's own origin.
+            approved = await http.post("/consent", headers={"origin": public_origin}, data=data)
+            return page, null_origin, approved
+
+    page, null_origin, approved = anyio.run(scenario)
+    assert page.status_code == 200
+    assert page.headers["referrer-policy"] == "same-origin"
+    assert null_origin.status_code == 403  # the guard still refuses Origin: null
+    assert approved.status_code == 302, approved.text
+    location = urlsplit(approved.headers["location"])
+    assert f"{location.scheme}://{location.netloc}{location.path}" == REDIRECT
+    query = parse_qs(location.query)
+    assert query["code"] and query["state"] == ["s1"]
+    events = [json.loads(line)["event"] for line in tunnel_app.audit_path.read_text().splitlines()]
+    assert "oauth_consent_granted" in events
 
 
 @pytest.mark.parametrize(
