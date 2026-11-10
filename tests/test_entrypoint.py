@@ -1,4 +1,4 @@
-"""End-to-end check of the real ``python -m uga.gateway`` entrypoint over HTTP.
+"""End-to-end check of the real ``python -m contextbridge.knowledge.gateway`` entrypoint over HTTP.
 
 The in-process tests build the server directly; this one runs ``main()`` so that
 config parsing, startup validation, and ``server.run`` are covered too.
@@ -67,7 +67,7 @@ def gateway(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Gateway]:
     env = {
         key: value
         for key, value in os.environ.items()
-        if not key.startswith("UGA_") and key != "MCP_AUTH_TOKEN"
+        if not key.startswith(("UGA_", "CONTEXTBRIDGE_")) and key != "MCP_AUTH_TOKEN"
     }
     env["MCP_AUTH_TOKEN"] = TOKEN
     env["PYTHONPATH"] = str(REPO / "src")
@@ -75,7 +75,7 @@ def gateway(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Gateway]:
     base = f"http://127.0.0.1:{port}"
     with log.open("w") as log_fh:
         proc = subprocess.Popen(
-            [sys.executable, "-m", "uga.gateway", "--config", str(config)],
+            [sys.executable, "-m", "contextbridge.knowledge.gateway", "--config", str(config)],
             env=env,
             cwd=cwd,
             stdout=log_fh,

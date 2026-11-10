@@ -14,13 +14,13 @@ from mcp.shared.exceptions import McpError
 from starlette.testclient import TestClient
 
 from conftest import TOKEN, read_audit, record, write_jsonl
-from uga.adapter import DatacoreStore
-from uga.audit import UgaAuditLog
-from uga.gateway import (
+from contextbridge.knowledge.adapter import DatacoreStore
+from contextbridge.knowledge.audit import GatewayAuditLog
+from contextbridge.knowledge.gateway import (
     _config_relative,
     _datacore_path,
     _guard_low_level_handlers,
-    create_uga_server,
+    create_knowledge_server,
 )
 
 
@@ -55,10 +55,10 @@ class _BrokenStore(DatacoreStore):
 
 
 def test_tool_timeout_stops_the_scan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("UGA_MCP_TOOL_TIMEOUT_SECONDS", "0.3")
+    monkeypatch.setenv("CONTEXTBRIDGE_MCP_TOOL_TIMEOUT_SECONDS", "0.3")
     audit_path = tmp_path / "audit.jsonl"
-    server = create_uga_server(
-        store=_SlowScanStore(_store(tmp_path)._records), token=TOKEN, audit=UgaAuditLog(audit_path)
+    server = create_knowledge_server(
+        store=_SlowScanStore(_store(tmp_path)._records), token=TOKEN, audit=GatewayAuditLog(audit_path)
     )
 
     started = time.monotonic()
@@ -77,7 +77,7 @@ def test_tool_timeout_stops_the_scan(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
 def test_error_details_are_masked(tmp_path: Path) -> None:
     audit_path = tmp_path / "audit.jsonl"
-    server = create_uga_server(store=_BrokenStore({}), token=TOKEN, audit=UgaAuditLog(audit_path))
+    server = create_knowledge_server(store=_BrokenStore({}), token=TOKEN, audit=GatewayAuditLog(audit_path))
 
     with pytest.raises(ToolError) as excinfo:
         _call(server, "search", {"query": "x"})
@@ -89,7 +89,7 @@ def test_error_details_are_masked(tmp_path: Path) -> None:
 
 def test_not_found_echo_and_audit_are_clipped(tmp_path: Path) -> None:
     audit_path = tmp_path / "audit.jsonl"
-    server = create_uga_server(store=_store(tmp_path), token=TOKEN, audit=UgaAuditLog(audit_path))
+    server = create_knowledge_server(store=_store(tmp_path), token=TOKEN, audit=GatewayAuditLog(audit_path))
 
     with pytest.raises(ToolError, match="Record not found: nope"):
         _call(server, "fetch", {"id": "nope"})
@@ -104,7 +104,7 @@ def test_not_found_echo_and_audit_are_clipped(tmp_path: Path) -> None:
 
 def test_one_audit_line_per_request(tmp_path: Path) -> None:
     audit_path = tmp_path / "audit.jsonl"
-    server = create_uga_server(store=_store(tmp_path), token=TOKEN, audit=UgaAuditLog(audit_path))
+    server = create_knowledge_server(store=_store(tmp_path), token=TOKEN, audit=GatewayAuditLog(audit_path))
 
     async def go() -> None:
         async with Client(server) as client:
@@ -126,7 +126,7 @@ def test_one_audit_line_per_request(tmp_path: Path) -> None:
 
 def test_resources_and_prompts_are_empty_or_denied(tmp_path: Path) -> None:
     audit_path = tmp_path / "audit.jsonl"
-    server = create_uga_server(store=_store(tmp_path), token=TOKEN, audit=UgaAuditLog(audit_path))
+    server = create_knowledge_server(store=_store(tmp_path), token=TOKEN, audit=GatewayAuditLog(audit_path))
 
     async def go() -> list[Any]:
         async with Client(server) as client:
@@ -160,7 +160,7 @@ def test_low_level_handlers_outside_middleware_are_denied(tmp_path: Path) -> Non
     ping = handlers[mcp.types.PingRequest]
     handlers[FutureRequest] = ping
 
-    _guard_low_level_handlers(server, UgaAuditLog(audit_path))
+    _guard_low_level_handlers(server, GatewayAuditLog(audit_path))
 
     assert handlers[mcp.types.PingRequest] is ping
     with pytest.raises(McpError, match="not permitted"):
@@ -171,7 +171,7 @@ def test_low_level_handlers_outside_middleware_are_denied(tmp_path: Path) -> Non
 
 def test_server_denies_logging_set_level(tmp_path: Path) -> None:
     audit_path = tmp_path / "audit.jsonl"
-    server = create_uga_server(store=_store(tmp_path), token=TOKEN, audit=UgaAuditLog(audit_path))
+    server = create_knowledge_server(store=_store(tmp_path), token=TOKEN, audit=GatewayAuditLog(audit_path))
     if mcp.types.SetLevelRequest not in server._mcp_server.request_handlers:
         pytest.skip("this fastmcp release registers no logging/setLevel handler")
 
@@ -187,15 +187,15 @@ def test_server_denies_logging_set_level(tmp_path: Path) -> None:
 
 def test_server_requires_strong_token(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="must be set"):
-        create_uga_server(store=_store(tmp_path))
+        create_knowledge_server(store=_store(tmp_path))
     with pytest.raises(ValueError, match="at least"):
-        create_uga_server(store=_store(tmp_path), token="x")
+        create_knowledge_server(store=_store(tmp_path), token="x")
 
 
 def test_server_requires_data_source(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MCP_AUTH_TOKEN", TOKEN)
-    with pytest.raises(ValueError, match="UGA_DATACORE_JSONL"):
-        create_uga_server()
+    with pytest.raises(ValueError, match="CONTEXTBRIDGE_DATACORE_JSONL"):
+        create_knowledge_server()
 
 
 def test_server_reads_data_source_and_token_from_env(
@@ -205,21 +205,37 @@ def test_server_reads_data_source_and_token_from_env(
     monkeypatch.setenv("USERPROFILE", str(tmp_path))  # what ~ expands to on Windows
     write_jsonl(tmp_path / "d.jsonl", [record()])
     monkeypatch.setenv("MCP_AUTH_TOKEN", TOKEN)
-    monkeypatch.setenv("UGA_DATACORE_JSONL", "~/d.jsonl")
+    monkeypatch.setenv("CONTEXTBRIDGE_DATACORE_JSONL", "~/d.jsonl")
 
-    server = create_uga_server()
+    server = create_knowledge_server()
 
     assert server.auth is not None
     assert _call(server, "fetch", {"id": "r1"}).structured_content["id"] == "r1"
+
+
+def test_legacy_setting_names_still_work(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A deployment that still sets the pre-rename variable names keeps working; the new name wins."""
+    write_jsonl(tmp_path / "old.jsonl", [record()])
+    write_jsonl(tmp_path / "new.jsonl", [record(id="r2")])
+    monkeypatch.setenv("MCP_AUTH_TOKEN", TOKEN)
+    monkeypatch.delenv("CONTEXTBRIDGE_DATACORE_JSONL", raising=False)
+    monkeypatch.setenv("UGA_DATACORE_JSONL", str(tmp_path / "old.jsonl"))
+    monkeypatch.setenv("UGA_MCP_FETCH_MAX_CHARS", "3")
+
+    fetched = _call(create_knowledge_server(), "fetch", {"id": "r1"}).structured_content
+    assert fetched["truncated"] is True and len(fetched["text"]) == 3
+
+    monkeypatch.setenv("CONTEXTBRIDGE_DATACORE_JSONL", str(tmp_path / "new.jsonl"))
+    assert _call(create_knowledge_server(), "fetch", {"id": "r2"}).structured_content["id"] == "r2"
 
 
 def test_server_rejects_missing_env_data_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("MCP_AUTH_TOKEN", TOKEN)
-    monkeypatch.setenv("UGA_DATACORE_JSONL", str(tmp_path / "missing.jsonl"))
+    monkeypatch.setenv("CONTEXTBRIDGE_DATACORE_JSONL", str(tmp_path / "missing.jsonl"))
     with pytest.raises(ValueError, match="not found"):
-        create_uga_server()
+        create_knowledge_server()
 
 
 _INITIALIZE = {
@@ -236,7 +252,7 @@ _INITIALIZE = {
 
 def test_http_app_audits_auth_failures(tmp_path: Path) -> None:
     audit_path = tmp_path / "audit.jsonl"
-    server = create_uga_server(store=_store(tmp_path), token=TOKEN, audit=UgaAuditLog(audit_path))
+    server = create_knowledge_server(store=_store(tmp_path), token=TOKEN, audit=GatewayAuditLog(audit_path))
     headers = {"Accept": "application/json, text/event-stream"}
 
     # No extra middleware: auditing must come with the server's own http_app.
@@ -260,11 +276,11 @@ def test_http_app_audits_auth_failures(tmp_path: Path) -> None:
 
 
 def test_fetch_truncates_long_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("UGA_MCP_FETCH_MAX_CHARS", "10")
+    monkeypatch.setenv("CONTEXTBRIDGE_MCP_FETCH_MAX_CHARS", "10")
     store = DatacoreStore.from_jsonl(
         write_jsonl(tmp_path / "d.jsonl", [record("long", text="x" * 25), record("short", text="tiny")])
     )
-    server = create_uga_server(store=store, token=TOKEN, audit=UgaAuditLog(None))
+    server = create_knowledge_server(store=store, token=TOKEN, audit=GatewayAuditLog(None))
 
     long = _call(server, "fetch", {"id": "long"}).structured_content
     short = _call(server, "fetch", {"id": "short"}).structured_content
@@ -277,7 +293,7 @@ def test_fetch_truncates_long_text(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 def test_fetch_cap_defaults_to_100k_chars(tmp_path: Path) -> None:
     text = "y" * 100_001
     store = DatacoreStore.from_jsonl(write_jsonl(tmp_path / "d.jsonl", [record("big", text=text)]))
-    server = create_uga_server(store=store, token=TOKEN, audit=UgaAuditLog(None))
+    server = create_knowledge_server(store=store, token=TOKEN, audit=GatewayAuditLog(None))
 
     payload = _call(server, "fetch", {"id": "big"}).structured_content
 
@@ -287,8 +303,8 @@ def test_fetch_cap_defaults_to_100k_chars(tmp_path: Path) -> None:
 
 def test_status_route_requires_token(tmp_path: Path) -> None:
     audit_path = tmp_path / "audit.jsonl"
-    audit = UgaAuditLog(audit_path)
-    server = create_uga_server(
+    audit = GatewayAuditLog(audit_path)
+    server = create_knowledge_server(
         name="ContextBridge", store=_store(tmp_path), token=TOKEN, audit=audit
     )
 
@@ -321,7 +337,7 @@ def test_datacore_path_resolves_relative_to_config(tmp_path: Path) -> None:
 
 
 def test_datacore_path_must_exist(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("UGA_DATACORE_JSONL", str(tmp_path / "missing.jsonl"))
+    monkeypatch.setenv("CONTEXTBRIDGE_DATACORE_JSONL", str(tmp_path / "missing.jsonl"))
     with pytest.raises(ValueError, match="not found"):
         _datacore_path({}, config_path=tmp_path / "c.yaml")
 

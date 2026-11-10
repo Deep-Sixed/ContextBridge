@@ -1,4 +1,4 @@
-"""Minimal audit logging for UGA tool calls."""
+"""Audit logging for the knowledge and filesystem routes."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ def _query_preview(query: str, *, max_len: int = 80) -> str:
     return q[: max_len - 3] + "..."
 
 
-class UgaAuditLog:
+class GatewayAuditLog:
     """Append-only JSONL audit sink. Failures to write never block tool execution.
 
     Query text is not logged unless ``log_query_text`` is set; by default only a
@@ -43,7 +43,7 @@ class UgaAuditLog:
         self,
         path: str | Path | None,
         *,
-        route: str = "uga",
+        route: str = "knowledge",
         log_query_text: bool = False,
         hash_key: bytes | None = None,
     ) -> None:
@@ -133,6 +133,6 @@ class UgaAuditLog:
             except (OSError, ValueError):
                 pass
         try:
-            print(f"[uga audit] {line}", file=sys.stderr, flush=True)
+            print(f"[{self.route} audit] {line}", file=sys.stderr, flush=True)
         except (OSError, ValueError):
             pass

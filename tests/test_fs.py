@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from uga.fs import (
+from contextbridge.filesystem.fs import (
     MAX_LIST_DEPTH,
     MAX_MULTI_READ_FILES,
     TRASH_DIR_NAME,

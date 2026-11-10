@@ -1,4 +1,4 @@
-"""MCP contract and entrypoint checks for the filesystem route (uga.fs_gateway)."""
+"""MCP contract and entrypoint checks for the filesystem route (contextbridge.filesystem.gateway)."""
 
 from __future__ import annotations
 
@@ -18,14 +18,14 @@ from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 from starlette.testclient import TestClient
 
-import uga
+import contextbridge
 from conftest import TOKEN, read_audit
 from test_contract import _assert_no_injection_text
-from uga import fs_gateway
-from uga.audit import UgaAuditLog
-from uga.fs import Filesystem, FsRoot
-from uga.fs_gateway import create_fs_server
-from uga.policy import FS_READ_TOOLS, FS_WRITE_TOOLS, UGA_ALLOWED_TOOLS
+from contextbridge.filesystem import gateway as fs_gateway
+from contextbridge.knowledge.audit import GatewayAuditLog
+from contextbridge.filesystem.fs import Filesystem, FsRoot
+from contextbridge.filesystem.gateway import create_fs_server
+from contextbridge.knowledge.policy import FS_READ_TOOLS, FS_WRITE_TOOLS, KNOWLEDGE_ALLOWED_TOOLS
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -97,7 +97,7 @@ def _server(tmp_path: Path, *, writable: bool = True, audit_path: Path | None = 
     rw, ro = _roots(tmp_path)
     roots = [FsRoot(rw, writable=writable), FsRoot(ro)]
     return create_fs_server(
-        fs=Filesystem(roots), token=TOKEN, audit=UgaAuditLog(audit_path, route="fs")
+        fs=Filesystem(roots), token=TOKEN, audit=GatewayAuditLog(audit_path, route="fs")
     )
 
 
@@ -123,14 +123,14 @@ def test_tool_surface_depends_on_writable_roots(tmp_path: Path) -> None:
 
     assert {t.name for t in writable} == FS_READ_TOOLS | FS_WRITE_TOOLS == set(EXPECTED_INPUTS)
     assert {t.name for t in read_only} == FS_READ_TOOLS
-    assert not (FS_READ_TOOLS | FS_WRITE_TOOLS) & UGA_ALLOWED_TOOLS
+    assert not (FS_READ_TOOLS | FS_WRITE_TOOLS) & KNOWLEDGE_ALLOWED_TOOLS
 
 
 def test_tools_declare_annotations_schemas_and_descriptions(tmp_path: Path) -> None:
     session = _session(_server(tmp_path))
 
     _assert_no_injection_text("server instructions", session["init"].instructions or "")
-    assert session["init"].serverInfo.version == uga.__version__
+    assert session["init"].serverInfo.version == contextbridge.__version__
     for tool in session["tools"]:
         declared = tool.annotations.model_dump(exclude_none=True) if tool.annotations else {}
         read_only, destructive, idempotent = EXPECTED_HINTS[tool.name]
@@ -157,7 +157,7 @@ def test_instructions_name_each_root_and_its_mode(tmp_path: Path) -> None:
 def test_hidden_and_foreign_tools_are_denied_and_audited(tmp_path: Path) -> None:
     audit_path = tmp_path / "audit.jsonl"
     server = _server(tmp_path, writable=False, audit_path=audit_path)
-    denied = sorted(FS_WRITE_TOOLS | UGA_ALLOWED_TOOLS | {"start_process", "shell"})
+    denied = sorted(FS_WRITE_TOOLS | KNOWLEDGE_ALLOWED_TOOLS | {"start_process", "shell"})
 
     async def go() -> Any:
         async with Client(server) as client:
@@ -256,7 +256,7 @@ def test_requires_strong_token(tmp_path: Path) -> None:
 
 def test_http_requires_bearer_token(tmp_path: Path) -> None:
     audit_path = tmp_path / "audit.jsonl"
-    audit = UgaAuditLog(audit_path, route="fs")
+    audit = GatewayAuditLog(audit_path, route="fs")
     _, ro = _roots(tmp_path)
     server = create_fs_server(fs=Filesystem([FsRoot(ro)]), token=TOKEN, audit=audit)
     headers = {"Accept": "application/json, text/event-stream"}
@@ -359,7 +359,7 @@ def fs_gateway_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[s
     base = f"http://127.0.0.1:{port}"
     with log.open("w") as log_fh:
         proc = subprocess.Popen(
-            [sys.executable, "-m", "uga.fs_gateway", "--config", str(config)],
+            [sys.executable, "-m", "contextbridge.filesystem.gateway", "--config", str(config)],
             cwd=tmp_path_factory.mktemp("fs-cwd"),
             env=env,
             stdout=log_fh,
