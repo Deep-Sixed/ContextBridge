@@ -368,6 +368,8 @@ class Agent:
             }
             await ws.send(encode({"type": "auth", "signature": signature, "capabilities": capabilities}))
             welcome = await _expect(ws, "welcome")
+            if self._stopping.is_set():
+                return  # stop() may have run before the handshake published self._ws.
             heartbeat = min(max(float(welcome.get("heartbeat_seconds") or 15), 1.0), 300.0)
 
             self._ws = ws
