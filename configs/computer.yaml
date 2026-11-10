@@ -69,7 +69,7 @@ commands:
   # not subject to the filesystem deny list. Adding a program that can run other programs
   # makes allowlist mode equivalent to unrestricted: a shell or interpreter (bash, python3,
   # powershell), or git, whose -c options and aliases run any command.
-  allow: [ls, df, du, ps, uptime, whoami, hostname, uname, date, pwd]
+  allow: [ls, df, du, uptime, whoami, hostname, uname, date, pwd]
   default_timeout_seconds: 30
   max_timeout_seconds: 600
   max_output_bytes: 65536
