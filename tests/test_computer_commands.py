@@ -222,3 +222,18 @@ def test_session_lifetime_kills_grandchildren(policy):
 
 def test_allowlist_names_this_interpreter(policy):
     assert PY in policy.command_allow
+
+
+def test_process_listing_does_not_expose_command_arguments():
+    import subprocess
+
+    secret = "contextbridge-test-secret-in-argv"
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", secret])
+    try:
+        rows = commands.list_processes()["processes"]
+        own = next(row for row in rows if row["pid"] == proc.pid)
+        assert "cmdline" not in own
+        assert secret not in str(own)
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
