@@ -217,16 +217,18 @@ def test_timeouts_are_clamped(make_policy):
     assert policy.clamp_timeout(999) == 20
 
 
-def test_allowlist_warns_about_programs_that_print_other_processes_environments(make_policy):
+def test_allowlist_warns_about_programs_that_print_other_processes_environments(make_policy, workspace):
+    def warnings(allow, *, windows, mode="allowlist"):
+        cfg = {"filesystem": {"roots": [str(workspace)]}, "commands": {"mode": mode, "allow": allow}}
+        return load_policy(cfg, windows=windows).allowlist_warnings()
+
     assert make_policy().allowlist_warnings() == []
     for entry in ("ps", "/bin/ps"):
-        warnings = make_policy(commands={"allow": ["ls", entry]}).allowlist_warnings()
-        assert len(warnings) == 1 and "'ps'" in warnings[0] and "environment" in warnings[0]
-    assert make_policy(commands={"allow": ["PS.EXE"]}).allowlist_warnings() == []  # POSIX names are exact
-    assert load_policy(
-        {"filesystem": {"roots": ["."]}, "commands": {"mode": "allowlist", "allow": ["PS.EXE"]}}, windows=True
-    ).allowlist_warnings()
-    assert make_policy(commands={"mode": "unrestricted", "allow": ["ps"]}).allowlist_warnings() == []
+        found = warnings(["ls", entry], windows=False)
+        assert len(found) == 1 and "'ps'" in found[0] and "environment" in found[0]
+    assert warnings(["PS.EXE"], windows=False) == []  # POSIX program names are exact
+    assert len(warnings(["PS.EXE"], windows=True)) == 1  # Windows names ignore case and .exe
+    assert warnings(["ps"], windows=False, mode="unrestricted") == []
 
 
 @pytest.mark.parametrize("name", ["computer.yaml", "agent.yaml", "agent.windows.yaml"])
