@@ -265,7 +265,7 @@ Other machines join as **devices**. Each runs a small agent that dials *out* to 
 On the gateway host, enable the `agents` section of `configs/computer.yaml`:
 - set `enabled: true`;
 - set `host` to the gateway's Tailscale IP;
-- set `tailnet_node_ids` to the Tailscale node IDs of the machines allowed to connect (`Peer[*].ID` in `tailscale status --json` on the gateway). The gateway won't start with a non-loopback `host` and an empty list;
+- set `tailnet_node_ids` to the Tailscale node IDs of the machines allowed to connect (`Peer[*].ID` in `tailscale status --json` on the gateway). With a non-loopback `host` and an empty list the gateway won't start, and `contextbridge-admin tls-init` and `pair` refuse to run, so set this before the commands below;
 - keep `tls_cert`, `tls_key` and `registry` pointing at files under `state/`.
 
 Then:
@@ -308,7 +308,7 @@ Pairing is deliberately an admin CLI on the gateway host and not an MCP tool, so
 - **Encryption.**
   - **TLS rules.** The listener must use TLS unless it is on loopback. Agents require `wss://` unless the gateway is on the same machine.
   - **Certificate pinning.** With `gateway.fingerprint` set, agents check the gateway certificate's SHA-256 fingerprint before sending anything. Without it, the certificate and host name are verified against `gateway.ca_file`, or the system's CA store if that is unset too.
-  - **Allowed bind addresses.** The listener binds only a specific loopback, LAN, or overlay (e.g. Tailscale) address. `0.0.0.0`, `::`, public IPs, and hostnames are refused.
+  - **Allowed bind addresses.** The listener binds only a specific private address. `0.0.0.0`, `::`, public IPs, and hostnames are refused. In practice that means loopback (an agent on the gateway's own machine) or the gateway's Tailscale IP: a LAN address passes this check, but tailnet admission then refuses every agent that connects to it.
 - **Replay protection.** Calls carry a sequence number that must increase on each connection, and a request id the agent never accepts twice.
 - **Liveness.** Agents send heartbeats. A device that misses three is dropped and shown offline, and its pending calls fail. Agents reconnect with exponential backoff (reset once a connection is accepted, so a blip after a long outage is retried within a second) and stop permanently once revoked.
 - **One connection per device.** An agent refuses to start while another agent with the same identity file is running on that machine. If a second agent holding the same key connects anyway, the gateway pings the established connection: while it answers, the newcomer is refused (`already_connected`, retried with backoff) and the established connection keeps serving. A connection that does not answer within 5 seconds is replaced, so a restarted agent is never locked out by a half-open one.
@@ -393,6 +393,8 @@ ChatGPT and Claude reach MCP servers from their own clouds, so they need a publi
    ```
 
    Any TLS-terminating tunnel or reverse proxy works the same way. The gateway won't start remote mode until the owner credentials exist.
+
+   Funnel puts port 8793, including the consent page, on the public internet. That is what Claude and ChatGPT need: they connect from their own clouds, so a tailnet-only address (`tailscale serve`) does not reach them. Keep Funnel off whenever `remote.enabled` is false, and turn it off again if you stop using remote clients. The health check in `docs/local-health-check.md` warns while Funnel is on so that it is never on by accident.
 4. **Add the connector.** In Claude or ChatGPT, add a custom connector with the URL `https://friday.<tailnet>.ts.net/mcp`. The client registers itself and opens a ContextBridge consent page in your browser.
 5. **Approve on the consent page.**
    - **Permissions.** Only `computer:read` starts ticked; anything more is a deliberate choice.
