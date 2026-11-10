@@ -23,7 +23,7 @@ filesystem:
 commands:
   mode: allowlist
   # No shells, interpreters, or git: each can run any command (git through its -c options and aliases).
-  allow: [ls, df, du, ps, uptime, whoami, hostname, uname, date, pwd]
+  allow: [ls, df, du, uptime, whoami, hostname, uname, date, pwd]
   max_timeout_seconds: 600
 
 processes:
