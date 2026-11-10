@@ -366,6 +366,8 @@ def search_code(
         except subprocess.TimeoutExpired:
             break  # subprocess.run kills and reaps the worker.
         if completed.returncode != 0 and not completed.stdout:
+            if completed.returncode < 0 or time.monotonic() >= deadline:
+                break  # The worker was terminated by its hard deadline.
             raise FileOperationError("Search worker failed.")
         files_scanned += 1
         for line in completed.stdout.splitlines():
