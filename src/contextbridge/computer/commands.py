@@ -377,13 +377,12 @@ def list_processes(*, name_filter: str | None = None, limit: int = 200) -> dict[
     needle = (name_filter or "").casefold()
     mark_started(name_filter=name_filter)
     rows: list[dict[str, Any]] = []
-    attrs = ["pid", "ppid", "name", "username", "status", "create_time", "memory_info", "cmdline"]
+    attrs = ["pid", "ppid", "name", "username", "status", "create_time", "memory_info"]
     total = 0
     for proc in psutil.process_iter(attrs):
         info = proc.info
-        cmdline = " ".join(info.get("cmdline") or [])
         name = info.get("name") or ""
-        if needle and needle not in name.casefold() and needle not in cmdline.casefold():
+        if needle and needle not in name.casefold():
             continue
         total += 1
         if len(rows) >= limit:
@@ -398,7 +397,6 @@ def list_processes(*, name_filter: str | None = None, limit: int = 200) -> dict[
                 "status": info.get("status"),
                 "rss_bytes": memory.rss if memory else None,
                 "started": round(info["create_time"]) if info.get("create_time") else None,
-                "cmdline": cmdline[:300],
             }
         )
     return {"processes": rows, "matched": total, "truncated": total > len(rows)}
