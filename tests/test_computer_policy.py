@@ -215,3 +215,22 @@ def test_timeouts_are_clamped(make_policy):
     assert policy.clamp_timeout(0) == 5
     assert policy.clamp_timeout(10) == 10
     assert policy.clamp_timeout(999) == 20
+
+
+def test_allowlist_warns_about_programs_that_print_other_processes_environments(make_policy):
+    assert make_policy().allowlist_warnings() == []
+    for entry in ("ps", "/bin/ps"):
+        warnings = make_policy(commands={"allow": ["ls", entry]}).allowlist_warnings()
+        assert len(warnings) == 1 and "'ps'" in warnings[0] and "environment" in warnings[0]
+    assert make_policy(commands={"allow": ["PS.EXE"]}).allowlist_warnings() == []  # POSIX names are exact
+    assert load_policy(
+        {"filesystem": {"roots": ["."]}, "commands": {"mode": "allowlist", "allow": ["PS.EXE"]}}, windows=True
+    ).allowlist_warnings()
+    assert make_policy(commands={"mode": "unrestricted", "allow": ["ps"]}).allowlist_warnings() == []
+
+
+@pytest.mark.parametrize("name", ["computer.yaml", "agent.yaml", "agent.windows.yaml"])
+def test_example_configs_allow_nothing_that_prints_environments(name):
+    cfg = yaml.safe_load((REPO / "configs" / name).read_text(encoding="utf-8"))
+    assert "ps" not in cfg["commands"]["allow"]
+    assert load_policy(cfg).allowlist_warnings() == []

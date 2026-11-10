@@ -23,6 +23,8 @@ from mcp.types import ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from contextbridge.hardening import protect_process_secrets
+
 from . import __version__
 from .audit import UgaAuditLog
 from .fs import Filesystem, FsError, filesystem_from_config
@@ -297,6 +299,8 @@ def main() -> None:
     with open(args.config, encoding="utf-8") as fh:
         cfg = yaml.safe_load(fh) or {}
 
+    # Other processes of this user (a computer-route command, say) must not read the token from /proc.
+    protect_process_secrets()
     try:
         token = _require_token(os.environ.get(TOKEN_ENV), name=TOKEN_ENV)
     except ValueError as exc:
