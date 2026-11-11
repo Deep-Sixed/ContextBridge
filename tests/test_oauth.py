@@ -518,6 +518,44 @@ def test_tunnel_host_passes_the_guard_and_strangers_do_not(tunnel_app):
     assert foreign.status_code == 403
 
 
+def test_custom_cloudflare_hostname_uses_configured_public_origin(policy, tmp_path, store):
+    """A custom tunnel hostname must be accepted without weakening DNS-rebinding protection."""
+    from contextbridge.computer.server import RemoteListenerConfig
+
+    public = "https://mcp.contextbridge.app"
+    config = RemoteListenerConfig(
+        {"port": 8793, "public_url": public, "state": "oauth.json"}, tmp_path, tmp_path
+    )
+    audit = ComputerAuditLog(tmp_path / "audit.jsonl", echo=False)
+    server = create_remote_server(
+        build_router(policy, audit=audit), audit=audit, settings=config.settings(), store=store
+    )
+    app = server.http_app(middleware=config.http_options()["middleware"])
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 50000))
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8793") as http:
+            headers = {"host": "mcp.contextbridge.app"}
+            protected = await http.get("/.well-known/oauth-protected-resource/mcp", headers=headers)
+            authorization = await http.get("/.well-known/oauth-authorization-server", headers=headers)
+            unauthorized = await http.get("/mcp", headers=headers)
+            stale = await http.get("/mcp", headers={"host": "nexusagi.tail9cb382.ts.net"})
+            return protected, authorization, unauthorized, stale
+
+    protected, authorization, unauthorized, stale = anyio.run(scenario)
+    assert protected.status_code == 200
+    assert protected.json()["resource"] == public + "/mcp"
+    assert protected.json()["authorization_servers"] == [public + "/"]
+    assert authorization.status_code == 200
+    metadata = authorization.json()
+    assert metadata["issuer"] == public + "/"
+    for key in ("authorization_endpoint", "token_endpoint", "registration_endpoint"):
+        assert metadata[key].startswith(public + "/")
+    assert unauthorized.status_code == 401
+    assert public + "/.well-known/oauth-protected-resource/mcp" in unauthorized.headers["www-authenticate"]
+    assert stale.status_code == 421
+
+
 def test_browser_approval_through_the_tunnel_reaches_the_client(tunnel_app):
     """Regression: every browser approval behind the tunnel used to fail with 403 Forbidden Origin."""
     public_origin = "https://friday.example.ts.net"
