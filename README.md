@@ -279,6 +279,7 @@ copy configs\agent.windows.yaml configs\agent.yaml     # then set name, gateway.
 **Running as a scheduled task.** `install-agent.ps1` registers a scheduled task that runs the agent as *your* account, never SYSTEM, so commands have exactly your permissions within the agent's policy.
 - **Default:** starts at boot whether or not you are signed in. It uses S4U, so no password is stored, but registering it needs an elevated shell.
 - **`-AtLogOn`:** starts at sign-in instead, and needs no elevation.
+- **`-Elevated`:** runs the task with your full administrator token (run level Highest) instead of the standard one, so commands can change system settings, services and protected files. It needs an elevated shell and an account in the Administrators group, and combines with either trigger. Reinstalling without it goes back to a standard token. Pass `-ExpectElevated` to `check-agent.ps1` so the health check expects it.
 - **Either way:** a second trigger repeats every minute from installation on, so an agent that exits is relaunched within a minute; a running one is left alone. To keep the agent stopped, disable the task (`Disable-ScheduledTask`); stopping it lasts only until the next repeat.
 - **Logs:** go to `audit\agent.log`, plus the agent's audit log.
 - **Removal:** `-Uninstall`.
