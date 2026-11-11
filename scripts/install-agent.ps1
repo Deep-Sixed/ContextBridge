@@ -6,6 +6,12 @@
     The task runs `python -m contextbridge.remote.agent run` under your own account, never SYSTEM,
     so commands the agent runs have exactly your permissions (further limited by the agent's policy).
 
+    By default the task runs with a standard (filtered) token, even when your account is an administrator.
+    With -Elevated it runs with your full administrator token (run level Highest), so commands the agent runs
+    can change system settings, services, drivers and protected files. Use it only on a machine you intend to
+    administer remotely, together with the agent's own command policy. -Elevated needs an elevated PowerShell
+    and an account in the Administrators group; reinstall without it to go back to a standard token.
+
     Default: starts at boot and runs whether or not you are signed in (S4U logon; no password is stored).
     Registering an S4U task needs an elevated PowerShell. With -AtLogOn it starts when you sign in instead,
     which needs no elevation.
@@ -22,6 +28,8 @@
 .EXAMPLE
     .\scripts\install-agent.ps1 -Config C:\ContextBridge\configs\agent.yaml -AtLogOn
 .EXAMPLE
+    .\scripts\install-agent.ps1 -Elevated
+.EXAMPLE
     .\scripts\install-agent.ps1 -Uninstall
 #>
 [CmdletBinding()]
@@ -30,6 +38,7 @@ param(
     [string]$Python = '',
     [string]$TaskName = 'ContextBridge Agent',
     [switch]$AtLogOn,
+    [switch]$Elevated,
     [switch]$Uninstall,
     [switch]$DryRun
 )
@@ -72,14 +81,25 @@ $executable = if (Test-Path $pythonw) { $pythonw } else { $pythonPath }
 $logFile = Join-Path $root 'audit\agent.log'
 $arguments = "-m contextbridge.remote.agent run --config `"$configPath`" --log-file `"$logFile`""
 
-$user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$user = $identity.Name
+$runLevel = if ($Elevated) { 'Highest' } else { 'Limited' }
+if ($Elevated -and -not $DryRun) {
+    # Registering a Highest task needs an elevated shell, and it only helps an account that has an
+    # administrator token to give.
+    $isElevated = ([System.Security.Principal.WindowsPrincipal]$identity).IsInRole(
+        [System.Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $isElevated) {
+        throw "-Elevated needs an elevated PowerShell (Run as administrator) and an account in the Administrators group."
+    }
+}
 $action = New-ScheduledTaskAction -Execute $executable -Argument $arguments -WorkingDirectory $root
 if ($AtLogOn) {
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
-    $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+    $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel $runLevel
 } else {
     $trigger = New-ScheduledTaskTrigger -AtStartup
-    $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U -RunLevel Limited
+    $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U -RunLevel $runLevel
 }
 # Restart-on-failure only covers a task that fails to start, not an agent that exits, so a second trigger fires
 # every minute from now on, indefinitely; MultipleInstances IgnoreNew leaves a running agent alone. (Repeating the
@@ -101,6 +121,7 @@ if ($DryRun) {
         TaskName         = $TaskName
         User             = $user
         LogonType        = $principal.LogonType
+        RunLevel         = $principal.RunLevel
         Trigger          = if ($AtLogOn) { 'AtLogOn' } else { 'AtStartup' }
         Repeat           = $relaunch.Repetition.Interval
         Execute          = $executable
@@ -112,6 +133,6 @@ if ($DryRun) {
 
 Register-ScheduledTask -TaskName $TaskName -InputObject $task -Force | Out-Null
 Start-ScheduledTask -TaskName $TaskName
-Write-Output "Installed and started '$TaskName' as $user."
+Write-Output "Installed and started '$TaskName' as $user (run level $runLevel)."
 Write-Output "Status:  Get-ScheduledTask -TaskName '$TaskName' | Get-ScheduledTaskInfo"
 Write-Output "Logs:    $logFile and the agent audit log named in $configPath"

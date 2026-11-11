@@ -17,6 +17,10 @@
     Agent config to check. Defaults to the --config the scheduled task (-TaskName) passes to the
     agent, so the check looks at the agent that actually runs here. Falls back to configs\agent.yaml.
 
+.PARAMETER ExpectElevated
+    The task was installed with install-agent.ps1 -Elevated on purpose, so run level Highest is expected and
+    reported as PASS. Without it, Highest is reported as a WARN.
+
 .PARAMETER RecoveryTest
     DISRUPTIVE. Kills the agent started with the checked config (agents using other configs are left
     alone), then times how long the scheduled task takes to relaunch it and reconnect to the gateway.
@@ -37,6 +41,8 @@ param(
     [double]$Hours = 24,
     [switch]$Fetch,
     [switch]$RecoveryTest,
+    # The task was installed with install-agent.ps1 -Elevated on purpose: expect run level Highest.
+    [switch]$ExpectElevated,
     [int]$TimeoutSeconds = 150,
     [switch]$Yes
 )
@@ -155,7 +161,16 @@ if (-not $task) {
     Line $level 'scheduled task' "state $($task.State); last run $($info.LastRunTime); last result 0x$('{0:X}' -f $info.LastTaskResult)"
     if ("$logon" -eq 'S4U') { Line 'PASS' 'task logon type' 'S4U: starts at boot without sign-in' }
     else { Line 'WARN' 'task logon type' "$logon`: starts only after sign-in; reboot recovery needs a sign-in" }
-    if ($task.Principal.RunLevel -ne 'Limited') { Line 'WARN' 'task run level' "$($task.Principal.RunLevel) (expected Limited)" }
+    $runLevel = "$($task.Principal.RunLevel)"
+    $expected = if ($ExpectElevated) { 'Highest' } else { 'Limited' }
+    if ($runLevel -eq $expected) {
+        $note = if ($ExpectElevated) { 'commands run with the administrator token, as expected' } else { 'standard token' }
+        Line 'PASS' 'task run level' "$runLevel`: $note"
+    } elseif ($runLevel -eq 'Highest') {
+        Line 'WARN' 'task run level' 'Highest: commands run with the administrator token; pass -ExpectElevated if that is intended'
+    } else {
+        Line 'WARN' 'task run level' "$runLevel (expected $expected)"
+    }
 }
 
 # ------------------------------------------------------------ 4. agent processes + duplicate launches
