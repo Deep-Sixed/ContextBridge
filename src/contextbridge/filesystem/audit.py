@@ -1,4 +1,4 @@
-"""Audit logging for the knowledge and filesystem routes."""
+"""Audit logging for the filesystem route."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-# Longest client-supplied string (tool name, record id, client name, ...) written
+# Longest client-supplied string (tool name, path, client name, ...) written
 # to the log; longer values are cut so a client cannot bloat or flood the log.
 MAX_FIELD_LEN = 200
 
@@ -43,7 +43,7 @@ class GatewayAuditLog:
         self,
         path: str | Path | None,
         *,
-        route: str = "knowledge",
+        route: str = "fs",
         log_query_text: bool = False,
         hash_key: bytes | None = None,
     ) -> None:
@@ -80,7 +80,6 @@ class GatewayAuditLog:
         *,
         tool: str,
         query: str | None = None,
-        record_id: str | None = None,
         result_count: int | None = None,
         success: bool,
         detail: str | None = None,
@@ -112,8 +111,6 @@ class GatewayAuditLog:
             entry["query_len"] = len(query)
             if self._log_query_text:
                 entry["query_preview"] = _query_preview(query)
-        if record_id is not None:
-            entry["record_id"] = clip(record_id)
         if result_count is not None:
             entry["result_count"] = result_count
         if path is not None:

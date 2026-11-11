@@ -39,7 +39,6 @@ import anyio
 import yaml
 
 from .computer.server import (
-    KNOWLEDGE_TOKEN_ENV,
     LIST_DEVICES_TOOL,
     LOCAL_DEVICE,
     SERVER_TOOLS,
@@ -354,9 +353,6 @@ def main(argv: list[str] | None = None) -> None:
     token = os.environ.get(TOKEN_ENV, "")
     if not token:
         print(f"{TOKEN_ENV} must be set to the computer route's token.", file=sys.stderr)
-        sys.exit(2)
-    if token == os.environ.get(KNOWLEDGE_TOKEN_ENV):
-        print(f"{TOKEN_ENV} equals {KNOWLEDGE_TOKEN_ENV}; use the computer route's own token.", file=sys.stderr)
         sys.exit(2)
     url = _url_from_config(args.config) if args.config else (args.url or DEFAULT_URL)
     report = anyio.run(

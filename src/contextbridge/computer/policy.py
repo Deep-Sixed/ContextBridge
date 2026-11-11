@@ -96,7 +96,9 @@ DEFAULT_ENV_STRIP: tuple[str, ...] = (
 # has its own, so allowlisting one of these hands them out.
 ENVIRONMENT_READERS: frozenset[str] = frozenset({"ps"})
 
-# Gateway credentials are never passed to child processes, whatever env_strip says.
+# Route credentials are never passed to child processes, whatever env_strip says.
+# MCP_AUTH_TOKEN belonged to the retired knowledge route; a host that still sets it
+# keeps it out of commands too.
 ALWAYS_STRIPPED_ENV: frozenset[str] = frozenset(
     {"MCP_AUTH_TOKEN", "CONTEXTBRIDGE_FS_AUTH_TOKEN", "CONTEXTBRIDGE_COMPUTER_TOKEN"}
 )

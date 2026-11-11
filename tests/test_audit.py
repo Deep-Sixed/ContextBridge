@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from conftest import read_audit
 
-from contextbridge.knowledge.audit import GatewayAuditLog
+from contextbridge.filesystem.audit import GatewayAuditLog
 
 
 def test_query_text_is_not_logged_by_default(tmp_path: Path) -> None:
@@ -76,13 +76,11 @@ def test_query_hash_is_keyed(tmp_path: Path) -> None:
 
 def test_client_supplied_fields_are_clipped(tmp_path: Path) -> None:
     path = tmp_path / "audit.jsonl"
-    GatewayAuditLog(path).record(
-        tool="t" * 10_000, record_id="r" * 10_000, client_label="c" * 10_000, success=False
-    )
+    GatewayAuditLog(path).record(tool="t" * 10_000, client_label="c" * 10_000, success=False)
 
     (entry,) = read_audit(path)
 
-    for key in ("tool", "record_id", "client"):
+    for key in ("tool", "client"):
         assert len(entry[key]) < 300, key
 
 

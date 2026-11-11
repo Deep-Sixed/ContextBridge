@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import socket
 import subprocess
@@ -20,6 +21,28 @@ from fastmcp.client.auth import BearerAuth
 REPO = Path(__file__).resolve().parents[1]
 IS_WINDOWS = os.name == "nt"
 PY = Path(sys.executable).stem  # the allowlist name of this interpreter ("python" in CI and venvs)
+
+# Phrases a server's instructions and tool descriptions must never contain: they read like
+# prompt injection to the agent that receives them.
+INJECTION_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in [
+        r"ignore\s+(all\s+)?previous\s+instructions",
+        r"you\s+are\s+now\s+a",
+        r"your\s+new\s+(task|role|instructions?)\s+(is|are)",
+        r"system\s*:",
+        r"<\s*(system|human|assistant|user)\s*>",
+        r"do\s+not\s+(tell|inform|mention|reveal)",
+        r"(curl|wget|fetch)\s+https?://",
+        r"base64\.(b64decode|decodebytes)",
+        r"\b(exec|eval)\s*\(",
+    ]
+]
+
+
+def assert_no_injection_text(label: str, text: str) -> None:
+    for pattern in INJECTION_PATTERNS:
+        assert not pattern.search(text), f"{label} matches {pattern.pattern!r}"
 
 # Variables Windows programs (including Python's ssl and random) need to start at all.
 _WINDOWS_ENV = (

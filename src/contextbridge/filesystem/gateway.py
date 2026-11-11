@@ -1,6 +1,6 @@
 """ContextBridge filesystem route.
 
-A separate MCP server from the read-only knowledge route, with its own config, port,
+A separate MCP server from the computer route, with its own config, port,
 bearer token and allowlist. It serves only the roots in its config. Write tools are
 advertised only when at least one root is writable; read-only roots refuse writes.
 """
@@ -26,7 +26,7 @@ from starlette.responses import JSONResponse
 from contextbridge.hardening import protect_process_secrets
 
 from .. import __version__
-from ..knowledge.audit import GatewayAuditLog
+from .audit import GatewayAuditLog
 from .fs import Filesystem, FsError, filesystem_from_config
 from .search import (
     DEFAULT_MAX_RESULTS,
@@ -34,7 +34,7 @@ from .search import (
     DEFAULT_TIMEOUT_MS,
     SearchManager,
 )
-from ..knowledge.gateway import (
+from .server import (
     AllowlistMiddleware,
     _add_audit_fields,
     _BearerTokenVerifier,
@@ -46,7 +46,7 @@ from ..knowledge.gateway import (
     unauthenticated_response,
     uvicorn_config,
 )
-from ..knowledge.policy import FS_READ_TOOLS, FS_WRITE_TOOLS
+from .policy import FS_READ_TOOLS, FS_WRITE_TOOLS
 
 TOKEN_ENV = "CONTEXTBRIDGE_FS_AUTH_TOKEN"
 COMPUTER_TOKEN_ENV = "CONTEXTBRIDGE_COMPUTER_TOKEN"
@@ -305,9 +305,8 @@ def main() -> None:
         token = _require_token(os.environ.get(TOKEN_ENV), name=TOKEN_ENV)
     except ValueError as exc:
         raise SystemExit(str(exc)) from None
-    for other in ("MCP_AUTH_TOKEN", COMPUTER_TOKEN_ENV):
-        if token == os.environ.get(other):
-            raise SystemExit(f"{TOKEN_ENV} must differ from {other}.")
+    if token == os.environ.get(COMPUTER_TOKEN_ENV):
+        raise SystemExit(f"{TOKEN_ENV} must differ from {COMPUTER_TOKEN_ENV}.")
 
     serve = cfg.get("serve") or {}
     host = serve.get("host", "127.0.0.1")

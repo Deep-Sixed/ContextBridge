@@ -4,7 +4,7 @@ The acceptance criterion from docs/capability-roadmap.pdf: "ContextBridge operat
 against Friday and Thanatos using only its own agents, permissions, transport, and
 tools, with no third-party remote-access service."
 
-The whole deployment -- knowledge gateway, computer gateway with its agent and OAuth
+The whole deployment -- the computer gateway with its agent and OAuth
 listeners, and a remote agent standing in for Thanatos -- runs from the shipped
 entry points inside a jail:
 
@@ -13,8 +13,7 @@ entry points inside a jail:
   off this machine, so no hosted relay, registry, or update check can be reached.
 
 The test then proves, on both devices: the failover drill passes, every computer
-tool the deployment enables works, an OAuth (ChatGPT/Claude-style) client works,
-the knowledge route works, the agent and OAuth tokens survive a gateway restart,
+tool the deployment enables works, an OAuth (ChatGPT/Claude-style) client works, the agent and OAuth tokens survive a gateway restart,
 and nothing ever touched a tripwire or the network.
 """
 
@@ -42,7 +41,6 @@ from fastmcp.exceptions import ToolError
 from helpers import (
     IS_WINDOWS,
     PY,
-    REPO,
     cli,
     free_port,
     isolated_env,
@@ -64,9 +62,7 @@ from contextbridge.failover import (
 from contextbridge.oauth.store import OAuthStore
 
 JAIL_DIR = Path(__file__).with_name("failover_jail")
-FIXTURE = REPO / "tests" / "fixtures" / "datacore" / "datacore.fetch.v1.jsonl"
 COMPUTER_TOKEN = "computer-" + "f" * 40
-KNOWLEDGE_TOKEN = "knowledge-" + "k" * 40
 TRIPWIRES = ("npx", "node")
 THANATOS = "thanatos"
 # Computer tools the deployment below leaves off, and why. Every other tool must
@@ -400,7 +396,7 @@ def oauth_login(public: str, store: OAuthStore, *, scopes: list[str], devices: l
 def test_failover(tmp_path, jail):
     friday = make_workspace(tmp_path / "friday", "friday")
     thanatos = make_workspace(tmp_path / "thanatos", THANATOS)
-    local_port, agent_port, remote_port, knowledge_port = (free_port() for _ in range(4))
+    local_port, agent_port, remote_port = (free_port() for _ in range(3))
     public = f"http://127.0.0.1:{remote_port}"
 
     gateway_dir = tmp_path / "gateway"
@@ -434,11 +430,8 @@ def test_failover(tmp_path, jail):
         ),
         encoding="utf-8",
     )
-    knowledge_config = tmp_path / "knowledge.yaml"
-    knowledge_config.write_text(f"serve:\n  host: 127.0.0.1\n  port: {knowledge_port}\n", encoding="utf-8")
     env = jail.env
     gateway_env = {**env, "CONTEXTBRIDGE_COMPUTER_TOKEN": COMPUTER_TOKEN}
-    knowledge_env = {**env, "MCP_AUTH_TOKEN": KNOWLEDGE_TOKEN, "CONTEXTBRIDGE_DATACORE_JSONL": str(FIXTURE)}
     admin = ("contextbridge.remote.admin", "--config", str(gateway_config))
 
     agent_proc = None
@@ -478,88 +471,77 @@ def test_failover(tmp_path, jail):
             encoding="utf-8",
         )
 
-        with serve("contextbridge.knowledge.gateway", knowledge_config, knowledge_port, knowledge_env) as knowledge_url:
-            with serve("contextbridge.computer", gateway_config, local_port, gateway_env) as local_url:
-                gateway_log = gateway_config.with_name("computer.contextbridge.computer.stderr.log")
-                wait_port(remote_port, gateway_log)
-                enrolled = cli(
-                    "contextbridge.remote.agent", "enroll", "--config", str(agent_config), "--code", enrollment, env=env
-                )
-                assert enrolled.returncode == 0, enrolled.stderr
-                agent_proc = spawn_logged(
-                    [sys.executable, "-m", "contextbridge.remote.agent", "run", "--config", str(agent_config)],
-                    env=env,
-                    log=tmp_path / "agent.stderr.log",
-                )
-                run_async(with_client, local_url, COMPUTER_TOKEN, lambda c: wait_online(c, THANATOS))
+        with serve("contextbridge.computer", gateway_config, local_port, gateway_env) as local_url:
+            gateway_log = gateway_config.with_name("computer.contextbridge.computer.stderr.log")
+            wait_port(remote_port, gateway_log)
+            enrolled = cli(
+                "contextbridge.remote.agent", "enroll", "--config", str(agent_config), "--code", enrollment, env=env
+            )
+            assert enrolled.returncode == 0, enrolled.stderr
+            agent_proc = spawn_logged(
+                [sys.executable, "-m", "contextbridge.remote.agent", "run", "--config", str(agent_config)],
+                env=env,
+                log=tmp_path / "agent.stderr.log",
+            )
+            run_async(with_client, local_url, COMPUTER_TOKEN, lambda c: wait_online(c, THANATOS))
 
-                code, report = drill_cli(env, local_url, "--write")
-                assert failed_checks(report) == [] and code == 0 and report["ready"] is True
-                assert [d["device"] for d in report["devices"]] == ["local", THANATOS]
-                for device in report["devices"]:
-                    statuses = {c["name"]: c["status"] for c in device["checks"]}
-                    assert set(statuses.values()) == {"pass"}, (device["device"], statuses)
-                    assert {"run_command", "session", "write_round_trip", "documents", "delete"} <= set(statuses)
-                for root in (friday, thanatos):
-                    assert "status: verified" in (root / "work" / ".contextbridge-failover" / "probe.txt").read_text()
+            code, report = drill_cli(env, local_url, "--write")
+            assert failed_checks(report) == [] and code == 0 and report["ready"] is True
+            assert [d["device"] for d in report["devices"]] == ["local", THANATOS]
+            for device in report["devices"]:
+                statuses = {c["name"]: c["status"] for c in device["checks"]}
+                assert set(statuses.values()) == {"pass"}, (device["device"], statuses)
+                assert {"run_command", "session", "write_round_trip", "documents", "delete"} <= set(statuses)
+            for root in (friday, thanatos):
+                assert "status: verified" in (root / "work" / ".contextbridge-failover" / "probe.txt").read_text()
 
-                # Every computer tool the deployment enables, on both machines.
-                used: dict[str, set[str]] = {}
+            # Every computer tool the deployment enables, on both machines.
+            used: dict[str, set[str]] = {}
 
-                async def every_tool(client):
-                    for device in ("local", THANATOS):
-                        await exercise_tools(client, device, used)
-
-                run_async(with_client, local_url, COMPUTER_TOKEN, every_tool)
-                expected = SERVER_TOOLS - set(NOT_EXERCISED)
+            async def every_tool(client):
                 for device in ("local", THANATOS):
-                    assert expected <= used[device], (device, expected - used[device])
-                assert (thanatos / "work" / "failover" / "log.txt").read_text() == "done\ndone\n"
+                    await exercise_tools(client, device, used)
 
-                # A Claude/ChatGPT-style client, approved for reading on both machines.
-                access = oauth_login(public, store, scopes=[SCOPE_READ], devices=["local", THANATOS])
+            run_async(with_client, local_url, COMPUTER_TOKEN, every_tool)
+            expected = SERVER_TOOLS - set(NOT_EXERCISED)
+            for device in ("local", THANATOS):
+                assert expected <= used[device], (device, expected - used[device])
+            assert (thanatos / "work" / "failover" / "log.txt").read_text() == "done\ndone\n"
 
-                async def remote_reads(client):
-                    texts = {}
-                    for device in ("local", THANATOS):
-                        result = await client.call_tool("read_file", {"path": "README.txt", "device": device})
-                        texts[device] = result.structured_content["content"]
-                    with pytest.raises(ToolError, match="computer:execute"):
-                        await client.call_tool("run_command", {"command": "hostname", "device": THANATOS})
-                    return texts
+            # A Claude/ChatGPT-style client, approved for reading on both machines.
+            access = oauth_login(public, store, scopes=[SCOPE_READ], devices=["local", THANATOS])
 
-                texts = run_async(with_client, public + "/mcp", access, remote_reads)
-                assert texts == {"local": "friday workspace\n", THANATOS: "thanatos workspace\n"}
+            async def remote_reads(client):
+                texts = {}
+                for device in ("local", THANATOS):
+                    result = await client.call_tool("read_file", {"path": "README.txt", "device": device})
+                    texts[device] = result.structured_content["content"]
+                with pytest.raises(ToolError, match="computer:execute"):
+                    await client.call_tool("run_command", {"command": "hostname", "device": THANATOS})
+                return texts
 
-                # The knowledge route is untouched by all of this.
-                async def knowledge(client):
-                    hits = (await client.call_tool("search", {"query": "approved knowledge"})).structured_content
-                    record = (await client.call_tool("fetch", {"id": "rec-002"})).structured_content
-                    return hits, record
+            texts = run_async(with_client, public + "/mcp", access, remote_reads)
+            assert texts == {"local": "friday workspace\n", THANATOS: "thanatos workspace\n"}
 
-                hits, record = run_async(with_client, knowledge_url, KNOWLEDGE_TOKEN, knowledge)
-                assert {h["id"] for h in hits["results"]} == {"rec-001"}
-                assert record["title"] == "Computer route policy"
+        # The gateway goes down and comes back: the agent reconnects by itself,
+        # and the client's OAuth token still works.
+        with serve("contextbridge.computer", gateway_config, local_port, gateway_env) as local_url:
+            wait_port(remote_port, gateway_log)
 
-            # The gateway goes down and comes back: the agent reconnects by itself,
-            # and the client's OAuth token still works.
-            with serve("contextbridge.computer", gateway_config, local_port, gateway_env) as local_url:
-                wait_port(remote_port, gateway_log)
+            async def after_restart(client):
+                await wait_online(client, THANATOS)
+                result = await client.call_tool("read_file", {"path": "work/failover/log.txt", "device": THANATOS})
+                return result.structured_content["content"]
 
-                async def after_restart(client):
-                    await wait_online(client, THANATOS)
-                    result = await client.call_tool("read_file", {"path": "work/failover/log.txt", "device": THANATOS})
-                    return result.structured_content["content"]
+            assert run_async(with_client, local_url, COMPUTER_TOKEN, after_restart) == "done\ndone\n"
 
-                assert run_async(with_client, local_url, COMPUTER_TOKEN, after_restart) == "done\ndone\n"
+            async def remote_after_restart(client):
+                result = await client.call_tool("read_file", {"path": "docs/notes.md", "device": THANATOS})
+                return result.structured_content["content"]
 
-                async def remote_after_restart(client):
-                    result = await client.call_tool("read_file", {"path": "docs/notes.md", "device": THANATOS})
-                    return result.structured_content["content"]
-
-                assert run_async(with_client, public + "/mcp", access, remote_after_restart) == "alpha\nbeta\ngamma\n"
-                code, report = drill_cli(env, local_url)
-                assert failed_checks(report) == [] and code == 0
+            assert run_async(with_client, public + "/mcp", access, remote_after_restart) == "alpha\nbeta\ngamma\n"
+            code, report = drill_cli(env, local_url)
+            assert failed_checks(report) == [] and code == 0
     finally:
         if agent_proc is not None and agent_proc.poll() is None:
             agent_proc.kill()
