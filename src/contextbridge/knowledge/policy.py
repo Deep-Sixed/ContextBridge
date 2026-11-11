@@ -1,12 +1,12 @@
-"""UGA gateway tool policy — explicit allowlist, default-deny."""
+"""Knowledge route tool policy — explicit allowlist, default-deny."""
 
 from __future__ import annotations
 
-UGA_ALLOWED_TOOLS: frozenset[str] = frozenset({"search", "fetch"})
+KNOWLEDGE_ALLOWED_TOOLS: frozenset[str] = frozenset({"search", "fetch"})
 
 # Examples used in tests and docs; not an exhaustive deny list because default-deny
-# applies to anything outside UGA_ALLOWED_TOOLS.
-UGA_FORBIDDEN_TOOL_EXAMPLES: frozenset[str] = frozenset(
+# applies to anything outside KNOWLEDGE_ALLOWED_TOOLS.
+KNOWLEDGE_FORBIDDEN_TOOL_EXAMPLES: frozenset[str] = frozenset(
     {
         "shell",
         "list_directory",
@@ -20,7 +20,7 @@ UGA_FORBIDDEN_TOOL_EXAMPLES: frozenset[str] = frozenset(
 )
 
 
-# The filesystem route (uga.fs_gateway) is a separate server with its own allowlist.
+# The filesystem route (contextbridge.filesystem.gateway) is a separate server with its own allowlist.
 FS_READ_TOOLS: frozenset[str] = frozenset(
     {
         "read_file",

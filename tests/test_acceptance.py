@@ -72,8 +72,8 @@ def test_knowledge_gateway_serves_search_and_fetch(tmp_path):
     port = free_port()
     config = tmp_path / "contextbridge.yaml"
     config.write_text(f"name: ContextBridge\nserve:\n  host: 127.0.0.1\n  port: {port}\n", encoding="utf-8")
-    env = isolated_env(MCP_AUTH_TOKEN=KNOWLEDGE_TOKEN, UGA_DATACORE_JSONL=str(FIXTURE))
-    with serve("uga.gateway", config, port, env) as url:
+    env = isolated_env(MCP_AUTH_TOKEN=KNOWLEDGE_TOKEN, CONTEXTBRIDGE_DATACORE_JSONL=str(FIXTURE))
+    with serve("contextbridge.knowledge.gateway", config, port, env) as url:
 
         async def use(client):
             tools = {t.name for t in await client.list_tools()}

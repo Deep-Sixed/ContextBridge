@@ -6,7 +6,7 @@
   writable root that held it, with a ``<id>.json`` manifest beside it, and
   ``restore_deleted`` puts it back. No file tool can reach the trash, so a client
   cannot make its own deletions permanent; the owner empties it on the host.
-  The layout matches the filesystem route's (``uga.fs``), so either route's
+  The layout matches the filesystem route's (``contextbridge.filesystem.fs``), so either route's
   deletions in a shared folder can be listed and restored here.
 * ``permanent``: the item is removed outright.
 * ``disabled``: there is no delete tool.

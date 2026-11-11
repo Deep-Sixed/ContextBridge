@@ -11,10 +11,10 @@ from typing import Any
 
 import pytest
 
-from uga import fs_search
-from uga.fs import TRASH_DIR_NAME, Filesystem, FsError, FsLimits, FsPathDenied, FsRoot
-from uga.fs_search import SearchManager, expand_file_pattern
-from uga.fs_search_worker import run as run_worker
+from contextbridge.filesystem import search as fs_search
+from contextbridge.filesystem.fs import TRASH_DIR_NAME, Filesystem, FsError, FsLimits, FsPathDenied, FsRoot
+from contextbridge.filesystem.search import SearchManager, expand_file_pattern
+from contextbridge.filesystem.search_worker import run as run_worker
 
 # Exponential backtracking on a line of a's ending in b: the worker cannot finish
 # or check its deadline while matching it, so only killing the process stops it.
