@@ -33,15 +33,14 @@ agents:
 remote:
   # ChatGPT, Claude, and other remote MCP clients connect here with OAuth. Off until you set it up:
   #   contextbridge-admin --config configs/computer.yaml owner-init    # passphrase + authenticator app
-  #   tailscale funnel --bg 8793     # only once enabled is true: this makes the port public,
-  #                                  # which Claude and ChatGPT need (they are not on your tailnet)
-  # Keep Funnel off while enabled is false.
+  #   Publish 127.0.0.1:<port> with a Cloudflare Tunnel route for public_url's hostname
+  #   (blank path). Claude and ChatGPT connect from their own clouds, so it must be public.
   # Then add <public_url>/mcp as a custom connector. Each client is approved on a consent page
   # (passphrase + authenticator code) where you pick its permissions and devices.
   enabled: false
   host: 127.0.0.1          # loopback only; the tunnel publishes it
   port: 8793               # must differ from serve.port and agents.port
-  public_url: https://friday.example.ts.net   # the https origin the tunnel serves (no path)
+  public_url: https://mcp.example.com   # exact public HTTPS origin the tunnel serves; no /mcp path
   state: ../state/oauth.json   # owner credentials, clients, hashed tokens; hidden from every file tool
   allow_scopes: [computer:read]   # the most any remote client can be approved for; add more deliberately
   allow_devices: [local]   # device names remote clients may be offered; "*" for every enrolled device

@@ -28,7 +28,7 @@ scripts/healthcheck/check-gateway.sh --fetch --drill
 |---|---|---|
 | Deployed revision | HEAD compared with `origin/main`; uncommitted changes; installed package version | Same |
 | Service running | One gateway process; no stray local agents or leftover test processes | Scheduled task state, last result, logon type (S4U or sign-in); exactly one agent running the checked config (a venv launcher and its child process count as one); a warning for each agent running a different config |
-| Listeners and exposure | 8791 (and 8793 if enabled) on loopback; agent listener on its tailnet IP; no 8790–8794 on `0.0.0.0`; Tailscale Funnel off unless remote clients are enabled (WARN while it is on) | Gateway reachable over TCP; firewall profiles on; no inbound allow rule for Python |
+| Listeners and exposure | 8791 (and 8793 if enabled) on loopback; agent listener on its tailnet IP; no 8790–8794 on `0.0.0.0`; Tailscale Funnel off: remote clients come in through Cloudflare Tunnel (WARN while Funnel is on) | Gateway reachable over TCP; firewall profiles on; no inbound allow rule for Python |
 | Enrollment | `contextbridge-admin devices` (active and pending); `tailnet_node_ids` pinned | Identity file present; gateway fingerprint is not the placeholder |
 | Connection history | `device_connected`, `disconnected`, `heartbeat_lost`, `auth_failed`, `duplicate_refused`, `tailnet_admission_denied`; each device's last connect and agent version | `gateway_connected`, `disconnected`, `unreachable`, `result_undelivered`; restarts since boot |
 | Reboot recovery | n/a | Seconds from boot to first `gateway_connected` (WARN over 180 s) |
