@@ -312,3 +312,19 @@ def test_device_grant_limits_federated_tools(tmp_path, workspace):
 
     names = asyncio.run(scenario())
     assert not FAKE_TOOLS & names
+
+
+def test_two_servers_never_collide(policy):
+    section = {**fake_section(), "fake-two": {"command": sys.executable, "args": [FAKE], "startup_seconds": 60}}
+    federation = build_federation(load_mcp_servers({"mcp_servers": section}), policy)
+    federation.start()
+    try:
+        tools = federation.tools
+        first = federation.call("fake_echo", {"text": "one"})["structured_content"]
+        second = federation.call("fake-two_echo", {"text": "two"})["structured_content"]
+    finally:
+        federation.close()
+    # Server names cannot contain '_', so '<server>_' prefixes from different servers never overlap.
+    assert FAKE_TOOLS <= set(tools) and "fake-two_echo" in tools and "fake-two_fake_snapshot" in tools
+    assert tools["fake-two_echo"].server == "fake-two"
+    assert first["echo"] == "one" and second["echo"] == "two" and first["pid"] != second["pid"]
