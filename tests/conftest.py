@@ -9,20 +9,15 @@ from helpers import PY
 
 from contextbridge.computer.policy import ComputerPolicy, load_policy
 
-# ------------------------------------------------------------ knowledge route
+# ------------------------------------------------------------- filesystem route
 
 TOKEN = "t" * 40
 
-_GATEWAY_ENV = (
-    "MCP_AUTH_TOKEN",
-    "CONTEXTBRIDGE_DATACORE_JSONL",
-    "CONTEXTBRIDGE_AUDIT_LOG",
-    "CONTEXTBRIDGE_AUDIT_LOG_QUERY_TEXT",
-    "CONTEXTBRIDGE_AUDIT_HASH_KEY",
+_ROUTE_ENV = (
     "CONTEXTBRIDGE_MCP_TOOL_TIMEOUT_SECONDS",
     "CONTEXTBRIDGE_MCP_METADATA_TIMEOUT_SECONDS",
-    "CONTEXTBRIDGE_MCP_SEARCH_LIMIT",
-    "CONTEXTBRIDGE_MCP_FETCH_MAX_CHARS",
+    "UGA_MCP_TOOL_TIMEOUT_SECONDS",
+    "UGA_MCP_METADATA_TIMEOUT_SECONDS",
     "CONTEXTBRIDGE_FS_AUTH_TOKEN",
     "CONTEXTBRIDGE_FS_AUDIT_LOG",
 )
@@ -30,24 +25,8 @@ _GATEWAY_ENV = (
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in _GATEWAY_ENV:
+    for name in _ROUTE_ENV:
         monkeypatch.delenv(name, raising=False)
-
-
-def record(record_id: Any = "r1", **fields: Any) -> dict[str, Any]:
-    base: dict[str, Any] = {
-        "id": record_id,
-        "title": f"Title {record_id}",
-        "text": f"Body {record_id}",
-        "url": f"https://example.test/{record_id}",
-    }
-    base.update(fields)
-    return base
-
-
-def write_jsonl(path: Path, records: list[dict[str, Any]]) -> Path:
-    path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
-    return path
 
 
 def read_audit(path: Path) -> list[dict[str, Any]]:

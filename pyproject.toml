@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "contextbridge"
 dynamic = ["version"]
-description = "Self-hosted MCP gateway for approved project context and policy-controlled computer access"
+description = "Self-hosted MCP gateway that gives AI assistants policy-controlled access to your computers"
 requires-python = ">=3.11"
 # The gateways hook fastmcp 3's middleware and server internals; fastmcp 4 reworked
 # that API (it also removed fastmcp.tools.tool). anyio 4.1 added abandon_on_cancel.

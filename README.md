@@ -1,16 +1,15 @@
 # ContextBridge
 
-A self-hosted MCP gateway that gives AI assistants authenticated, policy-controlled access to approved knowledge and to your own computers. ContextBridge has no runtime dependency on any hosted relay: its own gateway, agents, and transport do the work.
+A self-hosted MCP gateway that gives AI assistants authenticated, policy-controlled access to your own computers. ContextBridge has no runtime dependency on any hosted relay: its own gateway, agents, and transport do the work.
 
-It has three routes, each with its own server, port, and credential:
+It has two routes, each with its own server, port, and credential:
 
 | Route | Module | Tools | Credential |
 |---|---|---|---|
-| Knowledge | `contextbridge.knowledge.gateway` | `search`, `fetch` over approved JSONL records | `MCP_AUTH_TOKEN` |
 | Filesystem | `contextbridge.filesystem.gateway` | file tools inside configured directories (see [Filesystem route](#filesystem-route)) | `CONTEXTBRIDGE_FS_AUTH_TOKEN` |
 | Computer | `contextbridge.computer` | files, search, documents, commands, sessions, processes, devices; opt-in window and media inventory | `CONTEXTBRIDGE_COMPUTER_TOKEN` |
 
-Being able to read knowledge never grants file or computer access. Each route accepts only its own token. The filesystem and computer routes each refuse to start if their token matches either other route's token, when both are set in their environment.
+Each route accepts only its own token, and each refuses to start if its token matches the other route's, when both are set in its environment.
 
 The computer route can also serve ChatGPT, Claude, and other remote MCP clients through a second, OAuth-protected endpoint. Each client gets only the permissions and devices you approve for it (see [Remote MCP clients](#remote-mcp-clients-chatgpt-claude)).
 
@@ -23,80 +22,7 @@ python3 -m pytest        # includes acceptance tests that launch the gateways an
 
 ContextBridge requires Python 3.11+ and FastMCP 3.x (`fastmcp>=3,<4`). It has no runtime dependency on Node or npx, and the acceptance tests run both gateways in an environment without them.
 
-`tests/test_contract.py` pins the knowledge route's MCP contract: the exact tool set, annotations, input schemas, reported version, server instructions, and policy denial. `tests/test_entrypoint.py` starts the real `python -m contextbridge.knowledge.gateway` entrypoint and checks bearer auth over HTTP. `tests/test_fs.py` covers the filesystem operations and path rules, and `tests/test_fs_gateway.py` pins the filesystem route's MCP contract and starts its entrypoint. CI runs the whole suite on Ubuntu and Windows, with Python 3.11 against the oldest supported FastMCP (3.0.0) and Python 3.13 against the newest 3.x release.
-
-## Knowledge route
-
-**Security model:** exactly two operations (`search` and `fetch`), default-deny policy for tools and every other MCP method, read-only annotations, audit logging, and a static bearer token (at least 32 characters) required at startup. Error details are masked from clients. Only allowlisted record fields are served, at the top level and inside `metadata`. It binds only to the loopback interface by default.
-
-```sh
-export MCP_AUTH_TOKEN="<strong random secret provided by secret manager>"
-export CONTEXTBRIDGE_DATACORE_JSONL="/path/to/approved/datacore.fetch.v1.jsonl"
-./scripts/run-contextbridge.sh
-```
-
-`MCP_AUTH_TOKEN` must be at least 32 characters (for example `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`).
-
-The data export is required: set `CONTEXTBRIDGE_DATACORE_JSONL`, or `datacore_jsonl` in the config file (a relative path is resolved against the config file's directory). The environment variable wins. The export is loaded and validated at startup, and the gateway refuses to start if it is missing or invalid.
-
-`scripts/run-contextbridge.sh` always uses `configs/contextbridge.yaml`. To use another config file, run `python3 -m contextbridge.knowledge.gateway --config <path>`.
-
-### Connecting
-
-MCP clients connect over streamable HTTP to `http://127.0.0.1:8790/mcp` (the `serve.host` and `serve.port` from the config) and send `Authorization: Bearer <MCP_AUTH_TOKEN>`.
-
-Every HTTP route requires the token, including `GET /`, which returns the service name, the MCP path, and the tool names. A request without a valid token gets `401` and is audited as `auth`. The filesystem route applies the same rule with its own token.
-
-### Configuration
-
-| Setting | Default | Purpose |
-| --- | --- | --- |
-| `MCP_AUTH_TOKEN` | required | Bearer token clients must send; at least 32 characters |
-| `CONTEXTBRIDGE_DATACORE_JSONL` or `datacore_jsonl` | one is required | JSONL export to serve |
-| `serve.host` | `127.0.0.1` | Listen address |
-| `serve.port` | required | Listen port (`8790` in `configs/contextbridge.yaml`) |
-| `name` | `ContextBridge Knowledge` | Server name reported in `serverInfo` and by `GET /` |
-| `CONTEXTBRIDGE_AUDIT_LOG` or `serve.audit_log` | unset | Audit log file (see [Audit log](#audit-log)) |
-| `CONTEXTBRIDGE_AUDIT_LOG_QUERY_TEXT` | off | `1`, `true`, or `yes` also logs a query preview |
-| `CONTEXTBRIDGE_AUDIT_HASH_KEY` | random per run | Key for the audit log's query hash |
-| `serve.forwarded_allow_ips` | unset | Proxy addresses whose `X-Forwarded-For` is trusted for the audited `peer` |
-| `CONTEXTBRIDGE_MCP_SEARCH_LIMIT` | `10` | Maximum `search` results |
-| `CONTEXTBRIDGE_MCP_FETCH_MAX_CHARS` | `100000` | Maximum characters of `text` that `fetch` returns |
-| `CONTEXTBRIDGE_MCP_TOOL_TIMEOUT_SECONDS` | `10` | Timeout for a tool call |
-| `CONTEXTBRIDGE_MCP_METADATA_TIMEOUT_SECONDS` | `5` | Timeout for `initialize` and `tools/list` |
-
-Where a setting has both an environment variable and a config key, the environment variable wins. An unset, unparsable, or non-positive value for the last four falls back to the default. A relative `serve.audit_log` is resolved against the config file's directory.
-
-### Data format
-
-Each JSONL line is one approved record with `id` (a non-empty string or integer) and the strings `title`, `text`, and `url`, plus an optional `metadata` object. An integer `id` is served as a string (record `7` is fetched as `"7"`). Other keys, at the top level or inside `metadata`, are kept only if they are approved fields listed in `_APPROVED_FIELDS` in `src/contextbridge/knowledge/adapter.py`; any other key is dropped at load time and is never served or searched. An approved field keeps its whole value, including nested objects.
-
-Blank lines are skipped. Invalid JSON, a missing or non-string `title`, `text`, or `url`, or a duplicate `id` stops startup.
-
-### Tools
-
-| Tool | Input | Returns |
-| --- | --- | --- |
-| `search` | `query` | `{"results": [...]}` with up to `CONTEXTBRIDGE_MCP_SEARCH_LIMIT` hits. Each hit has `id`, `title`, and `url`, plus whichever of `summary`, `snippet`, `bank_id`, `record_kind`, `status`, and `updated_at` the record has (top-level field first, then `metadata`). |
-| `fetch` | `id` | The full record: `id`, `title`, `text`, `url`, `metadata`, and the approved top-level fields it has. |
-
-Search is a case-insensitive substring match against the values of `title`, `text`, `url`, `metadata`, and the approved fields; it does not match the `id` or JSON key names, and never matches across two fields. An empty query returns the first records in file order. `fetch` of an unknown id fails with `Record not found: <id>`.
-
-`fetch` returns at most `CONTEXTBRIDGE_MCP_FETCH_MAX_CHARS` characters of a record's `text`. A longer text is cut to that length, and the response adds `truncated: true` and the full `text_length`. Other fields are returned as exported.
-
-Both tools declare `readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`, and `openWorldHint=false`. They only read the snapshot loaded at startup, so changes to the JSONL file take effect on restart. The server reports the package version (`contextbridge.__version__`) in `serverInfo`, and its MCP `instructions` tell agents to search, then fetch by id, and to treat record text as data rather than instructions.
-
-Other MCP methods follow the same default-deny policy: `resources/list`, `resources/templates/list` and `prompts/list` return empty lists, `ping` is answered, and every other request (for example `resources/read`, `prompts/get`, `logging/setLevel`) is rejected.
-
-### Audit log
-
-Each MCP request except `ping`, and each HTTP request rejected by auth, is written as one JSON line to stderr (prefixed with `[knowledge audit] `) and, if `CONTEXTBRIDGE_AUDIT_LOG` (or `serve.audit_log` in the config, resolved against the config file's directory) is set, to that file. Missing parent directories are created. The file is opened without following symlinks, must be a regular file, and is set to mode `0600`, including when it already exists. An authenticated `GET /` is not audited.
-
-Each line has a `request_id` that is unique per request, and a tool call's line carries what the tool recorded (`record_id`, `result_count`, the query hash). Denied tools and methods are logged with `detail: "policy_denied"`, and their arguments are not logged. Requests rejected by bearer auth are logged as `tool: "auth"` with `missing_token`, `invalid_token`, or `forbidden`. Methods the MCP SDK does not implement at all are rejected by the SDK and not logged. Client-supplied strings such as tool names and record ids are cut to 200 characters.
-
-Queries are recorded as their length and a keyed hash (the first 16 hex digits of an HMAC-SHA256); set `CONTEXTBRIDGE_AUDIT_LOG_QUERY_TEXT=1` to also log a preview of up to 80 characters. Set `CONTEXTBRIDGE_AUDIT_HASH_KEY` to a random secret to make the hash of the same query stable across restarts; without it a random key is used for each run, and the hash cannot be reversed by hashing guesses without the key.
-
-The `peer` field is the address of the TCP connection. `X-Forwarded-For` is ignored unless the proxy's address is listed in `serve.forwarded_allow_ips`. If you serve `create_knowledge_server().http_app()` with your own uvicorn, pass `proxy_headers=False` (uvicorn trusts the header from 127.0.0.1 by default).
+`tests/test_fs.py` covers the filesystem operations and path rules, and `tests/test_fs_gateway.py` pins the filesystem route's MCP contract (tool set, annotations, schemas, reported version, default-deny for every other method) and starts its entrypoint. CI runs the whole suite on Ubuntu and Windows, with Python 3.11 against the oldest supported FastMCP (3.0.0) and Python 3.13 against the newest 3.x release.
 
 ## Filesystem route
 
@@ -107,7 +33,24 @@ export CONTEXTBRIDGE_FS_AUTH_TOKEN="<a different strong secret>"
 ./scripts/run-contextbridge-fs.sh
 ```
 
-`CONTEXTBRIDGE_FS_AUTH_TOKEN` follows the same rules as `MCP_AUTH_TOKEN` and must differ from it and from `CONTEXTBRIDGE_COMPUTER_TOKEN`; the route checks each of those that is set in its environment. Set `CONTEXTBRIDGE_FS_CONFIG` to use another config file. The config takes the same `name` (default `ContextBridge Files`) and `serve` keys as the gateway's, plus the `filesystem` section.
+`CONTEXTBRIDGE_FS_AUTH_TOKEN` is required, must be at least 32 characters (for example `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`), and must differ from `CONTEXTBRIDGE_COMPUTER_TOKEN` when that is set. Set `CONTEXTBRIDGE_FS_CONFIG` to use another config file.
+
+MCP clients connect over streamable HTTP to `http://127.0.0.1:8794/mcp` and send `Authorization: Bearer <CONTEXTBRIDGE_FS_AUTH_TOKEN>`. Every HTTP route requires the token, including `GET /`, which returns the service name, the MCP path, and the tool names. A request without a valid token gets `401` and is audited as `auth`.
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `serve.host` | `127.0.0.1` | Listen address; keep it on loopback |
+| `serve.port` | required | Listen port (`8794` in `configs/contextbridge-fs.yaml`) |
+| `name` | `ContextBridge Files` | Server name reported in `serverInfo` and by `GET /` |
+| `CONTEXTBRIDGE_FS_AUDIT_LOG` or `serve.audit_log` | unset | Audit log file (see **Audit** below) |
+| `serve.forwarded_allow_ips` | unset | Proxy addresses whose `X-Forwarded-For` is trusted for the audited `peer` |
+| `CONTEXTBRIDGE_MCP_TOOL_TIMEOUT_SECONDS` | `10` | Timeout for a tool call |
+| `CONTEXTBRIDGE_MCP_METADATA_TIMEOUT_SECONDS` | `5` | Timeout for `initialize` and `tools/list` |
+| `filesystem` | required | Roots and limits (below) |
+
+Where a setting has both an environment variable and a config key, the environment variable wins. An unset, unparsable, or non-positive timeout falls back to the default. Relative paths in the config are resolved against the config file's directory.
+
+Other MCP methods are default-deny: `resources/list`, `resources/templates/list` and `prompts/list` return empty lists, `ping` is answered, and every other request (for example `resources/read`, `prompts/get`, `logging/setLevel`) is rejected and audited. Error details are masked from clients.
 
 **Path rules:** every path must be absolute or start with `~` (the server user's home directory). It is resolved with symlinks followed and must land inside a root, so `..` and symlinks cannot reach outside. Roots are read-only unless they set `writable: true`, must exist, and must not overlap. The server's MCP `instructions` list each root and whether it is writable. Write tools are only advertised when at least one root is writable, and calls to any tool outside the advertised set are denied and audited.
 
@@ -144,9 +87,9 @@ Each search runs in its own worker process (`src/contextbridge/filesystem/search
 
 **Deletion is recoverable:** each deleted item is kept under `.contextbridge-trash/<trash_id>/`, next to a `<trash_id>.json` file recording its original path. No tool can read, list, change or empty the trash; recover or purge items from the host.
 
-**Limits:** `max_read_bytes` and `max_write_bytes` (1 MiB each by default) cap a response and a write, `max_list_entries` (1000) caps a listing, and `max_search_file_bytes` (10 MiB) is the largest file a content search reads. Calls use the same `CONTEXTBRIDGE_MCP_TOOL_TIMEOUT_SECONDS` and `CONTEXTBRIDGE_MCP_METADATA_TIMEOUT_SECONDS` settings as the gateway. Text must be UTF-8; binary files are refused.
+**Limits:** `max_read_bytes` and `max_write_bytes` (1 MiB each by default) cap a response and a write, `max_list_entries` (1000) caps a listing, and `max_search_file_bytes` (10 MiB) is the largest file a content search reads. Text must be UTF-8; binary files are refused.
 
-**Audit:** lines go to stderr and to `CONTEXTBRIDGE_FS_AUDIT_LOG` (or `serve.audit_log`, resolved against the config file's directory) with `route: "fs"`. As on the gateway, each request is one line, and `X-Forwarded-For` is ignored unless `serve.forwarded_allow_ips` lists the proxy. Paths are logged as the client sent them, with byte counts for reads and writes and the trash location for deletes. Refused paths are logged with `detail: "path_denied"`. Search events include `search_id` and result counts; patterns are logged only by length and hash.
+**Audit:** each MCP request except `ping`, and each HTTP request rejected by auth, is one JSON line with `route: "fs"`, written to stderr (prefixed `[fs audit] `) and, if set, to `CONTEXTBRIDGE_FS_AUDIT_LOG` (or `serve.audit_log`). The file is opened without following symlinks, must be a regular file, and is set to mode `0600`. Each line has a unique `request_id`. Denied tools and methods are logged with `detail: "policy_denied"` and without their arguments; requests rejected by bearer auth are logged as `tool: "auth"` with `missing_token`, `invalid_token`, or `forbidden`. Client-supplied strings are cut to 200 characters. The `peer` field is the TCP peer address; `X-Forwarded-For` is ignored unless `serve.forwarded_allow_ips` lists the proxy. Paths are logged as the client sent them, with byte counts for reads and writes and the trash location for deletes. Refused paths are logged with `detail: "path_denied"`. Search events include `search_id` and result counts; patterns are logged only by length and hash.
 
 **Known limits:** checks run before each operation, so another local process that swaps a symlink in between can still redirect it; only the final component is opened with `O_NOFOLLOW`. Likewise, a destination created between `move_file`'s check and the rename is replaced. Hard links that already exist inside a root are not detected.
 
@@ -201,7 +144,7 @@ These checks run on **every tool call**, at the moment it executes:
 
 - **Paths.** Every path resolves through symlinks before it is checked, so neither `..` nor a symlink can escape `filesystem.roots`. Writes are allowed only inside `filesystem.writable_roots`. Any path with a component matching a `deny` glob (`.ssh`, `.env*`, `*.pem`, `*.kdbx`, and so on) is hidden from listings and searches and refused for reads and writes. The policy file and the audit log can never be written or moved through ContextBridge.
 - **Limits.** Reads, writes, search results, and search time all have caps. A `search_code` regular expression is matched in a separate worker process that is killed when `max_search_seconds` runs out, so a slow pattern cannot stall the gateway or an agent. Rewrites are atomic and preserve file mode. `edit_block` fails unless the match count is exactly what the caller expected.
-- **Commands.** `allowlist` mode runs one program per call without a shell. The program must be on the allowlist, and pipes, redirects, `;` and `&&` are refused before anything runs. `unrestricted` mode runs through a shell: `bash -c` by default (PowerShell on Windows), or whatever `commands.shell` names (`bash`, `sh`, `powershell`, `pwsh`, `cmd`, or an argv list). The working directory must be inside a readable root. Every command has a hard timeout (`max_timeout_seconds` caps whatever the caller asks for), and a timed-out command is killed along with every process it started. Output is capped in memory, keeping the head and the tail. Variables that look like credentials (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`, …) are removed from the child's environment, and all three route tokens (`MCP_AUTH_TOKEN`, `CONTEXTBRIDGE_FS_AUTH_TOKEN`, `CONTEXTBRIDGE_COMPUTER_TOKEN`) are always removed, whatever `env_strip` says. On Linux every ContextBridge server also marks itself non-dumpable at startup, so a command cannot read the tokens back out of the server's own `/proc/<pid>/environ` (`ps e` shows exactly that); as a side effect the servers write no core dumps and attaching a debugger to one needs root.
+- **Commands.** `allowlist` mode runs one program per call without a shell. The program must be on the allowlist, and pipes, redirects, `;` and `&&` are refused before anything runs. `unrestricted` mode runs through a shell: `bash -c` by default (PowerShell on Windows), or whatever `commands.shell` names (`bash`, `sh`, `powershell`, `pwsh`, `cmd`, or an argv list). The working directory must be inside a readable root. Every command has a hard timeout (`max_timeout_seconds` caps whatever the caller asks for), and a timed-out command is killed along with every process it started. Output is capped in memory, keeping the head and the tail. Variables that look like credentials (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`, …) are removed from the child's environment, and both route tokens (`CONTEXTBRIDGE_FS_AUTH_TOKEN`, `CONTEXTBRIDGE_COMPUTER_TOKEN`) are always removed, whatever `env_strip` says, as is the retired `MCP_AUTH_TOKEN`. On Linux every ContextBridge server also marks itself non-dumpable at startup, so a command cannot read the tokens back out of the server's own `/proc/<pid>/environ` (`ps e` shows exactly that); as a side effect the servers write no core dumps and attaching a debugger to one needs root.
 - **Sessions.** `start_process` runs long or interactive programs in the background. Concurrent sessions are capped (`max_sessions`) and each is killed when it reaches `max_session_seconds`.
 - **Deletes.** `delete_file` works only inside writable roots. It never deletes a root, a protected or hidden path, or a folder holding anything the file tools may not see (a `.ssh` or `.env` inside, say). A non-empty folder needs `recursive: true` and is capped at `max_delete_entries` (10,000).
   - **`delete: trash` (default):** the item moves to `.contextbridge-trash/<trash_id>/` in its writable root, beside a `<trash_id>.json` record of where it came from. `list_deleted` shows the trash and `restore_deleted` puts an item back, but no file tool can read, change, or empty the trash, so a client cannot make its own deletions permanent. Empty it on the host. The layout is the [filesystem route](#filesystem-route)'s, so a folder both routes serve has one trash.
@@ -471,7 +414,7 @@ No process is killed, and the only file deleted is the drill's own. The exit sta
 
 ### What CI proves
 
-`tests/test_failover.py` runs the whole deployment from its shipped entry points on Ubuntu and Windows: the knowledge gateway, the computer gateway with its agent and OAuth listeners, and an agent standing in for Thanatos. Everything runs inside a jail:
+`tests/test_failover.py` runs the whole deployment from its shipped entry points on Ubuntu and Windows: the computer gateway with its agent and OAuth listeners, and an agent standing in for Thanatos. Everything runs inside a jail:
 
 - **Tripwires:** `npx` and `node` programs come first on `PATH` and record any call.
 - **Network jail:** `tests/failover_jail/sitecustomize.py` refuses and records every network destination off the machine, so no hosted relay, registry, or update check can be reached.
@@ -480,7 +423,6 @@ Then the test checks each of these:
 - **Drill:** passes on both devices, including `--write`.
 - **Every tool:** every computer tool works on both devices, apart from `list_windows` and `media_inventory`, which the test's device policies leave off.
 - **Remote client:** a Claude/ChatGPT-style OAuth client reads from both devices and is refused anything it wasn't granted.
-- **Knowledge route:** `search` and `fetch` work.
 - **Restart:** after a gateway restart, the agent reconnects on its own and the OAuth token still works.
 - **Audit:** both machines' audit logs show the same requests.
 - **Isolation:** nothing touched a tripwire or the network.
@@ -504,14 +446,13 @@ Native delete and the PDF, Word, and Excel tools arrived in phase 7 (see [Docume
 ## Network exposure
 
 No route depends on Authentik.
-- **Knowledge route:** binds to loopback by default; do not set `serve.host` to a public interface. It has no OAuth front end; the remote endpoint serves only the computer route.
-- **Filesystem route (8794):** binds to loopback by default, and the same `serve.host` rule applies. It has no OAuth front end either.
+- **Filesystem route (8794):** binds to loopback by default; do not set `serve.host` to a public interface. It has no OAuth front end; the remote endpoint serves only the computer route.
 - **Computer MCP endpoints:** refuse any non-loopback address; there is no override.
   - **Local listener (8791):** accepts only the static token.
   - **Remote listener (8793):** accepts only OAuth tokens. It is meant to be published only through a TLS tunnel.
 - **Agent listener:** TLS-only, limited to private addresses, and accepts only enrolled devices, which, unless the listener is on loopback, must connect from a Tailscale node listed in `agents.tailnet_node_ids`.
 
-Do not forward ports 8790, 8791, 8792, or 8794 to the internet. Publish 8793 only through a TLS tunnel, and only once `owner-init` is done.
+Do not forward ports 8791, 8792, or 8794 to the internet. Publish 8793 only through a TLS tunnel, and only once `owner-init` is done.
 
 ## Roadmap
 
@@ -525,7 +466,7 @@ Do not forward ports 8790, 8791, 8792, or 8794 to the internet. Publish 8793 onl
 
 ## Documentation
 
-The files in `docs/` are planning documents. The filesystem and computer routes implement the roadmap's filesystem operations; the filesystem route now also offers asynchronous file and content search. The computer route covers search, commands, processes, remote devices, documents (PDF, Word, Excel) and native recoverable delete. Synchronization remains unimplemented. The read-only knowledge route rejects these operations. The documents refer to Friday (Linux) and Thanatos (Windows).
+The files in `docs/` are planning documents. The filesystem and computer routes implement the roadmap's filesystem operations; the filesystem route now also offers asynchronous file and content search. The computer route covers search, commands, processes, remote devices, documents (PDF, Word, Excel) and native recoverable delete. Synchronization remains unimplemented. The documents refer to Friday (Linux) and Thanatos (Windows).
 
 - `docs/phase-2-desktop-plan.md` plans desktop interaction. Its first step, `list_windows`, is implemented (see [Desktop and media inventory](#desktop-and-media-inventory)); the rest is not. Its phase numbers are its own and don't match the [Roadmap](#roadmap) above.
 - `docs/capability-roadmap.pdf` lists the capabilities ContextBridge targets, with an implementation checklist. The checklist is a blank tracker, not a status report. It is generated by `scripts/build-roadmap-pdf.py`.
@@ -544,10 +485,9 @@ python3 -m pip install -e '.[docs]'
 
 No route is production-validated yet. Authentication-front/sidecar deployments and systemd services are intentionally left out.
 
-**Upgrading an older deployment.** The knowledge and filesystem routes used to live in a package with a different name, and their settings had a different prefix. If you start them with `scripts/run-contextbridge.sh` and `scripts/run-contextbridge-fs.sh`, nothing changes for you. Otherwise:
-- start them with `python3 -m contextbridge.knowledge.gateway` and `python3 -m contextbridge.filesystem.gateway`;
-- settings are now named `CONTEXTBRIDGE_*` (for example `CONTEXTBRIDGE_DATACORE_JSONL`). The old names are still read when the new one is unset, so existing environments keep working;
-- the knowledge route's audit lines now carry `route: "knowledge"`, its default server name is `ContextBridge Knowledge`, and stderr audit lines are prefixed with the route's name (`[knowledge audit]`, `[fs audit]`).
+**Upgrading an older deployment.**
+- **The read-only knowledge route is gone.** It served `search` and `fetch` over a JSONL export of a retired data store. `scripts/run-contextbridge.sh`, `configs/contextbridge.yaml`, port 8790 and `MCP_AUTH_TOKEN` are no longer used; stop any service that starts the route and remove its connector from ChatGPT or Claude. `MCP_AUTH_TOKEN` is still stripped from command environments in case a host keeps it set.
+- **The filesystem route moved.** If you start it with `scripts/run-contextbridge-fs.sh`, nothing changes. Otherwise start it with `python3 -m contextbridge.filesystem.gateway`. Its timeout settings are now named `CONTEXTBRIDGE_MCP_*`; the old `UGA_MCP_*` names are still read when the new one is unset.
 
 `src/contextbridge/projects.py` (a project-to-host-to-repository registry, see `configs/projects.example.yaml`) and `src/contextbridge/task_ledger.py` (a SQLite ledger of task states) are library foundations: no route, tool, or CLI uses them yet, and neither grants any access.
 

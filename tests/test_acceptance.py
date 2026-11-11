@@ -36,9 +36,8 @@ from helpers import (
 
 from contextbridge.computer.server import main as computer_main
 
-FIXTURE = REPO / "tests" / "fixtures" / "datacore" / "datacore.fetch.v1.jsonl"
 COMPUTER_TOKEN = "computer-" + "c" * 40
-KNOWLEDGE_TOKEN = "knowledge-" + "k" * 40
+OTHER_TOKEN = "other-" + "o" * 40
 
 posix_only = pytest.mark.skipif(IS_WINDOWS, reason="uses POSIX utilities (ls, echo, sleep, sh)")
 
@@ -63,33 +62,6 @@ def _requests(audit_log: Path) -> dict[str, list[dict]]:
         if "request_id" in entry:
             grouped.setdefault(entry["request_id"], []).append(entry)
     return grouped
-
-
-# ------------------------------------------------------------ knowledge route
-
-
-def test_knowledge_gateway_serves_search_and_fetch(tmp_path):
-    port = free_port()
-    config = tmp_path / "contextbridge.yaml"
-    config.write_text(f"name: ContextBridge\nserve:\n  host: 127.0.0.1\n  port: {port}\n", encoding="utf-8")
-    env = isolated_env(MCP_AUTH_TOKEN=KNOWLEDGE_TOKEN, CONTEXTBRIDGE_DATACORE_JSONL=str(FIXTURE))
-    with serve("contextbridge.knowledge.gateway", config, port, env) as url:
-
-        async def use(client):
-            tools = {t.name for t in await client.list_tools()}
-            hits = (await client.call_tool("search", {"query": "approved knowledge"})).structured_content
-            record = (await client.call_tool("fetch", {"id": "rec-002"})).structured_content
-            return tools, hits, record
-
-        tools, hits, record = call(url, KNOWLEDGE_TOKEN, use)
-        assert tools == {"search", "fetch"}
-        assert {hit["id"] for hit in hits["results"]} == {"rec-001"}
-        assert record["title"] == "Computer route policy"
-
-        for token in (None, "wrong-token", COMPUTER_TOKEN):
-            with pytest.raises(httpx.HTTPStatusError) as err:
-                call(url, token, lambda client: client.list_tools())
-            assert err.value.response.status_code == 401
 
 
 # ------------------------------------------------------------- computer route
@@ -133,7 +105,7 @@ def test_computer_gateway_starts_and_serves_authorized_requests(computer, worksp
 
 def test_computer_gateway_requires_its_own_credential(computer):
     url, _ = computer
-    for token in (None, "wrong-token", KNOWLEDGE_TOKEN):
+    for token in (None, "wrong-token", OTHER_TOKEN):
         with pytest.raises(httpx.HTTPStatusError) as err:
             call(url, token, lambda client: client.list_tools())
         assert err.value.response.status_code == 401
@@ -221,7 +193,6 @@ def test_scopes_are_enforced_at_execution_time(tmp_path, workspace):
 
 @pytest.fixture
 def startup(tmp_path, workspace, monkeypatch):
-    monkeypatch.delenv("MCP_AUTH_TOKEN", raising=False)
     monkeypatch.setenv("CONTEXTBRIDGE_COMPUTER_TOKEN", COMPUTER_TOKEN)
 
     def launch(**serve_overrides):
@@ -240,7 +211,6 @@ def startup(tmp_path, workspace, monkeypatch):
     [
         ({"CONTEXTBRIDGE_COMPUTER_TOKEN": None}, "must be set"),
         ({"CONTEXTBRIDGE_COMPUTER_TOKEN": "short"}, "at least 32"),
-        ({"MCP_AUTH_TOKEN": COMPUTER_TOKEN}, "must differ from MCP_AUTH_TOKEN"),
         ({"CONTEXTBRIDGE_FS_AUTH_TOKEN": COMPUTER_TOKEN}, "must differ from CONTEXTBRIDGE_FS_AUTH_TOKEN"),
     ],
 )

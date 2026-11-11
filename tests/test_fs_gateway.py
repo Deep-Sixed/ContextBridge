@@ -13,19 +13,23 @@ from typing import Any
 
 import anyio
 import httpx
+import importlib.metadata
+import mcp.types
 import pytest
 from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
+from mcp.shared.exceptions import McpError
 from starlette.testclient import TestClient
 
 import contextbridge
 from conftest import TOKEN, read_audit
-from test_contract import _assert_no_injection_text
+from helpers import assert_no_injection_text
 from contextbridge.filesystem import gateway as fs_gateway
-from contextbridge.knowledge.audit import GatewayAuditLog
+from contextbridge.filesystem.audit import GatewayAuditLog
 from contextbridge.filesystem.fs import Filesystem, FsRoot
 from contextbridge.filesystem.gateway import create_fs_server
-from contextbridge.knowledge.policy import FS_READ_TOOLS, FS_WRITE_TOOLS, KNOWLEDGE_ALLOWED_TOOLS
+from contextbridge.filesystem.policy import FS_READ_TOOLS, FS_WRITE_TOOLS
+from contextbridge.filesystem.server import _guard_low_level_handlers
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -123,13 +127,12 @@ def test_tool_surface_depends_on_writable_roots(tmp_path: Path) -> None:
 
     assert {t.name for t in writable} == FS_READ_TOOLS | FS_WRITE_TOOLS == set(EXPECTED_INPUTS)
     assert {t.name for t in read_only} == FS_READ_TOOLS
-    assert not (FS_READ_TOOLS | FS_WRITE_TOOLS) & KNOWLEDGE_ALLOWED_TOOLS
 
 
 def test_tools_declare_annotations_schemas_and_descriptions(tmp_path: Path) -> None:
     session = _session(_server(tmp_path))
 
-    _assert_no_injection_text("server instructions", session["init"].instructions or "")
+    assert_no_injection_text("server instructions", session["init"].instructions or "")
     assert session["init"].serverInfo.version == contextbridge.__version__
     for tool in session["tools"]:
         declared = tool.annotations.model_dump(exclude_none=True) if tool.annotations else {}
@@ -143,7 +146,7 @@ def test_tools_declare_annotations_schemas_and_descriptions(tmp_path: Path) -> N
         properties = set((tool.inputSchema or {}).get("properties") or {})
         assert properties == EXPECTED_INPUTS[tool.name], f"{tool.name} inputs: {properties}"
         assert tool.description, f"{tool.name} has no description"
-        _assert_no_injection_text(f"{tool.name} description", tool.description)
+        assert_no_injection_text(f"{tool.name} description", tool.description)
 
 
 def test_instructions_name_each_root_and_its_mode(tmp_path: Path) -> None:
@@ -157,7 +160,7 @@ def test_instructions_name_each_root_and_its_mode(tmp_path: Path) -> None:
 def test_hidden_and_foreign_tools_are_denied_and_audited(tmp_path: Path) -> None:
     audit_path = tmp_path / "audit.jsonl"
     server = _server(tmp_path, writable=False, audit_path=audit_path)
-    denied = sorted(FS_WRITE_TOOLS | KNOWLEDGE_ALLOWED_TOOLS | {"start_process", "shell"})
+    denied = sorted(FS_WRITE_TOOLS | {"search", "fetch", "start_process", "shell"})
 
     async def go() -> Any:
         async with Client(server) as client:
@@ -277,6 +280,113 @@ def test_http_requires_bearer_token(tmp_path: Path) -> None:
     assert auth_lines == ["missing_token", "missing_token"]
 
 
+def test_auth_failures_and_initialize_are_audited_with_the_client(tmp_path: Path) -> None:
+    audit_path = tmp_path / "audit.jsonl"
+    _, ro = _roots(tmp_path)
+    server = create_fs_server(
+        fs=Filesystem([FsRoot(ro)]), token=TOKEN, audit=GatewayAuditLog(audit_path, route="fs")
+    )
+    headers = {"Accept": "application/json, text/event-stream"}
+
+    with TestClient(server.http_app()) as client:
+        wrong = client.post("/mcp", json=_INITIALIZE, headers={**headers, "Authorization": "Bearer " + "w" * 40})
+        ok = client.post("/mcp", json=_INITIALIZE, headers={**headers, "Authorization": f"Bearer {TOKEN}"})
+
+    assert (wrong.status_code, ok.status_code) == (401, 200)
+    entries = read_audit(audit_path)
+    (auth,) = [e for e in entries if e["tool"] == "auth"]
+    assert (auth["detail"], auth["peer"]) == ("invalid_token", "testclient")
+    (init,) = [e for e in entries if e["tool"] == "initialize"]
+    assert (init["client"], init["peer"], init["route"]) == ("pytest-client", "testclient", "fs")
+
+
+def test_resources_and_prompts_are_empty_or_denied(tmp_path: Path) -> None:
+    audit_path = tmp_path / "audit.jsonl"
+    server = _server(tmp_path, audit_path=audit_path)
+
+    async def go() -> list[Any]:
+        async with Client(server) as client:
+            listings = [
+                await client.list_resources(),
+                await client.list_resource_templates(),
+                await client.list_prompts(),
+            ]
+            with pytest.raises(McpError, match="not permitted"):
+                await client.read_resource("file:///etc/passwd")
+            with pytest.raises(McpError, match="not permitted"):
+                await client.get_prompt("anything")
+            return listings
+
+    assert anyio.run(go) == [[], [], []]
+    outcome = {e["tool"]: e.get("detail", "ok") for e in read_audit(audit_path)}
+    assert outcome["resources/list"] == outcome["resources/templates/list"] == outcome["prompts/list"] == "ok"
+    assert outcome["resources/read"] == outcome["prompts/get"] == "policy_denied"
+
+
+def test_low_level_handlers_outside_middleware_are_denied(tmp_path: Path) -> None:
+    class FutureRequest:
+        method = "future/method"
+
+    audit_path = tmp_path / "audit.jsonl"
+    server = FastMCP("x")
+    handlers = server._mcp_server.request_handlers
+    ping = handlers[mcp.types.PingRequest]
+    handlers[FutureRequest] = ping
+
+    _guard_low_level_handlers(server, GatewayAuditLog(audit_path, route="fs"))
+
+    assert handlers[mcp.types.PingRequest] is ping
+    with pytest.raises(McpError, match="not permitted"):
+        anyio.run(handlers[FutureRequest], FutureRequest())
+    (line,) = read_audit(audit_path)
+    assert (line["tool"], line["detail"]) == ("future/method", "policy_denied")
+
+
+def test_server_denies_logging_set_level(tmp_path: Path) -> None:
+    audit_path = tmp_path / "audit.jsonl"
+    server = _server(tmp_path, audit_path=audit_path)
+    if mcp.types.SetLevelRequest not in server._mcp_server.request_handlers:
+        pytest.skip("this fastmcp release registers no logging/setLevel handler")
+
+    async def go() -> None:
+        async with Client(server) as client:
+            with pytest.raises(McpError, match="not permitted"):
+                await client.set_logging_level("debug")
+
+    anyio.run(go)
+    (line,) = [e for e in read_audit(audit_path) if e["tool"] == "logging/setLevel"]
+    assert line["detail"] == "policy_denied"
+
+
+@pytest.mark.parametrize("setting", ["CONTEXTBRIDGE_MCP_TOOL_TIMEOUT_SECONDS", "UGA_MCP_TOOL_TIMEOUT_SECONDS"])
+def test_slow_calls_time_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, setting: str) -> None:
+    """The per-call timeout answers the client; its pre-rename setting name still works."""
+
+    def slow(self: Filesystem, *args: Any, **kwargs: Any) -> Any:
+        time.sleep(2)
+        return {}
+
+    monkeypatch.setattr(Filesystem, "read_file", slow)
+    monkeypatch.setenv(setting, "0.3")
+    audit_path = tmp_path / "audit.jsonl"
+    server = _server(tmp_path, audit_path=audit_path)
+
+    started = time.monotonic()
+    with pytest.raises(ToolError, match="timed out"):
+        _call(server, "read_file", {"path": str(tmp_path / "ro" / "notes.txt")})
+    assert time.monotonic() - started < 1.5
+    (line,) = [e for e in read_audit(audit_path) if e["tool"] == "read_file"]
+    assert line["detail"] == "timeout"
+
+
+def test_installed_metadata_matches_package_version() -> None:
+    try:
+        installed = importlib.metadata.version("contextbridge")
+    except importlib.metadata.PackageNotFoundError:
+        pytest.skip("contextbridge is not installed; run pip install -e .")
+    assert installed == contextbridge.__version__
+
+
 def _write_config(tmp_path: Path, port: int, roots: str, serve_extra: str = "") -> Path:
     config = tmp_path / "fs.yaml"
     config.write_text(
@@ -292,17 +402,11 @@ def _run_main(monkeypatch: pytest.MonkeyPatch, config: Path) -> None:
     fs_gateway.main()
 
 
-def test_main_refuses_shared_or_missing_token(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_main_refuses_a_missing_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     (tmp_path / "data").mkdir()
     config = _write_config(tmp_path, 1, "    - path: data\n")
 
     with pytest.raises(SystemExit, match="CONTEXTBRIDGE_FS_AUTH_TOKEN must be set"):
-        _run_main(monkeypatch, config)
-    monkeypatch.setenv("CONTEXTBRIDGE_FS_AUTH_TOKEN", TOKEN)
-    monkeypatch.setenv("MCP_AUTH_TOKEN", TOKEN)
-    with pytest.raises(SystemExit, match="must differ from MCP_AUTH_TOKEN"):
         _run_main(monkeypatch, config)
 
 
@@ -351,7 +455,7 @@ def fs_gateway_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[s
     env = {
         key: value
         for key, value in os.environ.items()
-        if not key.startswith(("UGA_", "CONTEXTBRIDGE_")) and key != "MCP_AUTH_TOKEN"
+        if not key.startswith(("UGA_", "CONTEXTBRIDGE_"))
     }
     env["CONTEXTBRIDGE_FS_AUTH_TOKEN"] = TOKEN
     env["PYTHONPATH"] = str(REPO / "src")
