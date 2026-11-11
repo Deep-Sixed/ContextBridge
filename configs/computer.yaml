@@ -14,16 +14,17 @@ auth:
 
 agents:
   # Remote agents (other machines) dial in here. Off until you set it up:
-  #   contextbridge-admin --config configs/computer.yaml tls-init --hostname friday --ip <this host's LAN/Tailscale IP>
+  #   contextbridge-admin --config configs/computer.yaml tls-init --hostname friday --ip <this host's Tailscale IP>
   #   contextbridge-admin --config configs/computer.yaml pair thanatos
   enabled: false
-  host: 127.0.0.1          # a specific loopback, LAN, or Tailscale IP; never 0.0.0.0 or a public address
+  host: 127.0.0.1          # loopback, or this host's Tailscale IP for remote agents; never 0.0.0.0 or a public address
   port: 8792
   tls_cert: ../state/tls/gateway.crt   # required unless host is loopback
   tls_key: ../state/tls/gateway.key    # hidden from every file tool
-  # Mandatory tailnet admission. Use stable peer IDs from gateway-local
+  # Mandatory tailnet admission when host is not loopback: the gateway refuses to start
+  # with an empty list, and refuses agents that are not one of these Tailscale nodes (so a
+  # plain LAN address cannot be used). Use stable peer IDs from gateway-local
   # `tailscale status --json` (Peer[*].ID), not a hostname or IP range.
-  # No remote agents start until this is explicitly configured.
   tailnet_node_ids: []
   registry: ../state/devices.json      # enrolled devices; hidden from every file tool
   heartbeat_seconds: 15    # a device is dropped after 3 missed heartbeats
@@ -32,7 +33,9 @@ agents:
 remote:
   # ChatGPT, Claude, and other remote MCP clients connect here with OAuth. Off until you set it up:
   #   contextbridge-admin --config configs/computer.yaml owner-init    # passphrase + authenticator app
-  #   Publish only via an authenticated private-tailnet endpoint; no public Funnel by default
+  #   tailscale funnel --bg 8793     # only once enabled is true: this makes the port public,
+  #                                  # which Claude and ChatGPT need (they are not on your tailnet)
+  # Keep Funnel off while enabled is false.
   # Then add <public_url>/mcp as a custom connector. Each client is approved on a consent page
   # (passphrase + authenticator code) where you pick its permissions and devices.
   enabled: false
