@@ -9,7 +9,7 @@ Session::
 
     agent   → {"type": "hello", "version", "device_id"}
     gateway → {"type": "challenge", "nonce", "gateway_id"}
-    agent   → {"type": "auth", "signature", "capabilities": {"tools", "policy", "info"}}
+    agent   → {"type": "auth", "signature", "capabilities": {"tools", "policy", "info", "federated"}}
     gateway → {"type": "welcome", "heartbeat_seconds"}
 
     gateway → {"type": "call", "seq", "request_id", "tool", "args"}
@@ -18,6 +18,10 @@ Session::
     agent   → {"type": "heartbeat"}
     agent   → {"type": "event", "event": "exited", ...}
     gateway → {"type": "error", "code", "message"}   (then closes)
+
+``federated`` lists tools from MCP servers the agent's own config runs
+(:class:`~contextbridge.computer.federation.FederatedTool` in wire form); a
+``call`` names one exactly as listed.
 
 The signature is Ed25519 over :func:`auth_payload`, binding the device, this
 gateway, and a fresh 32-byte nonce. ``seq`` increases strictly per connection

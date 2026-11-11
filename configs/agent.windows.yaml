@@ -46,3 +46,13 @@ desktop:
 # Phase 3: inventory only; recording and playback are not supported.
 media:
   discover: false
+
+# MCP servers this machine runs and offers through the gateway (see "MCP servers on a device" in the README).
+# Only this file can add one; each tool needs `scope` in both the caller's token and this device's grant.
+# mcp_servers:
+#   desktop:
+#     command: agent-desktop
+#     args: [mcp]
+#     scope: computer:execute
+#     tool_scopes:
+#       desktop_snapshot: desktop:observe

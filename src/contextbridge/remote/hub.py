@@ -26,7 +26,8 @@ from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
 from ..computer.audit import AuditError, CallAudit, ComputerAuditLog
-from ..computer.dispatch import ENGINE_TOOLS
+from ..computer.dispatch import ENGINE_TOOLS, RESERVED_TOOL_NAMES
+from ..computer.federation import FederatedTool, tools_from_wire
 from ..computer.policy import PolicyViolation
 from .protocol import (
     HANDSHAKE_TIMEOUT_SECONDS,
@@ -87,6 +88,7 @@ class AgentConnection:
     tools: frozenset[str]
     info: dict[str, str]
     policy: dict[str, Any]
+    federated: dict[str, FederatedTool] = field(default_factory=dict)
     connected_at: float = field(default_factory=time.time)
     last_seen: float = field(default_factory=time.monotonic)
     pending: dict[str, _Pending] = field(default_factory=dict)
@@ -178,6 +180,14 @@ class AgentHub:
                 tools |= conn.tools
         return frozenset(tools)
 
+    def online_federated(self, devices: frozenset[str] | None = None) -> dict[str, dict[str, FederatedTool]]:
+        """Federated tools per connected device (only devices in ``devices``, unless None)."""
+        return {
+            conn.device.name: conn.federated
+            for conn in self._connections.values()
+            if conn.federated and (devices is None or conn.device.name in devices)
+        }
+
     def describe(self) -> list[dict[str, Any]]:
         rows = []
         for device in sorted(self.registry.devices(), key=lambda d: d.name):
@@ -197,6 +207,8 @@ class AgentHub:
             if conn is not None:
                 row["connected_since"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(conn.connected_at))
                 row["tools"] = sorted(conn.tools)
+                if conn.federated:
+                    row["mcp_tools"] = sorted(conn.federated)
                 row["info"] = conn.info
                 row["policy"] = conn.policy
             rows.append(row)
@@ -208,7 +220,7 @@ class AgentHub:
         conn = self.connection(name)
         if conn is None:
             raise DeviceUnavailable(f"Device '{name}' is offline.")
-        if tool not in conn.tools:
+        if tool not in conn.tools and tool not in conn.federated:
             raise RemoteDenied(f"Tool '{tool}' is not enabled on device '{name}'.")
         request_id = call.request_id if call is not None else uuid.uuid4().hex[:16]
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
@@ -334,6 +346,7 @@ class AgentHub:
             tools=frozenset(t for t in reported if t in ENGINE_TOOLS),
             info=_clean_info(caps.get("info")),
             policy=caps.get("policy") if isinstance(caps.get("policy"), dict) else {},
+            federated=tools_from_wire(caps.get("federated"), reserved=RESERVED_TOOL_NAMES),
         )
         # One admission per device at a time, so two newcomers cannot both get past a live connection.
         async with self._admitting.setdefault(device.device_id, asyncio.Lock()):
@@ -359,6 +372,7 @@ class AgentHub:
             device_id=device.device_id,
             peer=peer,
             tools=sorted(conn.tools),
+            mcp_tools=sorted(conn.federated) or None,
             info=conn.info,
         )
         return conn

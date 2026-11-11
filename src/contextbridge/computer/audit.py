@@ -86,6 +86,12 @@ def summarize_args(arguments: dict[str, Any] | None) -> dict[str, Any]:
     return fields
 
 
+def digest_args(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Size and hash of a whole argument object (for tools whose arguments ContextBridge does not know)."""
+    data = json.dumps(arguments, default=str, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {"args_bytes": len(data), "args_sha256": hashlib.sha256(data).hexdigest()[:16]}
+
+
 def outcome_fields(result: Any) -> dict[str, Any]:
     if not isinstance(result, dict):
         return {}

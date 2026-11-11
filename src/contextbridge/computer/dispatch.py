@@ -15,7 +15,9 @@ from typing import Any
 from pydantic import ValidationError, validate_call
 
 from . import commands, desktop, documents, files, media, trash
+from .audit import digest_args, mark_started
 from .commands import ExitCallback, SessionManager
+from .federation import MAX_ARGUMENT_BYTES, Federation, FederatedTool, McpServerConfig
 from .policy import ComputerPolicy, PolicyViolation
 from .system import system_info
 
@@ -40,6 +42,8 @@ ENGINE_TOOLS = (
     | DOCUMENT_READ_TOOLS | DOCUMENT_WRITE_TOOLS
     | {PROCESS_LIST_TOOL, PROCESS_KILL_TOOL, DELETE_TOOL, TRASH_READ_TOOL, TRASH_RESTORE_TOOL}
 )
+# Names a federated tool may never take: every built-in tool, including the gateway's own.
+RESERVED_TOOL_NAMES = ENGINE_TOOLS | {"list_devices"}
 _DOCUMENT_LIBRARIES = ("pypdf", "docx", "openpyxl", "reportlab")
 
 def documents_available() -> bool:
@@ -47,14 +51,24 @@ def documents_available() -> bool:
 
 
 
+def build_federation(servers: tuple[McpServerConfig, ...], policy: ComputerPolicy) -> Federation | None:
+    """A :class:`Federation` for this machine's ``mcp_servers`` (not yet started), or None."""
+    if not servers:
+        return None
+    return Federation(servers, env=policy.child_env(), reserved=RESERVED_TOOL_NAMES)
+
+
 class InvalidArguments(ValueError):
     """Raised when a tool call's arguments do not match the tool's signature."""
 
 
 def call_succeeded(tool: str, result: Any) -> bool:
-    """Whether a call that returned normally achieved its goal (commands: exit 0, no timeout)."""
+    """Whether a call that returned normally achieved its goal (commands: exit 0, no timeout;
+    federated tools: no error result)."""
     if tool == "run_command" and isinstance(result, dict):
         return result.get("exit_code") == 0 and not result.get("timed_out")
+    if tool not in ENGINE_TOOLS and isinstance(result, dict):
+        return result.get("is_error") is not True
     return True
 
 
@@ -86,15 +100,32 @@ def available_tools(policy: ComputerPolicy) -> frozenset[str]:
 
 
 class Engine:
-    """Executes tool calls on this machine under ``policy``."""
+    """Executes tool calls on this machine under ``policy``.
 
-    def __init__(self, policy: ComputerPolicy, *, on_exit: ExitCallback | None = None) -> None:
+    ``federation`` adds the tools of MCP servers this machine's config runs (see
+    :mod:`.federation`); they are listed in :attr:`federated`, not :attr:`tools`.
+    """
+
+    def __init__(
+        self,
+        policy: ComputerPolicy,
+        *,
+        on_exit: ExitCallback | None = None,
+        federation: Federation | None = None,
+    ) -> None:
         self.policy = policy
         self.tools = available_tools(policy)
         self.sessions = SessionManager(policy, on_exit=on_exit) if policy.commands_enabled else None
+        self.federation = federation
+
+    @property
+    def federated(self) -> dict[str, FederatedTool]:
+        return self.federation.tools if self.federation is not None else {}
 
     def execute(self, tool: str, args: dict[str, Any] | None) -> dict[str, Any]:
         if tool not in self.tools:
+            if self.federation is not None and tool in self.federation.tools:
+                return self._execute_federated(tool, args)
             raise PolicyViolation(f"Tool '{tool}' is not enabled on this computer.")
         handler = _HANDLERS[tool]
         try:
@@ -103,9 +134,22 @@ class Engine:
             problems = "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors())
             raise InvalidArguments(f"Invalid arguments for '{tool}': {problems}") from None
 
+    def _execute_federated(self, tool: str, args: dict[str, Any] | None) -> dict[str, Any]:
+        assert self.federation is not None
+        arguments = args or {}
+        if not isinstance(arguments, dict):
+            raise InvalidArguments(f"Invalid arguments for '{tool}': expected an object")
+        digest = digest_args(arguments)
+        if digest["args_bytes"] > MAX_ARGUMENT_BYTES:
+            raise InvalidArguments(f"Arguments for '{tool}' are larger than {MAX_ARGUMENT_BYTES // 1024} KB.")
+        mark_started(mcp_server=self.federation.server_for(tool), **digest)
+        return self.federation.call(tool, arguments)
+
     def shutdown(self) -> None:
         if self.sessions is not None:
             self.sessions.shutdown()
+        if self.federation is not None:
+            self.federation.close()
 
 
 _HANDLERS: dict[str, Callable[..., dict[str, Any]]] = {}

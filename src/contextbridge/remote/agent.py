@@ -47,7 +47,8 @@ from ..computer.audit import (
     summarize_args,
     unbind_call,
 )
-from ..computer.dispatch import Engine, call_succeeded
+from ..computer.dispatch import Engine, build_federation, call_succeeded
+from ..computer.federation import McpServerConfig, load_mcp_servers
 from ..computer.policy import ComputerPolicy, PolicyError, PolicyViolation, load_policy
 from ..hardening import protect_process_secrets
 from ..net import is_loopback
@@ -134,6 +135,7 @@ class AgentConfig:
     audit_path: Path
     policy: ComputerPolicy
     max_concurrent_calls: int = 8
+    mcp_servers: tuple[McpServerConfig, ...] = ()
 
     @property
     def tls(self) -> bool:
@@ -177,7 +179,8 @@ def load_agent_config(path: str | Path) -> AgentConfig:
     max_calls = cfg.get("max_concurrent_calls", 8)
     if not isinstance(max_calls, int) or max_calls < 1:
         raise PolicyError("max_concurrent_calls must be a positive integer")
-    return AgentConfig(config_path, name, url, fingerprint, ca_file, identity, audit, policy, max_calls)
+    servers = load_mcp_servers(cfg, base=base)
+    return AgentConfig(config_path, name, url, fingerprint, ca_file, identity, audit, policy, max_calls, servers)
 
 
 # ------------------------------------------------------------------- identity
@@ -307,7 +310,8 @@ class Agent:
         self.config = config
         self.identity = identity
         self.audit = audit
-        self.engine = Engine(config.policy, on_exit=self._on_exit)
+        federation = build_federation(config.mcp_servers, config.policy)
+        self.engine = Engine(config.policy, on_exit=self._on_exit, federation=federation)
         self.connected = asyncio.Event()
         self._ws: ClientConnection | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -333,6 +337,13 @@ class Agent:
         self._loop = asyncio.get_running_loop()
         self._backoff = 1.0
         try:
+            if self.engine.federation is not None:
+                await asyncio.to_thread(self.engine.federation.start)
+                self._log(
+                    "mcp_servers_started",
+                    servers=self.engine.federation.describe(),
+                    tools=sorted(self.engine.federated),
+                )
             while not self._stopping.is_set():
                 try:
                     await self._session()
@@ -365,6 +376,7 @@ class Agent:
                 "tools": sorted(self.engine.tools),
                 "policy": self.config.policy.summary(),
                 "info": _host_info(),
+                "federated": [tool.to_wire() for tool in self.engine.federated.values()],
             }
             await ws.send(encode({"type": "auth", "signature": signature, "capabilities": capabilities}))
             welcome = await _expect(ws, "welcome")
@@ -377,7 +389,12 @@ class Agent:
             # However the session ends, its loss is a fresh outage, not more of an earlier one.
             self._backoff = 1.0
             self.connected.set()
-            self._log("gateway_connected", gateway=self.config.gateway_url, tools=sorted(self.engine.tools))
+            self._log(
+                "gateway_connected",
+                gateway=self.config.gateway_url,
+                tools=sorted(self.engine.tools),
+                mcp_tools=sorted(self.engine.federated) or None,
+            )
             beat = asyncio.create_task(self._heartbeats(ws, heartbeat))
             try:
                 async for raw in ws:

@@ -37,8 +37,8 @@ posix_only = pytest.mark.skipif(os.name == "nt", reason="uses POSIX utilities")
 def allow_scopes(*scopes: str):
     """Authorizer standing in for a bearer token that carries ``scopes``."""
 
-    def authorize(tool: str) -> str:
-        if TOOL_SCOPES.get(tool) not in scopes:
+    def authorize(tool: str, scope: str | None = None) -> str:
+        if (scope or TOOL_SCOPES.get(tool)) not in scopes:
             raise AuthorizationError(f"Token is not authorized for '{tool}'.")
         return "test-client"
 

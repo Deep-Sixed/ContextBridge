@@ -27,9 +27,9 @@ from .store import OAuthStore
 def remote_authorizer(settings: RemoteSettings) -> Authorizer:
     """Token scope check, capped by the scopes the config allows remote clients today."""
 
-    def authorize(tool: str) -> str:
-        client = token_authorizer(tool)
-        scope = TOOL_SCOPES[tool]
+    def authorize(tool: str, scope: str | None = None) -> str:
+        client = token_authorizer(tool, scope)
+        scope = scope or TOOL_SCOPES[tool]
         if scope not in settings.allow_scopes:
             raise AuthorizationError(f"Remote clients may not use '{scope}' (remote.allow_scopes).")
         return client
