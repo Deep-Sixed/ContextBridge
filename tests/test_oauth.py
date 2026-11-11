@@ -539,7 +539,7 @@ def test_custom_cloudflare_hostname_uses_configured_public_origin(policy, tmp_pa
             protected = await http.get("/.well-known/oauth-protected-resource/mcp", headers=headers)
             authorization = await http.get("/.well-known/oauth-authorization-server", headers=headers)
             unauthorized = await http.get("/mcp", headers=headers)
-            stale = await http.get("/mcp", headers={"host": "nexusagi.tail9cb382.ts.net"})
+            stale = await http.get("/mcp", headers={"host": "friday.example.ts.net"})  # the previous public name
             return protected, authorization, unauthorized, stale
 
     protected, authorization, unauthorized, stale = anyio.run(scenario)

@@ -338,7 +338,13 @@ ChatGPT and Claude reach MCP servers from their own clouds, so they need a publi
    Any TLS-terminating tunnel or reverse proxy works the same way. The gateway won't start remote mode until the owner credentials exist.
 
    Funnel puts port 8793, including the consent page, on the public internet. That is what Claude and ChatGPT need: they connect from their own clouds, so a tailnet-only address (`tailscale serve`) does not reach them. Keep Funnel off whenever `remote.enabled` is false, and turn it off again if you stop using remote clients. The health check in `docs/local-health-check.md` warns while Funnel is on so that it is never on by accident.
-#### Cloudflare Tunnel with a custom MCP domain
+4. **Add the connector.** In Claude or ChatGPT, add a custom connector with the URL `<public_url>/mcp`. The client registers itself and opens a ContextBridge consent page in your browser.
+5. **Approve on the consent page.**
+   - **Permissions.** Only `computer:read` starts ticked; anything more is a deliberate choice.
+   - **Devices.** Tick which devices this client may use.
+   - **Confirm.** Enter your passphrase and the current authenticator code.
+
+### Cloudflare Tunnel with a custom domain
 
 A Cloudflare Tunnel can publish the OAuth listener without opening an inbound port. For a host such as `mcp.example.com`:
 
@@ -351,13 +357,7 @@ A Cloudflare Tunnel can publish the OAuth listener without opening an inbound po
    - `curl -i https://mcp.example.com/.well-known/oauth-authorization-server` → **200**; `issuer`, `authorization_endpoint`, `token_endpoint`, and `registration_endpoint` use the new origin.
 5. Point the ChatGPT/Claude connector to `https://mcp.example.com/mcp` and complete OAuth consent. Keep the gateway's built-in authentication enabled. A separate Cloudflare Access browser challenge can interrupt MCP OAuth, so test any additional access policy before enforcing it.
 
-**Hostname migration / 421 troubleshooting:** compare the Host header sent by the tunnel with `remote.public_url`. To diagnose locally without weakening the guard, try `curl -i -H 'Host: mcp.example.com' http://127.0.0.1:8793/mcp`: **401** means the new name is accepted, **421** means the running gateway still rejects it. Back up the deployment config before changing it and restart the gateway to reload the settings. A healthy tunnel, DNS record, or wildcard TLS certificate alone does not fix a gateway Host mismatch. Token grants and client registrations should be reviewed after an origin change because OAuth resource identifiers are tied to the public URL.
-
-4. **Add the connector.** In Claude or ChatGPT, add a custom connector with the URL `<public_url>/mcp`. The client registers itself and opens a ContextBridge consent page in your browser.
-5. **Approve on the consent page.**
-   - **Permissions.** Only `computer:read` starts ticked; anything more is a deliberate choice.
-   - **Devices.** Tick which devices this client may use.
-   - **Confirm.** Enter your passphrase and the current authenticator code.
+**Hostname migration / 421 troubleshooting:** compare the Host header sent by the tunnel with `remote.public_url`. To diagnose locally without weakening the guard, try `curl -i -H 'Host: mcp.example.com' http://127.0.0.1:8793/mcp`: **401** means the new name is accepted, **421** means the running gateway still rejects it. Back up the deployment config before changing it and restart the gateway to reload the settings. A healthy tunnel, DNS record, or wildcard TLS certificate alone does not fix a gateway Host mismatch. Changing `public_url` changes the MCP resource that access tokens are bound to, so tokens issued for the old name stop working: reconnect each ChatGPT or Claude connector after the change, and remove its old registration with `contextbridge-admin oauth-revoke`.
 
 ### Managing clients
 
