@@ -159,7 +159,7 @@ EOF
   fi
   FUNNEL="$(tailscale funnel status 2>/dev/null || true)"
   if grep -qi "funnel on" <<<"$FUNNEL"; then
-    line WARN "tailscale funnel" "Funnel is ON (public internet); confirm this is intended (see PR #31)"
+    line WARN "tailscale funnel" "Funnel is ON (public internet); remote clients use Cloudflare Tunnel, so turn it off: tailscale funnel reset"
   else
     line PASS "tailscale funnel" "no public Funnel"
   fi
