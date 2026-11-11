@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from conftest import record, write_jsonl
-from uga.adapter import DatacoreRecordError, DatacoreStore
+from contextbridge.knowledge.adapter import DatacoreRecordError, DatacoreStore
 
 
 def _store(tmp_path: Path, *records: dict) -> DatacoreStore:

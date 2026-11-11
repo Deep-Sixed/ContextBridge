@@ -1,6 +1,7 @@
-"""Unidirectional Gateway Appliance (UGA) — read-only Datacore MCP route.
+"""ContextBridge knowledge route: read-only ``search`` and ``fetch`` over approved records.
 
-The separate filesystem route lives in ``uga.fs`` and ``uga.fs_gateway``.
+The filesystem route lives in ``contextbridge.filesystem``, the computer route in
+``contextbridge.computer``.
 """
 
 # One version for the whole distribution: pyproject.toml reads contextbridge.__version__,
@@ -13,14 +14,14 @@ from .adapter import (
     DatacoreRecordNotFound,
     DatacoreStore,
 )
-from .policy import UGA_ALLOWED_TOOLS, UGA_FORBIDDEN_TOOL_EXAMPLES
+from .policy import KNOWLEDGE_ALLOWED_TOOLS, KNOWLEDGE_FORBIDDEN_TOOL_EXAMPLES
 
 __all__ = [
     "DatacoreFetchRecord",
     "DatacoreRecordError",
     "DatacoreRecordNotFound",
     "DatacoreStore",
-    "UGA_ALLOWED_TOOLS",
-    "UGA_FORBIDDEN_TOOL_EXAMPLES",
+    "KNOWLEDGE_ALLOWED_TOOLS",
+    "KNOWLEDGE_FORBIDDEN_TOOL_EXAMPLES",
     "__version__",
 ]

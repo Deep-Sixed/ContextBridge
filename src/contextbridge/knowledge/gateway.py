@@ -1,4 +1,4 @@
-"""Unidirectional Gateway Appliance MCP route.
+"""ContextBridge knowledge route.
 
 Exposes exactly two ChatGPT-compatible tools — ``search`` and ``fetch`` — backed by
 the read-only Datacore JSONL adapter. Default-deny policy rejects every other tool
@@ -40,10 +40,10 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from contextbridge.hardening import protect_process_secrets
 
-from . import __version__
+from .. import __version__
 from .adapter import DatacoreRecordNotFound, DatacoreStore
-from .audit import UgaAuditLog, clip
-from .policy import UGA_ALLOWED_TOOLS
+from .audit import GatewayAuditLog, clip
+from .policy import KNOWLEDGE_ALLOWED_TOOLS
 
 DEFAULT_METADATA_TIMEOUT_SECONDS = 5.0
 DEFAULT_TOOL_TIMEOUT_SECONDS = 10.0
@@ -61,7 +61,7 @@ SERVER_INSTRUCTIONS = (
     "it with truncated=true and the full length in text_length."
 )
 
-# Requests fastmcp routes through middleware. Of these, UgaAllowlistMiddleware runs
+# Requests fastmcp routes through middleware. Of these, AllowlistMiddleware runs
 # initialize, tools/list and allowlisted tools/call, answers the resource and prompt
 # listings with nothing, and rejects the rest.
 _MIDDLEWARE_ROUTED_REQUESTS = (
@@ -77,16 +77,28 @@ _EMPTY_LIST_METHODS = frozenset({"resources/list", "resources/templates/list", "
 
 # The request's audit fields. The middleware sets it, the tools add what they know
 # (query, record_id, result_count), and the middleware writes it as one line.
-_audit_fields: ContextVar[dict[str, Any] | None] = ContextVar("uga_audit_fields", default=None)
+_audit_fields: ContextVar[dict[str, Any] | None] = ContextVar("contextbridge_audit_fields", default=None)
 # True while the MCP SDK refreshes its tool cache during a tools/call. That
 # tools/list comes from the SDK, not the client, so it is not audited.
-_tool_cache_refresh: ContextVar[bool] = ContextVar("uga_tool_cache_refresh", default=False)
+_tool_cache_refresh: ContextVar[bool] = ContextVar("contextbridge_tool_cache_refresh", default=False)
 # A random key per MCP session; JSON-RPC ids are only unique within a session.
 _session_keys: weakref.WeakKeyDictionary[Any, str] = weakref.WeakKeyDictionary()
 
 
+# Settings were once named UGA_*; a deployment that still sets those keeps working.
+_LEGACY_PREFIX = "UGA_"
+
+
+def _env(name: str) -> str | None:
+    """The value of a ``CONTEXTBRIDGE_*`` setting, falling back to its legacy name."""
+    value = os.environ.get(name)
+    if not value and name.startswith("CONTEXTBRIDGE_"):
+        value = os.environ.get(_LEGACY_PREFIX + name.removeprefix("CONTEXTBRIDGE_"))
+    return value
+
+
 def _env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name)
+    raw = _env(name)
     if not raw:
         return default
     try:
@@ -97,7 +109,7 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
+    raw = _env(name)
     if not raw:
         return default
     try:
@@ -108,19 +120,19 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _metadata_timeout_seconds() -> float:
-    return _env_float("UGA_MCP_METADATA_TIMEOUT_SECONDS", DEFAULT_METADATA_TIMEOUT_SECONDS)
+    return _env_float("CONTEXTBRIDGE_MCP_METADATA_TIMEOUT_SECONDS", DEFAULT_METADATA_TIMEOUT_SECONDS)
 
 
 def _tool_timeout_seconds() -> float:
-    return _env_float("UGA_MCP_TOOL_TIMEOUT_SECONDS", DEFAULT_TOOL_TIMEOUT_SECONDS)
+    return _env_float("CONTEXTBRIDGE_MCP_TOOL_TIMEOUT_SECONDS", DEFAULT_TOOL_TIMEOUT_SECONDS)
 
 
 def _search_limit() -> int:
-    return _env_int("UGA_MCP_SEARCH_LIMIT", DEFAULT_SEARCH_LIMIT)
+    return _env_int("CONTEXTBRIDGE_MCP_SEARCH_LIMIT", DEFAULT_SEARCH_LIMIT)
 
 
 def _fetch_max_chars() -> int:
-    return _env_int("UGA_MCP_FETCH_MAX_CHARS", DEFAULT_FETCH_MAX_CHARS)
+    return _env_int("CONTEXTBRIDGE_MCP_FETCH_MAX_CHARS", DEFAULT_FETCH_MAX_CHARS)
 
 
 def _cap_text(payload: dict[str, Any], max_chars: int) -> dict[str, Any]:
@@ -184,12 +196,12 @@ def _require_token(token: str | None, *, name: str = "MCP_AUTH_TOKEN") -> str:
     return token
 
 
-def _audit_from_env() -> UgaAuditLog:
-    log_query_text = os.environ.get("UGA_AUDIT_LOG_QUERY_TEXT", "").lower() in {"1", "true", "yes"}
-    hash_key = os.environ.get("UGA_AUDIT_HASH_KEY", "").encode("utf-8") or None
-    return UgaAuditLog(
-        os.environ.get("UGA_AUDIT_LOG"),
-        route="uga",
+def _audit_from_env() -> GatewayAuditLog:
+    log_query_text = (_env("CONTEXTBRIDGE_AUDIT_LOG_QUERY_TEXT") or "").lower() in {"1", "true", "yes"}
+    hash_key = (_env("CONTEXTBRIDGE_AUDIT_HASH_KEY") or "").encode("utf-8") or None
+    return GatewayAuditLog(
+        _env("CONTEXTBRIDGE_AUDIT_LOG"),
+        route="knowledge",
         log_query_text=log_query_text,
         hash_key=hash_key,
     )
@@ -213,13 +225,13 @@ class _BearerTokenVerifier(TokenVerifier):
         presented = hashlib.sha256(token.encode("utf-8")).digest()
         if not hmac.compare_digest(presented, self._digest):
             return None
-        return AccessToken(token=token, client_id="nexus-uga", scopes=[])
+        return AccessToken(token=token, client_id="contextbridge-knowledge", scopes=[])
 
 
 class AuthFailureAuditMiddleware:
     """Audit HTTP requests rejected by auth; these never reach the MCP middleware."""
 
-    def __init__(self, app: ASGIApp, audit: UgaAuditLog) -> None:
+    def __init__(self, app: ASGIApp, audit: GatewayAuditLog) -> None:
         self.app = app
         self._audit = audit
 
@@ -248,14 +260,14 @@ class AuthFailureAuditMiddleware:
         await self.app(scope, receive, audited_send)
 
 
-class _UgaServer(FastMCP):
+class _AuditedServer(FastMCP):
     """FastMCP whose HTTP app always audits requests rejected by auth.
 
     ``run()`` builds its app through ``http_app`` too, so every way of serving the
     gateway over HTTP gets the audit middleware.
     """
 
-    uga_audit: UgaAuditLog
+    audit_log: GatewayAuditLog
 
     def http_app(  # type: ignore[override]
         self,
@@ -263,7 +275,7 @@ class _UgaServer(FastMCP):
         middleware: list[AsgiMiddleware] | None = None,
         **kwargs: Any,
     ) -> Starlette:
-        audit_middleware = AsgiMiddleware(AuthFailureAuditMiddleware, audit=self.uga_audit)
+        audit_middleware = AsgiMiddleware(AuthFailureAuditMiddleware, audit=self.audit_log)
         return super().http_app(path, [audit_middleware, *(middleware or [])], **kwargs)
 
 
@@ -284,7 +296,7 @@ def unauthenticated_response(request: Request) -> JSONResponse | None:
     )
 
 
-def _not_permitted(method: str, route_name: str = "UGA") -> McpError:
+def _not_permitted(method: str, route_name: str = "knowledge") -> McpError:
     return McpError(
         ErrorData(
             code=mcp.types.METHOD_NOT_FOUND,
@@ -293,22 +305,22 @@ def _not_permitted(method: str, route_name: str = "UGA") -> McpError:
     )
 
 
-class UgaAllowlistMiddleware(Middleware):
+class AllowlistMiddleware(Middleware):
     """Default-deny policy and one audit line for every request fastmcp routes here.
 
     initialize, tools/list (filtered to the allowlist) and allowlisted tools/call
     run. resources/list, resources/templates/list and prompts/list answer empty;
-    everything else is rejected. The defaults are the UGA route's; the filesystem
+    everything else is rejected. The defaults are the knowledge route's; the filesystem
     route passes its own allowlist and names.
     """
 
     def __init__(
         self,
-        audit: UgaAuditLog,
+        audit: GatewayAuditLog,
         *,
-        allowed_tools: frozenset[str] = UGA_ALLOWED_TOOLS,
-        route_name: str = "UGA",
-        service_name: str = "Nexus Datacore",
+        allowed_tools: frozenset[str] = KNOWLEDGE_ALLOWED_TOOLS,
+        route_name: str = "knowledge",
+        service_name: str = "ContextBridge knowledge",
     ) -> None:
         self._audit = audit
         self._allowed_tools = allowed_tools
@@ -380,7 +392,7 @@ LowLevelHandler = Callable[[Any], Awaitable[Any]]
 
 
 def _guard_low_level_handlers(
-    server: FastMCP, audit: UgaAuditLog, route_name: str = "UGA"
+    server: FastMCP, audit: GatewayAuditLog, route_name: str = "knowledge"
 ) -> None:
     """Apply the policy to the MCP requests fastmcp's middleware never sees.
 
@@ -413,7 +425,7 @@ def _flag_tool_cache_refresh(handler: LowLevelHandler) -> LowLevelHandler:
     return list_tools
 
 
-def _audited_denial(audit: UgaAuditLog, route_name: str) -> LowLevelHandler:
+def _audited_denial(audit: GatewayAuditLog, route_name: str) -> LowLevelHandler:
     async def deny(request: Any) -> Any:
         audit.record(
             tool=request.method,
@@ -437,17 +449,17 @@ _READ_ONLY = ToolAnnotations(
 )
 
 
-def create_uga_server(
+def create_knowledge_server(
     *,
-    name: str = "Nexus UGA",
+    name: str = "ContextBridge Knowledge",
     store: DatacoreStore | None = None,
     token: str | None = None,
-    audit: UgaAuditLog | None = None,
+    audit: GatewayAuditLog | None = None,
 ) -> FastMCP:
     """Build the gateway with bearer auth always attached.
 
-    ``store``, ``token`` and ``audit`` default to ``UGA_DATACORE_JSONL``,
-    ``MCP_AUTH_TOKEN`` and ``UGA_AUDIT_LOG``; a missing store or token raises.
+    ``store``, ``token`` and ``audit`` default to ``CONTEXTBRIDGE_DATACORE_JSONL``,
+    ``MCP_AUTH_TOKEN`` and ``CONTEXTBRIDGE_AUDIT_LOG``; a missing store or token raises.
     """
     verifier = _BearerTokenVerifier(
         _require_token(token if token is not None else os.environ.get("MCP_AUTH_TOKEN"))
@@ -456,14 +468,14 @@ def create_uga_server(
         store = _store_from_env()
     if audit is None:
         audit = _audit_from_env()
-    server = _UgaServer(
+    server = _AuditedServer(
         name=name,
         version=__version__,
         instructions=SERVER_INSTRUCTIONS,
         auth=verifier,
         mask_error_details=True,
     )
-    server.uga_audit = audit
+    server.audit_log = audit
 
     @server.tool(name="search", annotations=_READ_ONLY)
     async def search(query: str) -> dict[str, Any]:
@@ -490,7 +502,7 @@ def create_uga_server(
             _add_audit_fields(detail="not_found")
             raise ToolError(f"Record not found: {clip(id)}") from None
 
-    server.add_middleware(UgaAllowlistMiddleware(audit))
+    server.add_middleware(AllowlistMiddleware(audit))
     _guard_low_level_handlers(server, audit)
 
     @server.custom_route("/", methods=["GET"])
@@ -501,7 +513,7 @@ def create_uga_server(
             {
                 "service": name,
                 "mcp_path": "/mcp",
-                "tools": sorted(UGA_ALLOWED_TOOLS),
+                "tools": sorted(KNOWLEDGE_ALLOWED_TOOLS),
             }
         )
 
@@ -537,11 +549,11 @@ def _config_relative(value: str, config_path: Path) -> Path:
 
 
 def _datacore_path(cfg: dict[str, Any] | None = None, *, config_path: Path | None = None) -> Path:
-    """Resolve the JSONL export: ``UGA_DATACORE_JSONL`` wins over ``datacore_jsonl``.
+    """Resolve the JSONL export: ``CONTEXTBRIDGE_DATACORE_JSONL`` wins over ``datacore_jsonl``.
 
     A relative ``datacore_jsonl`` is resolved against the config file's directory.
     """
-    env_path = os.environ.get("UGA_DATACORE_JSONL")
+    env_path = _env("CONTEXTBRIDGE_DATACORE_JSONL")
     configured = (cfg or {}).get("datacore_jsonl")
     if env_path:
         path = Path(env_path).expanduser()
@@ -549,7 +561,7 @@ def _datacore_path(cfg: dict[str, Any] | None = None, *, config_path: Path | Non
         path = _config_relative(configured, config_path)
     else:
         raise ValueError(
-            "No datacore export configured: set UGA_DATACORE_JSONL or datacore_jsonl."
+            "No datacore export configured: set CONTEXTBRIDGE_DATACORE_JSONL or datacore_jsonl."
         )
     if not path.is_file():
         raise ValueError(f"datacore JSONL export not found: {path}")
@@ -557,7 +569,7 @@ def _datacore_path(cfg: dict[str, Any] | None = None, *, config_path: Path | Non
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Nexus Unidirectional Gateway Appliance")
+    ap = argparse.ArgumentParser(description="ContextBridge knowledge route (read-only search and fetch)")
     ap.add_argument("--config", required=True)
     args = ap.parse_args()
 
@@ -579,8 +591,8 @@ def main() -> None:
 
     config_path = Path(args.config)
     audit_path = serve.get("audit_log")
-    if audit_path:
-        os.environ.setdefault("UGA_AUDIT_LOG", str(_config_relative(audit_path, config_path)))
+    if audit_path and not _env("CONTEXTBRIDGE_AUDIT_LOG"):
+        os.environ["CONTEXTBRIDGE_AUDIT_LOG"] = str(_config_relative(audit_path, config_path))
 
     # Load and validate the export now so a bad or missing file stops startup
     # instead of failing every request.
@@ -588,19 +600,19 @@ def main() -> None:
         store = DatacoreStore.from_jsonl(_datacore_path(cfg, config_path=config_path))
         audit = _audit_from_env()
     except (OSError, ValueError) as exc:
-        raise SystemExit(f"UGA gateway startup failed: {exc}") from None
+        raise SystemExit(f"knowledge route startup failed: {exc}") from None
 
-    server = create_uga_server(
-        name=cfg.get("name", "Nexus UGA"), store=store, token=token, audit=audit
+    server = create_knowledge_server(
+        name=cfg.get("name", "ContextBridge Knowledge"), store=store, token=token, audit=audit
     )
     advertised = advertised_tool_names(server)
-    if advertised != UGA_ALLOWED_TOOLS:
+    if advertised != KNOWLEDGE_ALLOWED_TOOLS:
         raise SystemExit(
-            f"UGA tool surface mismatch: expected {set(UGA_ALLOWED_TOOLS)!r}, got {advertised!r}"
+            f"knowledge tool surface mismatch: expected {set(KNOWLEDGE_ALLOWED_TOOLS)!r}, got {advertised!r}"
         )
 
     print(
-        f"[uga] serving search/fetch over {len(store)} records on {host}:{port}",
+        f"[knowledge] serving search/fetch over {len(store)} records on {host}:{port}",
         file=sys.stderr,
         flush=True,
     )

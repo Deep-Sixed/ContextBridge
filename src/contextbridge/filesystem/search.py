@@ -23,7 +23,7 @@ from typing import Any
 
 from .fs import Filesystem, FsError, _os_errors
 
-WORKER = Path(__file__).with_name("fs_search_worker.py")
+WORKER = Path(__file__).with_name("search_worker.py")
 
 SEARCH_TYPES = ("files", "content")
 DEFAULT_MAX_RESULTS = 500

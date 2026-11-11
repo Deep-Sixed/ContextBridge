@@ -1,4 +1,4 @@
-"""Read-only Datacore adapter for the Unidirectional Gateway Appliance POC.
+"""Read-only Datacore adapter for the knowledge route.
 
 Loads approved ``datacore.fetch.v1`` records from a local JSONL file. No database
 credentials, no writes, no filesystem paths in tool responses.

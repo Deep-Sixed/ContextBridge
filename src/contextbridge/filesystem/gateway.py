@@ -1,6 +1,6 @@
 """ContextBridge filesystem route.
 
-A separate MCP server from the read-only UGA route, with its own config, port,
+A separate MCP server from the read-only knowledge route, with its own config, port,
 bearer token and allowlist. It serves only the roots in its config. Write tools are
 advertised only when at least one root is writable; read-only roots refuse writes.
 """
@@ -25,28 +25,28 @@ from starlette.responses import JSONResponse
 
 from contextbridge.hardening import protect_process_secrets
 
-from . import __version__
-from .audit import UgaAuditLog
+from .. import __version__
+from ..knowledge.audit import GatewayAuditLog
 from .fs import Filesystem, FsError, filesystem_from_config
-from .fs_search import (
+from .search import (
     DEFAULT_MAX_RESULTS,
     DEFAULT_PAGE,
     DEFAULT_TIMEOUT_MS,
     SearchManager,
 )
-from .gateway import (
-    UgaAllowlistMiddleware,
+from ..knowledge.gateway import (
+    AllowlistMiddleware,
     _add_audit_fields,
     _BearerTokenVerifier,
     _config_relative,
     _guard_low_level_handlers,
     _require_token,
-    _UgaServer,
+    _AuditedServer,
     advertised_tool_names,
     unauthenticated_response,
     uvicorn_config,
 )
-from .policy import FS_READ_TOOLS, FS_WRITE_TOOLS
+from ..knowledge.policy import FS_READ_TOOLS, FS_WRITE_TOOLS
 
 TOKEN_ENV = "CONTEXTBRIDGE_FS_AUTH_TOKEN"
 COMPUTER_TOKEN_ENV = "CONTEXTBRIDGE_COMPUTER_TOKEN"
@@ -107,23 +107,23 @@ def create_fs_server(
     *,
     fs: Filesystem,
     token: str,
-    audit: UgaAuditLog | None = None,
+    audit: GatewayAuditLog | None = None,
     name: str = DEFAULT_NAME,
 ) -> FastMCP:
     """Build the filesystem route with bearer auth always attached."""
     verifier = _BearerTokenVerifier(_require_token(token, name=TOKEN_ENV))
     if audit is None:
-        audit = UgaAuditLog(os.environ.get(AUDIT_ENV), route="fs")
+        audit = GatewayAuditLog(os.environ.get(AUDIT_ENV), route="fs")
     allowed = allowed_fs_tools(fs)
     searches = SearchManager(fs)
-    server = _UgaServer(
+    server = _AuditedServer(
         name=name,
         version=__version__,
         auth=verifier,
         mask_error_details=True,
         instructions=_instructions(fs),
     )
-    server.uga_audit = audit
+    server.audit_log = audit
 
     def audited(
         op: Callable[[], dict[str, Any]],
@@ -273,7 +273,7 @@ def create_fs_server(
             return await run(fs.delete_file, path, recursive, path=path)
 
     server.add_middleware(
-        UgaAllowlistMiddleware(
+        AllowlistMiddleware(
             audit,
             allowed_tools=allowed,
             route_name="filesystem",
@@ -322,7 +322,7 @@ def main() -> None:
         audit_log = os.environ.get(AUDIT_ENV) or (
             str(_config_relative(configured_log, config_path)) if configured_log else None
         )
-        audit = UgaAuditLog(audit_log, route="fs")
+        audit = GatewayAuditLog(audit_log, route="fs")
     except (OSError, ValueError) as exc:
         raise SystemExit(f"filesystem route startup failed: {exc}") from None
 
@@ -338,7 +338,7 @@ def main() -> None:
 
     writable = sum(root.writable for root in fs.roots)
     print(
-        f"[uga fs] serving {len(advertised)} tools over {len(fs.roots)} root(s) "
+        f"[filesystem] serving {len(advertised)} tools over {len(fs.roots)} root(s) "
         f"({writable} writable) on {host}:{port}",
         file=sys.stderr,
         flush=True,

@@ -8,12 +8,12 @@ from pathlib import Path
 import pytest
 from conftest import read_audit
 
-from uga.audit import UgaAuditLog
+from contextbridge.knowledge.audit import GatewayAuditLog
 
 
 def test_query_text_is_not_logged_by_default(tmp_path: Path) -> None:
     path = tmp_path / "audit.jsonl"
-    UgaAuditLog(path).record(tool="search", query="salary of jane doe", success=True)
+    GatewayAuditLog(path).record(tool="search", query="salary of jane doe", success=True)
 
     (entry,) = read_audit(path)
 
@@ -25,7 +25,7 @@ def test_query_text_is_not_logged_by_default(tmp_path: Path) -> None:
 
 def test_query_text_is_logged_when_opted_in(tmp_path: Path) -> None:
     path = tmp_path / "audit.jsonl"
-    UgaAuditLog(path, log_query_text=True).record(tool="search", query="hello", success=True)
+    GatewayAuditLog(path, log_query_text=True).record(tool="search", query="hello", success=True)
 
     assert read_audit(path)[0]["query_preview"] == "hello"
 
@@ -33,7 +33,7 @@ def test_query_text_is_logged_when_opted_in(tmp_path: Path) -> None:
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits; Windows uses ACLs")
 def test_audit_file_is_private(tmp_path: Path) -> None:
     path = tmp_path / "audit.jsonl"
-    UgaAuditLog(path)
+    GatewayAuditLog(path)
 
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
@@ -44,7 +44,7 @@ def test_existing_audit_file_is_made_private(tmp_path: Path) -> None:
     path.write_text("")
     path.chmod(0o644)
 
-    UgaAuditLog(path)
+    GatewayAuditLog(path)
 
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
@@ -55,11 +55,11 @@ def test_audit_log_refuses_symlink(tmp_path: Path) -> None:
     os.symlink(target, tmp_path / "audit.jsonl")
 
     with pytest.raises(OSError):
-        UgaAuditLog(tmp_path / "audit.jsonl")
+        GatewayAuditLog(tmp_path / "audit.jsonl")
 
 
 def test_query_hash_is_keyed(tmp_path: Path) -> None:
-    def query_hash(audit: UgaAuditLog, name: str) -> str:
+    def query_hash(audit: GatewayAuditLog, name: str) -> str:
         audit_path = tmp_path / name
         audit._fh = audit_path.open("a")
         audit.record(tool="search", query="salary of jane doe", success=True)
@@ -67,16 +67,16 @@ def test_query_hash_is_keyed(tmp_path: Path) -> None:
         return read_audit(audit_path)[0]["query_hash"]
 
     plain = hashlib.sha256(b"salary of jane doe").hexdigest()[:16]
-    keyed = query_hash(UgaAuditLog(None, hash_key=b"k" * 32), "a.jsonl")
+    keyed = query_hash(GatewayAuditLog(None, hash_key=b"k" * 32), "a.jsonl")
 
-    assert keyed == query_hash(UgaAuditLog(None, hash_key=b"k" * 32), "b.jsonl")
+    assert keyed == query_hash(GatewayAuditLog(None, hash_key=b"k" * 32), "b.jsonl")
     assert keyed != plain
-    assert query_hash(UgaAuditLog(None), "c.jsonl") != query_hash(UgaAuditLog(None), "d.jsonl")
+    assert query_hash(GatewayAuditLog(None), "c.jsonl") != query_hash(GatewayAuditLog(None), "d.jsonl")
 
 
 def test_client_supplied_fields_are_clipped(tmp_path: Path) -> None:
     path = tmp_path / "audit.jsonl"
-    UgaAuditLog(path).record(
+    GatewayAuditLog(path).record(
         tool="t" * 10_000, record_id="r" * 10_000, client_label="c" * 10_000, success=False
     )
 
@@ -98,6 +98,6 @@ def test_broken_stderr_does_not_raise(tmp_path: Path, monkeypatch: pytest.Monkey
     monkeypatch.setattr("sys.stderr", _BrokenStream())
     path = tmp_path / "audit.jsonl"
 
-    UgaAuditLog(path).record(tool="search", query="q", success=True)
+    GatewayAuditLog(path).record(tool="search", query="q", success=True)
 
     assert read_audit(path)[0]["tool"] == "search"

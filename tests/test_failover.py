@@ -438,7 +438,7 @@ def test_failover(tmp_path, jail):
     knowledge_config.write_text(f"serve:\n  host: 127.0.0.1\n  port: {knowledge_port}\n", encoding="utf-8")
     env = jail.env
     gateway_env = {**env, "CONTEXTBRIDGE_COMPUTER_TOKEN": COMPUTER_TOKEN}
-    knowledge_env = {**env, "MCP_AUTH_TOKEN": KNOWLEDGE_TOKEN, "UGA_DATACORE_JSONL": str(FIXTURE)}
+    knowledge_env = {**env, "MCP_AUTH_TOKEN": KNOWLEDGE_TOKEN, "CONTEXTBRIDGE_DATACORE_JSONL": str(FIXTURE)}
     admin = ("contextbridge.remote.admin", "--config", str(gateway_config))
 
     agent_proc = None
@@ -478,7 +478,7 @@ def test_failover(tmp_path, jail):
             encoding="utf-8",
         )
 
-        with serve("uga.gateway", knowledge_config, knowledge_port, knowledge_env) as knowledge_url:
+        with serve("contextbridge.knowledge.gateway", knowledge_config, knowledge_port, knowledge_env) as knowledge_url:
             with serve("contextbridge.computer", gateway_config, local_port, gateway_env) as local_url:
                 gateway_log = gateway_config.with_name("computer.contextbridge.computer.stderr.log")
                 wait_port(remote_port, gateway_log)

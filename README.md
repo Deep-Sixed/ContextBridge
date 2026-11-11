@@ -6,8 +6,8 @@ It has three routes, each with its own server, port, and credential:
 
 | Route | Module | Tools | Credential |
 |---|---|---|---|
-| Knowledge (UGA) | `uga.gateway` | `search`, `fetch` over approved JSONL records | `MCP_AUTH_TOKEN` |
-| Filesystem | `uga.fs_gateway` | file tools inside configured directories (see [Filesystem route](#filesystem-route)) | `CONTEXTBRIDGE_FS_AUTH_TOKEN` |
+| Knowledge | `contextbridge.knowledge.gateway` | `search`, `fetch` over approved JSONL records | `MCP_AUTH_TOKEN` |
+| Filesystem | `contextbridge.filesystem.gateway` | file tools inside configured directories (see [Filesystem route](#filesystem-route)) | `CONTEXTBRIDGE_FS_AUTH_TOKEN` |
 | Computer | `contextbridge.computer` | files, search, documents, commands, sessions, processes, devices; opt-in window and media inventory | `CONTEXTBRIDGE_COMPUTER_TOKEN` |
 
 Being able to read knowledge never grants file or computer access. Each route accepts only its own token. The filesystem and computer routes each refuse to start if their token matches either other route's token, when both are set in their environment.
@@ -23,7 +23,7 @@ python3 -m pytest        # includes acceptance tests that launch the gateways an
 
 ContextBridge requires Python 3.11+ and FastMCP 3.x (`fastmcp>=3,<4`). It has no runtime dependency on Node or npx, and the acceptance tests run both gateways in an environment without them.
 
-`tests/test_contract.py` pins the knowledge route's MCP contract: the exact tool set, annotations, input schemas, reported version, server instructions, and policy denial. `tests/test_entrypoint.py` starts the real `python -m uga.gateway` entrypoint and checks bearer auth over HTTP. `tests/test_fs.py` covers the filesystem operations and path rules, and `tests/test_fs_gateway.py` pins the filesystem route's MCP contract and starts its entrypoint. CI runs the whole suite on Ubuntu and Windows, with Python 3.11 against the oldest supported FastMCP (3.0.0) and Python 3.13 against the newest 3.x release.
+`tests/test_contract.py` pins the knowledge route's MCP contract: the exact tool set, annotations, input schemas, reported version, server instructions, and policy denial. `tests/test_entrypoint.py` starts the real `python -m contextbridge.knowledge.gateway` entrypoint and checks bearer auth over HTTP. `tests/test_fs.py` covers the filesystem operations and path rules, and `tests/test_fs_gateway.py` pins the filesystem route's MCP contract and starts its entrypoint. CI runs the whole suite on Ubuntu and Windows, with Python 3.11 against the oldest supported FastMCP (3.0.0) and Python 3.13 against the newest 3.x release.
 
 ## Knowledge route
 
@@ -31,15 +31,15 @@ ContextBridge requires Python 3.11+ and FastMCP 3.x (`fastmcp>=3,<4`). It has no
 
 ```sh
 export MCP_AUTH_TOKEN="<strong random secret provided by secret manager>"
-export UGA_DATACORE_JSONL="/path/to/approved/datacore.fetch.v1.jsonl"
+export CONTEXTBRIDGE_DATACORE_JSONL="/path/to/approved/datacore.fetch.v1.jsonl"
 ./scripts/run-contextbridge.sh
 ```
 
 `MCP_AUTH_TOKEN` must be at least 32 characters (for example `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`).
 
-The data export is required: set `UGA_DATACORE_JSONL`, or `datacore_jsonl` in the config file (a relative path is resolved against the config file's directory). The environment variable wins. The export is loaded and validated at startup, and the gateway refuses to start if it is missing or invalid.
+The data export is required: set `CONTEXTBRIDGE_DATACORE_JSONL`, or `datacore_jsonl` in the config file (a relative path is resolved against the config file's directory). The environment variable wins. The export is loaded and validated at startup, and the gateway refuses to start if it is missing or invalid.
 
-`scripts/run-contextbridge.sh` always uses `configs/contextbridge.yaml`. To use another config file, run `python3 -m uga.gateway --config <path>`.
+`scripts/run-contextbridge.sh` always uses `configs/contextbridge.yaml`. To use another config file, run `python3 -m contextbridge.knowledge.gateway --config <path>`.
 
 ### Connecting
 
@@ -52,24 +52,24 @@ Every HTTP route requires the token, including `GET /`, which returns the servic
 | Setting | Default | Purpose |
 | --- | --- | --- |
 | `MCP_AUTH_TOKEN` | required | Bearer token clients must send; at least 32 characters |
-| `UGA_DATACORE_JSONL` or `datacore_jsonl` | one is required | JSONL export to serve |
+| `CONTEXTBRIDGE_DATACORE_JSONL` or `datacore_jsonl` | one is required | JSONL export to serve |
 | `serve.host` | `127.0.0.1` | Listen address |
 | `serve.port` | required | Listen port (`8790` in `configs/contextbridge.yaml`) |
-| `name` | `Nexus UGA` | Server name reported in `serverInfo` and by `GET /` |
-| `UGA_AUDIT_LOG` or `serve.audit_log` | unset | Audit log file (see [Audit log](#audit-log)) |
-| `UGA_AUDIT_LOG_QUERY_TEXT` | off | `1`, `true`, or `yes` also logs a query preview |
-| `UGA_AUDIT_HASH_KEY` | random per run | Key for the audit log's query hash |
+| `name` | `ContextBridge Knowledge` | Server name reported in `serverInfo` and by `GET /` |
+| `CONTEXTBRIDGE_AUDIT_LOG` or `serve.audit_log` | unset | Audit log file (see [Audit log](#audit-log)) |
+| `CONTEXTBRIDGE_AUDIT_LOG_QUERY_TEXT` | off | `1`, `true`, or `yes` also logs a query preview |
+| `CONTEXTBRIDGE_AUDIT_HASH_KEY` | random per run | Key for the audit log's query hash |
 | `serve.forwarded_allow_ips` | unset | Proxy addresses whose `X-Forwarded-For` is trusted for the audited `peer` |
-| `UGA_MCP_SEARCH_LIMIT` | `10` | Maximum `search` results |
-| `UGA_MCP_FETCH_MAX_CHARS` | `100000` | Maximum characters of `text` that `fetch` returns |
-| `UGA_MCP_TOOL_TIMEOUT_SECONDS` | `10` | Timeout for a tool call |
-| `UGA_MCP_METADATA_TIMEOUT_SECONDS` | `5` | Timeout for `initialize` and `tools/list` |
+| `CONTEXTBRIDGE_MCP_SEARCH_LIMIT` | `10` | Maximum `search` results |
+| `CONTEXTBRIDGE_MCP_FETCH_MAX_CHARS` | `100000` | Maximum characters of `text` that `fetch` returns |
+| `CONTEXTBRIDGE_MCP_TOOL_TIMEOUT_SECONDS` | `10` | Timeout for a tool call |
+| `CONTEXTBRIDGE_MCP_METADATA_TIMEOUT_SECONDS` | `5` | Timeout for `initialize` and `tools/list` |
 
 Where a setting has both an environment variable and a config key, the environment variable wins. An unset, unparsable, or non-positive value for the last four falls back to the default. A relative `serve.audit_log` is resolved against the config file's directory.
 
 ### Data format
 
-Each JSONL line is one approved record with `id` (a non-empty string or integer) and the strings `title`, `text`, and `url`, plus an optional `metadata` object. An integer `id` is served as a string (record `7` is fetched as `"7"`). Other keys, at the top level or inside `metadata`, are kept only if they are approved fields listed in `_APPROVED_FIELDS` in `src/uga/adapter.py`; any other key is dropped at load time and is never served or searched. An approved field keeps its whole value, including nested objects.
+Each JSONL line is one approved record with `id` (a non-empty string or integer) and the strings `title`, `text`, and `url`, plus an optional `metadata` object. An integer `id` is served as a string (record `7` is fetched as `"7"`). Other keys, at the top level or inside `metadata`, are kept only if they are approved fields listed in `_APPROVED_FIELDS` in `src/contextbridge/knowledge/adapter.py`; any other key is dropped at load time and is never served or searched. An approved field keeps its whole value, including nested objects.
 
 Blank lines are skipped. Invalid JSON, a missing or non-string `title`, `text`, or `url`, or a duplicate `id` stops startup.
 
@@ -77,30 +77,30 @@ Blank lines are skipped. Invalid JSON, a missing or non-string `title`, `text`, 
 
 | Tool | Input | Returns |
 | --- | --- | --- |
-| `search` | `query` | `{"results": [...]}` with up to `UGA_MCP_SEARCH_LIMIT` hits. Each hit has `id`, `title`, and `url`, plus whichever of `summary`, `snippet`, `bank_id`, `record_kind`, `status`, and `updated_at` the record has (top-level field first, then `metadata`). |
+| `search` | `query` | `{"results": [...]}` with up to `CONTEXTBRIDGE_MCP_SEARCH_LIMIT` hits. Each hit has `id`, `title`, and `url`, plus whichever of `summary`, `snippet`, `bank_id`, `record_kind`, `status`, and `updated_at` the record has (top-level field first, then `metadata`). |
 | `fetch` | `id` | The full record: `id`, `title`, `text`, `url`, `metadata`, and the approved top-level fields it has. |
 
 Search is a case-insensitive substring match against the values of `title`, `text`, `url`, `metadata`, and the approved fields; it does not match the `id` or JSON key names, and never matches across two fields. An empty query returns the first records in file order. `fetch` of an unknown id fails with `Record not found: <id>`.
 
-`fetch` returns at most `UGA_MCP_FETCH_MAX_CHARS` characters of a record's `text`. A longer text is cut to that length, and the response adds `truncated: true` and the full `text_length`. Other fields are returned as exported.
+`fetch` returns at most `CONTEXTBRIDGE_MCP_FETCH_MAX_CHARS` characters of a record's `text`. A longer text is cut to that length, and the response adds `truncated: true` and the full `text_length`. Other fields are returned as exported.
 
-Both tools declare `readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`, and `openWorldHint=false`. They only read the snapshot loaded at startup, so changes to the JSONL file take effect on restart. The server reports the package version (`uga.__version__`) in `serverInfo`, and its MCP `instructions` tell agents to search, then fetch by id, and to treat record text as data rather than instructions.
+Both tools declare `readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`, and `openWorldHint=false`. They only read the snapshot loaded at startup, so changes to the JSONL file take effect on restart. The server reports the package version (`contextbridge.__version__`) in `serverInfo`, and its MCP `instructions` tell agents to search, then fetch by id, and to treat record text as data rather than instructions.
 
 Other MCP methods follow the same default-deny policy: `resources/list`, `resources/templates/list` and `prompts/list` return empty lists, `ping` is answered, and every other request (for example `resources/read`, `prompts/get`, `logging/setLevel`) is rejected.
 
 ### Audit log
 
-Each MCP request except `ping`, and each HTTP request rejected by auth, is written as one JSON line to stderr (prefixed with `[uga audit] `) and, if `UGA_AUDIT_LOG` (or `serve.audit_log` in the config, resolved against the config file's directory) is set, to that file. Missing parent directories are created. The file is opened without following symlinks, must be a regular file, and is set to mode `0600`, including when it already exists. An authenticated `GET /` is not audited.
+Each MCP request except `ping`, and each HTTP request rejected by auth, is written as one JSON line to stderr (prefixed with `[knowledge audit] `) and, if `CONTEXTBRIDGE_AUDIT_LOG` (or `serve.audit_log` in the config, resolved against the config file's directory) is set, to that file. Missing parent directories are created. The file is opened without following symlinks, must be a regular file, and is set to mode `0600`, including when it already exists. An authenticated `GET /` is not audited.
 
 Each line has a `request_id` that is unique per request, and a tool call's line carries what the tool recorded (`record_id`, `result_count`, the query hash). Denied tools and methods are logged with `detail: "policy_denied"`, and their arguments are not logged. Requests rejected by bearer auth are logged as `tool: "auth"` with `missing_token`, `invalid_token`, or `forbidden`. Methods the MCP SDK does not implement at all are rejected by the SDK and not logged. Client-supplied strings such as tool names and record ids are cut to 200 characters.
 
-Queries are recorded as their length and a keyed hash (the first 16 hex digits of an HMAC-SHA256); set `UGA_AUDIT_LOG_QUERY_TEXT=1` to also log a preview of up to 80 characters. Set `UGA_AUDIT_HASH_KEY` to a random secret to make the hash of the same query stable across restarts; without it a random key is used for each run, and the hash cannot be reversed by hashing guesses without the key.
+Queries are recorded as their length and a keyed hash (the first 16 hex digits of an HMAC-SHA256); set `CONTEXTBRIDGE_AUDIT_LOG_QUERY_TEXT=1` to also log a preview of up to 80 characters. Set `CONTEXTBRIDGE_AUDIT_HASH_KEY` to a random secret to make the hash of the same query stable across restarts; without it a random key is used for each run, and the hash cannot be reversed by hashing guesses without the key.
 
-The `peer` field is the address of the TCP connection. `X-Forwarded-For` is ignored unless the proxy's address is listed in `serve.forwarded_allow_ips`. If you serve `create_uga_server().http_app()` with your own uvicorn, pass `proxy_headers=False` (uvicorn trusts the header from 127.0.0.1 by default).
+The `peer` field is the address of the TCP connection. `X-Forwarded-For` is ignored unless the proxy's address is listed in `serve.forwarded_allow_ips`. If you serve `create_knowledge_server().http_app()` with your own uvicorn, pass `proxy_headers=False` (uvicorn trusts the header from 127.0.0.1 by default).
 
 ## Filesystem route
 
-`python -m uga.fs_gateway` (or `./scripts/run-contextbridge-fs.sh`) is a separate MCP server on port 8794. It gives agents file access inside the directories listed under `filesystem.roots` in `configs/contextbridge-fs.yaml`. The shipped config lists none, so the route refuses to start until you add some.
+`python -m contextbridge.filesystem.gateway` (or `./scripts/run-contextbridge-fs.sh`) is a separate MCP server on port 8794. It gives agents file access inside the directories listed under `filesystem.roots` in `configs/contextbridge-fs.yaml`. The shipped config lists none, so the route refuses to start until you add some.
 
 ```sh
 export CONTEXTBRIDGE_FS_AUTH_TOKEN="<a different strong secret>"
@@ -140,11 +140,11 @@ The search starts at `path` (a directory, or a single file for a `content` searc
 
 `start_search` waits up to one second, so a quick search returns complete. A longer one keeps running, and `get_more_search_results` returns its results so far, with `status: "running"` and `has_more: true` until it finishes. The final status is `completed`, `cancelled`, `timed_out` or `failed`; `limit_reached` is true when `max_results` (default 500, at most 5000) or the 8 MiB per-search cap stopped it early.
 
-Each search runs in its own worker process (`src/uga/fs_search_worker.py`, started with `python -I`), so `stop_search` and `timeout_ms` (default 30000, at most 300000) stop it even inside a slow regular expression. On Linux and macOS the worker also sets an alarm a few seconds past its timeout, so it ends even if the server dies first. At most 4 searches run at once. The 10 most recent are kept in memory, and the oldest finished one is dropped to make room, so search ids are not kept across restarts. Searches are shared: every client with the route's token can list, page through and stop them.
+Each search runs in its own worker process (`src/contextbridge/filesystem/search_worker.py`, started with `python -I`), so `stop_search` and `timeout_ms` (default 30000, at most 300000) stop it even inside a slow regular expression. On Linux and macOS the worker also sets an alarm a few seconds past its timeout, so it ends even if the server dies first. At most 4 searches run at once. The 10 most recent are kept in memory, and the oldest finished one is dropped to make room, so search ids are not kept across restarts. Searches are shared: every client with the route's token can list, page through and stop them.
 
 **Deletion is recoverable:** each deleted item is kept under `.contextbridge-trash/<trash_id>/`, next to a `<trash_id>.json` file recording its original path. No tool can read, list, change or empty the trash; recover or purge items from the host.
 
-**Limits:** `max_read_bytes` and `max_write_bytes` (1 MiB each by default) cap a response and a write, `max_list_entries` (1000) caps a listing, and `max_search_file_bytes` (10 MiB) is the largest file a content search reads. Calls use the same `UGA_MCP_TOOL_TIMEOUT_SECONDS` and `UGA_MCP_METADATA_TIMEOUT_SECONDS` settings as the gateway. Text must be UTF-8; binary files are refused.
+**Limits:** `max_read_bytes` and `max_write_bytes` (1 MiB each by default) cap a response and a write, `max_list_entries` (1000) caps a listing, and `max_search_file_bytes` (10 MiB) is the largest file a content search reads. Calls use the same `CONTEXTBRIDGE_MCP_TOOL_TIMEOUT_SECONDS` and `CONTEXTBRIDGE_MCP_METADATA_TIMEOUT_SECONDS` settings as the gateway. Text must be UTF-8; binary files are refused.
 
 **Audit:** lines go to stderr and to `CONTEXTBRIDGE_FS_AUDIT_LOG` (or `serve.audit_log`, resolved against the config file's directory) with `route: "fs"`. As on the gateway, each request is one line, and `X-Forwarded-For` is ignored unless `serve.forwarded_allow_ips` lists the proxy. Paths are logged as the client sent them, with byte counts for reads and writes and the trash location for deletes. Refused paths are logged with `detail: "path_denied"`. Search events include `search_id` and result counts; patterns are logged only by length and hash.
 
@@ -542,7 +542,12 @@ python3 -m pip install -e '.[docs]'
 
 ## Status
 
-The knowledge route is a standalone extraction from an archived UGA (Unidirectional Gateway Appliance) implementation. That is why the package is `uga`, environment variables start with `UGA_`, the gateway's default name is `Nexus UGA`, and its timeout errors say "Nexus Datacore". Authentication-front/sidecar deployments and systemd services were intentionally left out. No route is production-validated yet.
+No route is production-validated yet. Authentication-front/sidecar deployments and systemd services are intentionally left out.
+
+**Upgrading an older deployment.** The knowledge and filesystem routes used to live in a package with a different name, and their settings had a different prefix. If you start them with `scripts/run-contextbridge.sh` and `scripts/run-contextbridge-fs.sh`, nothing changes for you. Otherwise:
+- start them with `python3 -m contextbridge.knowledge.gateway` and `python3 -m contextbridge.filesystem.gateway`;
+- settings are now named `CONTEXTBRIDGE_*` (for example `CONTEXTBRIDGE_DATACORE_JSONL`). The old names are still read when the new one is unset, so existing environments keep working;
+- the knowledge route's audit lines now carry `route: "knowledge"`, its default server name is `ContextBridge Knowledge`, and stderr audit lines are prefixed with the route's name (`[knowledge audit]`, `[fs audit]`).
 
 `src/contextbridge/projects.py` (a project-to-host-to-repository registry, see `configs/projects.example.yaml`) and `src/contextbridge/task_ledger.py` (a SQLite ledger of task states) are library foundations: no route, tool, or CLI uses them yet, and neither grants any access.
 

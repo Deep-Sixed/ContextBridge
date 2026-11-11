@@ -18,12 +18,12 @@ import pytest
 from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 
-import uga
+import contextbridge
 from conftest import TOKEN, read_audit, record, write_jsonl
-from uga.adapter import DatacoreStore
-from uga.audit import UgaAuditLog
-from uga.gateway import create_uga_server
-from uga.policy import UGA_ALLOWED_TOOLS, UGA_FORBIDDEN_TOOL_EXAMPLES
+from contextbridge.knowledge.adapter import DatacoreStore
+from contextbridge.knowledge.audit import GatewayAuditLog
+from contextbridge.knowledge.gateway import create_knowledge_server
+from contextbridge.knowledge.policy import KNOWLEDGE_ALLOWED_TOOLS, KNOWLEDGE_FORBIDDEN_TOOL_EXAMPLES
 
 EXPECTED_INPUTS = {"search": {"query"}, "fetch": {"id"}}
 
@@ -52,8 +52,8 @@ INJECTION_PATTERNS = [
 
 def _server(tmp_path: Path, audit_path: Path | None = None) -> FastMCP:
     store = DatacoreStore.from_jsonl(write_jsonl(tmp_path / "d.jsonl", [record("r1")]))
-    return create_uga_server(
-        name="ContextBridge", store=store, token=TOKEN, audit=UgaAuditLog(audit_path)
+    return create_knowledge_server(
+        name="ContextBridge", store=store, token=TOKEN, audit=GatewayAuditLog(audit_path)
     )
 
 
@@ -75,7 +75,7 @@ def _assert_no_injection_text(label: str, text: str) -> None:
 def test_tool_surface_matches_policy(tmp_path: Path) -> None:
     tools = _session(_server(tmp_path))["tools"]
 
-    assert {tool.name for tool in tools} == set(UGA_ALLOWED_TOOLS) == set(EXPECTED_INPUTS)
+    assert {tool.name for tool in tools} == set(KNOWLEDGE_ALLOWED_TOOLS) == set(EXPECTED_INPUTS)
 
 
 def test_tools_declare_complete_read_only_annotations(tmp_path: Path) -> None:
@@ -113,7 +113,7 @@ def test_server_reports_package_version(tmp_path: Path) -> None:
     server_info = _session(_server(tmp_path))["init"].serverInfo
 
     assert server_info.name == "ContextBridge"
-    assert server_info.version == uga.__version__
+    assert server_info.version == contextbridge.__version__
 
 
 def test_installed_metadata_matches_package_version() -> None:
@@ -121,7 +121,7 @@ def test_installed_metadata_matches_package_version() -> None:
         installed = importlib.metadata.version("contextbridge")
     except importlib.metadata.PackageNotFoundError:
         pytest.skip("contextbridge is not installed; run pip install -e .")
-    assert installed == uga.__version__
+    assert installed == contextbridge.__version__
 
 
 def test_forbidden_tools_are_denied_and_audited(tmp_path: Path) -> None:
@@ -130,7 +130,7 @@ def test_forbidden_tools_are_denied_and_audited(tmp_path: Path) -> None:
 
     async def go() -> Any:
         async with Client(server) as client:
-            for name in sorted(UGA_FORBIDDEN_TOOL_EXAMPLES):
+            for name in sorted(KNOWLEDGE_FORBIDDEN_TOOL_EXAMPLES):
                 with pytest.raises(ToolError, match="not permitted"):
                     await client.call_tool(name, {"command": "id", "query": "secret"})
             # A denied call must leave the session usable.
@@ -138,7 +138,7 @@ def test_forbidden_tools_are_denied_and_audited(tmp_path: Path) -> None:
 
     assert anyio.run(go).structured_content["id"] == "r1"
     denied = [entry for entry in read_audit(audit_path) if entry.get("detail") == "policy_denied"]
-    assert {entry["tool"] for entry in denied} == set(UGA_FORBIDDEN_TOOL_EXAMPLES)
+    assert {entry["tool"] for entry in denied} == set(KNOWLEDGE_FORBIDDEN_TOOL_EXAMPLES)
     for entry in denied:
         assert entry["success"] is False
         # Arguments to a denied tool are never written to the audit log.
