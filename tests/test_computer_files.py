@@ -351,7 +351,7 @@ def _peak_bytes(fn):
 
 
 def test_read_file_tail_memory_is_bounded_by_the_read_limit(make_policy, workspace):
-    (workspace / "docs" / "log.txt").write_text("".join(f"line {i:07d}\n" for i in range(400_000)), encoding="utf-8")
+    (workspace / "docs" / "log.txt").write_text("".join(f"line {i:07d}\n" for i in range(400_000)), encoding="utf-8", newline="\n")
     policy = make_policy(filesystem={"max_read_bytes": 4096})  # the file is about 5 MB
     result, peak = _peak_bytes(lambda: files.read_file(policy, "docs/log.txt", offset=-1_000_000_000, length=1))
     assert result["content"] == "line 0000000\n" and result["start_line"] == 0
@@ -362,7 +362,7 @@ def test_read_file_tail_memory_is_bounded_by_the_read_limit(make_policy, workspa
 
 
 def test_read_file_huge_line_is_never_held_whole(make_policy, workspace):
-    (workspace / "docs" / "blob.json").write_text("x" * 5_000_000 + "\nafter\n", encoding="utf-8")
+    (workspace / "docs" / "blob.json").write_text("x" * 5_000_000 + "\nafter\n", encoding="utf-8", newline="\n")
     policy = make_policy(filesystem={"max_read_bytes": 4096})
     result, peak = _peak_bytes(lambda: files.read_file(policy, "docs/blob.json"))
     assert result["truncated"] and result["content"] == "" and result["total_lines"] == 2
@@ -373,7 +373,7 @@ def test_read_file_huge_line_is_never_held_whole(make_policy, workspace):
 
 def test_read_file_tail_keeps_crlf_and_utf16(make_policy, workspace):
     (workspace / "docs" / "crlf.txt").write_bytes(b"a\r\nb\r\nc\r\n")
-    (workspace / "docs" / "wide.txt").write_text("one\ntwo\nthree\n", encoding="utf-16")
+    (workspace / "docs" / "wide.txt").write_text("one\ntwo\nthree\n", encoding="utf-16", newline="\n")
     policy = make_policy()
     assert files.read_file(policy, "docs/crlf.txt", offset=-2)["content"] == "b\r\nc\r\n"
     assert files.read_file(policy, "docs/wide.txt", offset=-1)["content"] == "three\n"
