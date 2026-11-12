@@ -9,7 +9,7 @@ This guide moves the ContextBridge gateway onto a small Linux VPS, so the gatewa
 ```
 
 - **No inbound ports** except SSH. `cloudflared` connects out to Cloudflare, and every ContextBridge listener stays on loopback.
-- **No Tailscale.** The agent listener is on loopback, so the Tailscale admission check does not apply. Agents are admitted by their enrolled Ed25519 device key alone, and new devices still need a one-time pairing code.
+- **No Tailscale.** The agent listener is on loopback, which means `agents.admission: device-key`: agents are admitted by their enrolled Ed25519 device key alone, new devices still need a one-time pairing code, and repeated failures from one client address are refused for a while.
 - **No local device.** The gateway on the VPS has no `filesystem` section, so no tool can touch the VPS itself.
 
 Examples below use `vps` as the server's hostname, `mcp.example.com` for the MCP endpoint, and `agents.example.com` for agents. Substitute your own.
@@ -64,6 +64,11 @@ agents:
   enabled: true
   host: 127.0.0.1          # loopback: cloudflared publishes it; no TLS files or tailnet IDs needed
   port: 8792
+  admission: device-key    # the loopback default, stated for clarity: agents from any network
+  client_ip_header: CF-Connecting-IP   # count failed attempts per real client, not per tunnel
+  public_url: wss://agents.example.com # what `pair` tells new devices
+  max_failed_attempts: 10
+  failure_window_seconds: 600
   registry: ../state/devices.json
   heartbeat_seconds: 15
   call_timeout_seconds: 660
@@ -82,6 +87,8 @@ remote:
 ```
 
 Do not set `agents.tls_cert`/`tls_key`: on loopback without them the listener speaks plain WebSocket to `cloudflared`, and Cloudflare provides the public TLS.
+
+`client_ip_header` matters: every connection reaches the gateway from `cloudflared` on `127.0.0.1`, so without it the failed-attempt limit would treat all agents as one client, and one attacker could lock everyone out for the window. Cloudflare sets `CF-Connecting-IP` itself, and the header is trusted only because the listener is reachable from this host alone.
 
 Create the static token for the local listener (only reachable from the VPS itself):
 
@@ -161,7 +168,7 @@ Copying the old gateway's state keeps every enrolled device (same `gateway_id`, 
 4. **Copy settings** from the old config's `remote` section (`allow_scopes`, `allow_devices`, token lifetimes) into the new one. Keep `public_url` identical.
 5. **Start the gateway** (section 4) and add the `mcp.example.com` route to the new tunnel (section 5).
 6. **Repoint each agent.** In its agent config, set `gateway.url: wss://agents.example.com` and delete the `gateway.fingerprint` line (the agent then trusts the certificate Cloudflare presents through the system's CA store). Restart the agent. `cb-admin devices` and `list_devices` should show it online.
-7. **Turn the old gateway machine into an agent.** Its files were the `local` device; on the VPS there is no `local`. Pair it as a normal device (`cb-admin pair <name>`), give it an agent config with the policy its old `filesystem`/`commands`/`processes` sections had, and enroll it. `pair` prints a `ws://<gateway address>:8792` URL; use `wss://agents.example.com` instead.
+7. **Turn the old gateway machine into an agent.** Its files were the `local` device; on the VPS there is no `local`. Pair it as a normal device (`cb-admin pair <name>`), give it an agent config with the policy its old `filesystem`/`commands`/`processes` sections had, and enroll it. `pair` prints the `agents.public_url` address to use.
 8. **Re-approve clients for the new device.** Existing grants name `local`, which no longer exists. Revoke and reconnect each client (`cb-admin oauth-clients`, `cb-admin oauth-revoke <id>`) and tick the new device on the consent page.
 
 **Rollback:** stop the VPS gateway, move the `mcp.example.com` route back to the old tunnel, restore the old agent configs (URL and fingerprint), and start the old gateway. Keep the old state folder untouched until the VPS has run cleanly for a while.

@@ -494,7 +494,10 @@ No route depends on Authentik.
 - **Computer MCP endpoints:** refuse any non-loopback address; there is no override.
   - **Local listener (8791):** accepts only the static token.
   - **Remote listener (8793):** accepts only OAuth tokens. It is meant to be published only through a TLS tunnel.
-- **Agent listener:** limited to loopback or private addresses, and accepts only enrolled devices. On a private address it is TLS-only and agents must connect from a Tailscale node listed in `agents.tailnet_node_ids`. On loopback it can be published through Cloudflare Tunnel, which provides the TLS (see [docs/vps-gateway.md](docs/vps-gateway.md)).
+- **Agent listener:** accepts only enrolled devices, and `agents.admission` decides who may even try:
+  - **`tailnet`** (the default off loopback): a private address, TLS only, and only the Tailscale nodes listed in `agents.tailnet_node_ids`.
+  - **`device-key`** (always on loopback): any network. One-time pairing codes and enrolled Ed25519 keys are the only protection. On loopback a tunnel such as Cloudflare's publishes it and provides TLS (see [docs/vps-gateway.md](docs/vps-gateway.md)); off loopback it may bind a public address, still TLS only.
+  - **Either way**, a client address that fails `max_failed_attempts` enrollments or sign-ins (default 10) within `failure_window_seconds` (default 600) is refused until the oldest failure ages out, and the audit log records `agent_rate_limited`. Behind a tunnel, set `agents.client_ip_header` (for Cloudflare, `CF-Connecting-IP`) so the limit applies per real client rather than to everyone at once.
 
 Do not forward ports 8791, 8792, or 8794 to the internet. Publish 8793 only through a TLS tunnel, and only once `owner-init` is done.
 

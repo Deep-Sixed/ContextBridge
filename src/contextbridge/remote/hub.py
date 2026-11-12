@@ -13,12 +13,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import itertools
 import secrets
 import ssl
 import sys
 import time
 import uuid
+from collections import OrderedDict, deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -67,6 +70,56 @@ class RemoteFailed(RuntimeError):
     def __init__(self, message: str, *, started: bool) -> None:
         super().__init__(message)
         self.started = started
+
+
+class FailureLimiter:
+    """Counts failed enrollments and sign-ins per client address over a sliding window.
+
+    A client that reaches ``max_failures`` within ``window_seconds`` is refused until
+    its oldest counted failure ages out. At most ``max_clients`` addresses are tracked;
+    the least recently failing one is forgotten first, so memory stays bounded.
+    """
+
+    def __init__(
+        self,
+        max_failures: int,
+        window_seconds: float,
+        *,
+        max_clients: int = 10_000,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.max_failures = max_failures
+        self.window_seconds = window_seconds
+        self.max_clients = max_clients
+        self._clock = clock
+        self._failures: OrderedDict[str, deque[float]] = OrderedDict()
+
+    def _recent(self, client: str) -> deque[float] | None:
+        times = self._failures.get(client)
+        if times is None:
+            return None
+        cutoff = self._clock() - self.window_seconds
+        while times and times[0] <= cutoff:
+            times.popleft()
+        if not times:
+            del self._failures[client]
+            return None
+        return times
+
+    def blocked(self, client: str) -> bool:
+        times = self._recent(client)
+        return times is not None and len(times) >= self.max_failures
+
+    def record(self, client: str) -> bool:
+        """Count one failure; return True if it is the one that blocks ``client``."""
+        times = self._recent(client)
+        if times is None:
+            times = self._failures[client] = deque()
+        times.append(self._clock())
+        self._failures.move_to_end(client)
+        while len(self._failures) > self.max_clients:
+            self._failures.popitem(last=False)
+        return len(times) == self.max_failures
 
 
 def _clean_info(raw: Any) -> dict[str, str]:
@@ -122,9 +175,14 @@ class AgentHub:
         call_timeout_seconds: float = 660.0,
         takeover_probe_seconds: float = TAKEOVER_PROBE_SECONDS,
         allowed_tailnet_node_ids: frozenset[str] | None = None,
+        client_ip_header: str | None = None,
+        max_failed_attempts: int = 10,
+        failure_window_seconds: float = 600.0,
     ) -> None:
         self.registry = registry
         self.allowed_tailnet_node_ids = allowed_tailnet_node_ids
+        self.client_ip_header = client_ip_header
+        self.limiter = FailureLimiter(max_failed_attempts, failure_window_seconds)
         self.audit = audit
         self.heartbeat_seconds = heartbeat_seconds
         self.call_timeout_seconds = call_timeout_seconds
@@ -247,8 +305,33 @@ class AgentHub:
 
     # ------------------------------------------------------------ handshake
 
+    def _client_address(self, ws: ServerConnection) -> str | None:
+        """The connecting client's address: the proxy's header when configured, else the socket peer."""
+        peer = str(ws.remote_address[0]) if ws.remote_address else None
+        if self.client_ip_header:
+            request = getattr(ws, "request", None)
+            value = request.headers.get(self.client_ip_header) if request is not None else None
+            if isinstance(value, str):
+                with contextlib.suppress(ValueError):
+                    return str(ipaddress.ip_address(value.split(",")[0].strip()))
+        return peer
+
+    def _failed(self, client: str | None) -> None:
+        """Count a failed handshake against ``client``; log once when it becomes rate limited."""
+        if self.limiter.record(client or "unknown"):
+            self._log(
+                "agent_rate_limited",
+                peer=client,
+                failures=self.limiter.max_failures,
+                window_seconds=self.limiter.window_seconds,
+            )
+
     async def _handle(self, ws: ServerConnection) -> None:
         peer = str(ws.remote_address[0]) if ws.remote_address else None
+        client = self._client_address(ws)
+        if self.limiter.blocked(client or "unknown"):
+            await self._refuse(ws, "rate_limited", "too many failed attempts; try again later")
+            return
         if self.allowed_tailnet_node_ids is not None:
             try:
                 if peer is None:
@@ -258,6 +341,7 @@ class AgentHub:
                 )
             except TailnetAdmissionDenied:
                 self._log("tailnet_admission_denied", peer=peer)
+                self._failed(client)
                 await self._refuse(ws, "tailnet_denied", "tailnet admission denied")
                 return
         try:
@@ -268,10 +352,11 @@ class AgentHub:
                 await self._refuse(ws, "version", f"protocol version {PROTOCOL_VERSION} required")
                 return
             if first["type"] == "enroll":
-                await self._enroll(ws, first, peer)
+                await self._enroll(ws, first, client)
                 return
-            conn = await self._authenticate(ws, first, peer)
+            conn = await self._authenticate(ws, first, client)
         except (TimeoutError, ProtocolError) as exc:
+            self._failed(client)
             await self._refuse(ws, "protocol", str(exc) or "handshake timed out")
             return
         except ConnectionClosed:
@@ -297,6 +382,7 @@ class AgentHub:
             record = self.registry.redeem(msg.get("code"), msg.get("public_key"), _clean_info(msg.get("info")))
         except (EnrollmentRejected, RegistryError, TypeError) as exc:
             self._log("device_enroll_rejected", peer=peer, reason=str(exc))
+            self._failed(peer)
             await asyncio.sleep(FAILED_ENROLL_DELAY_SECONDS)
             await self._refuse(ws, "bad_code", "enrollment refused")
             return
@@ -323,6 +409,7 @@ class AgentHub:
         if device is None or not device.active:
             code = "unknown_device" if device is None else "revoked"
             self._log("device_auth_failed", device_id=device_id, peer=peer, reason=code)
+            self._failed(peer)
             await self._refuse(ws, code, "device is not enrolled" if device is None else "device has been revoked")
             return None
         nonce = secrets.token_bytes(32)
@@ -336,6 +423,7 @@ class AgentHub:
             self._log(
                 "device_auth_failed", device=device.name, device_id=device.device_id, peer=peer, reason="bad_signature"
             )
+            self._failed(peer)
             await self._refuse(ws, "bad_signature", "signature verification failed")
             return None
         caps = reply.get("capabilities") if isinstance(reply.get("capabilities"), dict) else {}
