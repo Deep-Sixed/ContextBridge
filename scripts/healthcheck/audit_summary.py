@@ -122,7 +122,22 @@ def gateway_findings(cfg: dict) -> list[dict]:
         host = str(agents.get("host", ""))
         if host in {"0.0.0.0", "::", ""}:
             findings.append({"level": "FAIL", "check": "agents.host", "detail": f"binds {host!r}; use a tailnet IP"})
-        if not agents.get("tailnet_node_ids"):
+        loopback = host in {"127.0.0.1", "::1", "localhost"} or host.startswith("127.")
+        admission = agents.get("admission") or ("device-key" if loopback else "tailnet")
+        if admission == "device-key":
+            findings.append({
+                "level": "INFO" if loopback else "WARN",
+                "check": "agents.admission",
+                "detail": "device-key: agents from any network, protected by pairing codes and device keys"
+                + ("" if loopback else f"; listener bound directly on {host}"),
+            })
+            if loopback and not agents.get("client_ip_header"):
+                findings.append({
+                    "level": "WARN",
+                    "check": "agents.client_ip_header",
+                    "detail": "unset; behind a tunnel every agent shares one address, so failed-attempt limits apply to all",
+                })
+        elif not agents.get("tailnet_node_ids"):
             findings.append({"level": "FAIL", "check": "agents.tailnet_node_ids", "detail": "empty; agents cannot be admitted"})
         else:
             findings.append({"level": "PASS", "check": "agents.tailnet_node_ids", "detail": f"{len(agents['tailnet_node_ids'])} node id(s) pinned"})

@@ -17,11 +17,20 @@ agents:
   #   contextbridge-admin --config configs/computer.yaml tls-init --hostname friday --ip <this host's Tailscale IP>
   #   contextbridge-admin --config configs/computer.yaml pair thanatos
   enabled: false
-  host: 127.0.0.1          # loopback, or this host's Tailscale IP for remote agents; never 0.0.0.0 or a public address
+  host: 127.0.0.1          # loopback (behind a tunnel), or one IP address; never 0.0.0.0
   port: 8792
+  # Who may even try to enroll or sign in:
+  #   tailnet     (default off loopback) only the Tailscale nodes in tailnet_node_ids, on a private address
+  #   device-key  (always on loopback) any network; pairing codes and device keys are the only protection.
+  #               Off loopback it allows a public address and still requires tls_cert/tls_key.
+  # admission: tailnet
+  # client_ip_header: CF-Connecting-IP   # loopback only: the real client address a tunnel on this host passes on
+  # public_url: wss://agents.example.com # the address `pair` tells new devices to use
+  max_failed_attempts: 10  # failed enrollments/sign-ins per client address before it is refused...
+  failure_window_seconds: 600   # ...until its oldest failure is this old
   tls_cert: ../state/tls/gateway.crt   # required unless host is loopback
   tls_key: ../state/tls/gateway.key    # hidden from every file tool
-  # Mandatory tailnet admission when host is not loopback: the gateway refuses to start
+  # With admission: tailnet (the default when host is not loopback), the gateway refuses to start
   # with an empty list, and refuses agents that are not one of these Tailscale nodes (so a
   # plain LAN address cannot be used). Use stable peer IDs from gateway-local
   # `tailscale status --json` (Peer[*].ID), not a hostname or IP range.

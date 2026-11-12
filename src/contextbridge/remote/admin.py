@@ -95,7 +95,8 @@ def cmd_pair(listener: AgentListenerConfig, args: argparse.Namespace) -> None:
     print(f"On {args.name}, set in its agent config:")
     print(f"  name: {args.name}")
     print("  gateway:")
-    print(f"    url: {scheme}://<gateway address>:{listener.port}")
+    url = listener.public_url or f"{scheme}://<gateway address>:{listener.port}"
+    print(f"    url: {url}")
     if fingerprint:
         print(f"    fingerprint: {fingerprint}")
     print("then run:")

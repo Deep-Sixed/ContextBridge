@@ -50,7 +50,7 @@ from starlette.middleware import Middleware as ASGIMiddleware
 
 from .. import __version__
 from ..hardening import protect_process_secrets
-from ..net import HostOriginGuard, is_loopback, is_private_bind
+from ..net import HostOriginGuard, is_loopback, is_private_bind, is_specific_address
 from .audit import (
     MAX_AUDIT_VALUE,
     AuditError,
@@ -68,16 +68,16 @@ from .commands import CommandError
 from .dispatch import (
     COMMAND_TOOLS,
     DELETE_TOOL,
+    DESKTOP_TOOLS,
     DOCUMENT_READ_TOOLS,
     DOCUMENT_WRITE_TOOLS,
     ENGINE_TOOLS,
+    MEDIA_TOOLS,
     PROCESS_KILL_TOOL,
     PROCESS_LIST_TOOL,
     READ_TOOLS,
     TRASH_READ_TOOL,
     TRASH_RESTORE_TOOL,
-    DESKTOP_TOOLS,
-    MEDIA_TOOLS,
     WRITE_TOOLS,
     Engine,
     InvalidArguments,
@@ -85,7 +85,14 @@ from .dispatch import (
     build_federation,
     call_succeeded,
 )
-from .federation import TOOL_NAME, Federation, FederatedTool, FederationError, load_mcp_servers, result_text
+from .federation import (
+    TOOL_NAME,
+    FederatedTool,
+    Federation,
+    FederationError,
+    load_mcp_servers,
+    result_text,
+)
 from .files import FileOperationError
 from .policy import ComputerPolicy, PolicyError, PolicyViolation, load_policy
 from .scopes import (
@@ -952,8 +959,26 @@ def _port(value: Any, where: str) -> int:
     return value
 
 
+ADMISSION_TAILNET = "tailnet"
+ADMISSION_DEVICE_KEY = "device-key"
+ADMISSION_MODES = (ADMISSION_TAILNET, ADMISSION_DEVICE_KEY)
+
+
+def _bounded_int(value: Any, low: int, high: int, where: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
+        raise SystemExit(f"{where} must be a whole number from {low} to {high}.")
+    return value
+
+
 class AgentListenerConfig:
-    """The ``agents`` section: where remote agents dial in."""
+    """The ``agents`` section: where remote agents dial in.
+
+    ``admission`` decides which connections may even attempt to enroll or sign in:
+    ``tailnet`` (the default off loopback) admits only listed Tailscale nodes on a
+    private address; ``device-key`` admits any network and relies on the one-time
+    pairing code and the enrolled Ed25519 key alone. A loopback listener, which a
+    tunnel such as Cloudflare's publishes, is always ``device-key``.
+    """
 
     def __init__(self, cfg: dict[str, Any], base: Path, where: Path) -> None:
         self.host = str(cfg.get("host", "127.0.0.1"))
@@ -961,27 +986,61 @@ class AgentListenerConfig:
         self.tls_cert = _path(base, cfg.get("tls_cert"))
         self.tls_key = _path(base, cfg.get("tls_key"))
         self.registry = _path(base, cfg.get("registry"))
+        loopback = is_loopback(self.host)
+        explicit = cfg.get("admission")
+        self.admission = explicit or (ADMISSION_DEVICE_KEY if loopback else ADMISSION_TAILNET)
+        if self.admission not in ADMISSION_MODES:
+            raise SystemExit(f"{where}: agents.admission must be one of {', '.join(ADMISSION_MODES)}.")
         ids = cfg.get("tailnet_node_ids")
-        # A loopback listener is usable for a local agent and offline tests.
-        # A non-loopback listener must enforce tailnet peer admission.
-        if is_loopback(self.host):
-            self.tailnet_node_ids = None
-        else:
+        if self.admission == ADMISSION_TAILNET:
+            if loopback:
+                raise SystemExit(
+                    f"{where}: agents.admission: tailnet needs agents.host to be this host's Tailscale IP; "
+                    "on loopback every peer is 127.0.0.1. Use admission: device-key behind a tunnel."
+                )
             if not isinstance(ids, list) or not ids or any(
                 not isinstance(item, str) or not item.strip() for item in ids
             ):
                 raise SystemExit(f"{where}: agents.tailnet_node_ids must contain enrolled Tailscale node IDs.")
-            self.tailnet_node_ids = frozenset(ids)
+            self.tailnet_node_ids: frozenset[str] | None = frozenset(ids)
+        else:
+            # Node IDs left in a loopback config were always ignored; naming device-key next to them is a mistake.
+            if ids and explicit:
+                raise SystemExit(
+                    f"{where}: agents.tailnet_node_ids is only enforced with admission: tailnet; "
+                    "remove it or set admission: tailnet."
+                )
+            self.tailnet_node_ids = None
+        header = cfg.get("client_ip_header")
+        if header is not None and (not isinstance(header, str) or not header.strip() or not loopback):
+            raise SystemExit(
+                f"{where}: agents.client_ip_header names the header a proxy on this host sets "
+                "(e.g. CF-Connecting-IP), and is honored only when agents.host is loopback."
+            )
+        self.client_ip_header = header.strip() if isinstance(header, str) else None
+        self.public_url = str(cfg.get("public_url") or "").rstrip("/") or None
+        if self.public_url is not None:
+            parts = urlsplit(self.public_url)
+            if parts.scheme != "wss" or not parts.hostname or parts.path or parts.query:
+                raise SystemExit(f"{where}: agents.public_url must be the wss:// address agents use, with no path.")
+        self.max_failed_attempts = _bounded_int(
+            cfg.get("max_failed_attempts", 10), 1, 1000, f"{where}: agents.max_failed_attempts"
+        )
+        self.failure_window_seconds = _bounded_int(
+            cfg.get("failure_window_seconds", 600), 1, 86400, f"{where}: agents.failure_window_seconds"
+        )
         try:
             self.heartbeat_seconds = float(cfg.get("heartbeat_seconds", 15))
             self.call_timeout_seconds = float(cfg.get("call_timeout_seconds", 660))
         except (TypeError, ValueError):
             raise SystemExit(f"{where}: agents.heartbeat_seconds and call_timeout_seconds must be numbers.") from None
-        if not is_private_bind(self.host):
+        if self.admission == ADMISSION_TAILNET and not is_private_bind(self.host):
             raise SystemExit(
                 f"{where}: agents.host must be a loopback, LAN, or overlay-network IP address; "
-                f"{self.host} could be public."
+                f"{self.host} could be public. To accept agents from any network, set admission: device-key."
             )
+        if not is_specific_address(self.host):
+            raise SystemExit(f"{where}: agents.host must be one IP address, not a wildcard or hostname; got {self.host}.")
         if bool(self.tls_cert) != bool(self.tls_key):
             raise SystemExit(f"{where}: agents.tls_cert and agents.tls_key must be set together.")
         if not is_loopback(self.host) and not self.tls_cert:
@@ -1167,7 +1226,17 @@ def main(argv: list[str] | None = None) -> None:
             heartbeat_seconds=listener.heartbeat_seconds,
             call_timeout_seconds=listener.call_timeout_seconds,
             allowed_tailnet_node_ids=listener.tailnet_node_ids,
+            client_ip_header=listener.client_ip_header,
+            max_failed_attempts=listener.max_failed_attempts,
+            failure_window_seconds=listener.failure_window_seconds,
         )
+        if listener.admission == ADMISSION_DEVICE_KEY and not is_loopback(listener.host):
+            print(
+                f"[computer] agents listener on {listener.host} admits any network (admission: device-key); "
+                "only enrolled device keys and pairing codes protect it.",
+                file=sys.stderr,
+                flush=True,
+            )
 
     name = cfg.get("name", "ContextBridge Computer")
     federation = build_federation(mcp_servers, policy) if policy is not None else None
@@ -1206,6 +1275,7 @@ def main(argv: list[str] | None = None) -> None:
             local_tools=sorted(available_tools(policy)) if policy else None,
             policy=policy.summary() if policy else None,
             agents=f"{'wss' if ssl_context else 'ws'}://{listener.host}:{listener.port}" if listener else None,
+            agent_admission=listener.admission if listener else None,
             remote=(
                 {
                     "listen": f"http://{remote.host}:{remote.port}",

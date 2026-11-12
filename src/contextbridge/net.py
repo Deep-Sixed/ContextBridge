@@ -20,6 +20,17 @@ def is_loopback(host: str) -> bool:
         return False
 
 
+def is_specific_address(host: str) -> bool:
+    """True for loopback or one IP address literal (never a wildcard, multicast address, or hostname)."""
+    if is_loopback(host):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return not (address.is_unspecified or address.is_multicast)
+
+
 def is_private_bind(host: str) -> bool:
     """True for a specific loopback, LAN, or overlay-network address (never a wildcard or public IP)."""
     if is_loopback(host):
