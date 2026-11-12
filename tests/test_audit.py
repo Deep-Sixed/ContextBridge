@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from conftest import read_audit
 
+from contextbridge.computer.audit import ComputerAuditLog
 from contextbridge.filesystem.audit import GatewayAuditLog
 
 
@@ -99,3 +100,29 @@ def test_broken_stderr_does_not_raise(tmp_path: Path, monkeypatch: pytest.Monkey
     GatewayAuditLog(path).record(tool="search", query="q", success=True)
 
     assert read_audit(path)[0]["tool"] == "search"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits; Windows uses ACLs")
+def test_computer_and_agent_audit_logs_are_private(tmp_path: Path) -> None:
+    fresh = tmp_path / "new" / "computer.audit.jsonl"
+    existing = tmp_path / "agent.audit.jsonl"
+    existing.write_text("")
+    existing.chmod(0o644)
+
+    for path, route in ((fresh, "computer"), (existing, "agent")):
+        log = ComputerAuditLog(path, route=route, echo=False)
+        log.record("service_started")
+        log.close()
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert read_audit(fresh)[0]["event"] == "service_started"
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink") or os.name == "nt", reason="needs POSIX symlinks")
+def test_computer_audit_log_refuses_symlink(tmp_path: Path) -> None:
+    from contextbridge.computer.audit import AuditError
+
+    target = tmp_path / "elsewhere.jsonl"
+    target.write_text("")
+    os.symlink(target, tmp_path / "audit.jsonl")
+    with pytest.raises(AuditError):
+        ComputerAuditLog(tmp_path / "audit.jsonl")

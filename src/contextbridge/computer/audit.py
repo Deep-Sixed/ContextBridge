@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
+from ..hardening import open_private_log
+
 
 class AuditError(RuntimeError):
     """Raised when an audit event cannot be written."""
@@ -109,8 +111,7 @@ class ComputerAuditLog:
         self._fh: TextIO | None = None
         if self.path is not None:
             try:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                self._fh = self.path.open("a", buffering=1, encoding="utf-8")
+                self._fh = open_private_log(self.path)
             except OSError as exc:
                 raise AuditError(f"Cannot open audit log {self.path}: {exc}") from exc
 

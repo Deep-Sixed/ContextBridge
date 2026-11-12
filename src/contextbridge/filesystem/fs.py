@@ -20,7 +20,6 @@ import stat
 import tempfile
 import time
 import uuid
-from collections import deque
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -250,25 +249,21 @@ class Filesystem:
         limit = self.limits.max_read_bytes
         with _open_regular(target.path, path) as fh, _os_errors(path):
             if offset >= 0:
-                selected: list[bytes] = []
-                has_more = False
-                for index, line in enumerate(_lines(fh, path, limit)):
-                    if index < offset:
-                        continue
-                    if len(selected) == length:
-                        has_more = True
-                        break
-                    selected.append(line)
                 start = offset
             else:
-                tail: deque[bytes] = deque(maxlen=-offset)
-                total = 0
-                for line in _lines(fh, path, limit):
-                    tail.append(line)
-                    total += 1
-                selected = list(tail)[:length]
-                start = total - len(tail)
-                has_more = len(tail) > length
+                # Count first, then read forward: holding the last N lines would cost N lines of memory.
+                total = sum(1 for _ in _lines(fh, path, limit))
+                fh.seek(0)
+                start = max(0, total + offset)
+            selected: list[bytes] = []
+            has_more = False
+            for index, line in enumerate(_lines(fh, path, limit)):
+                if index < start:
+                    continue
+                if len(selected) == length:
+                    has_more = True
+                    break
+                selected.append(line)
         kept: list[bytes] = []
         used = 0
         for line in selected:

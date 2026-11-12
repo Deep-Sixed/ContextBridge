@@ -337,3 +337,43 @@ def test_utf8_bom_is_preserved_on_edit(policy, workspace):
     assert files.read_file(policy, "work/bom.txt")["content"] == "hello\r\n"
     files.edit_block(policy, "work/bom.txt", "hello", "bye")
     assert target.read_bytes() == b"\xef\xbb\xbfbye\r\n"
+
+
+def _peak_bytes(fn):
+    import tracemalloc
+
+    tracemalloc.start()
+    try:
+        result = fn()
+        return result, tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+def test_read_file_tail_memory_is_bounded_by_the_read_limit(make_policy, workspace):
+    (workspace / "docs" / "log.txt").write_text("".join(f"line {i:07d}\n" for i in range(400_000)), encoding="utf-8")
+    policy = make_policy(filesystem={"max_read_bytes": 4096})  # the file is about 5 MB
+    result, peak = _peak_bytes(lambda: files.read_file(policy, "docs/log.txt", offset=-1_000_000_000, length=1))
+    assert result["content"] == "line 0000000\n" and result["start_line"] == 0
+    assert peak < 1_000_000
+    last, _ = _peak_bytes(lambda: files.read_file(policy, "docs/log.txt", offset=-2))
+    assert last["content"] == "line 0399998\nline 0399999\n" and last["start_line"] == 399_998
+    assert last["total_lines"] == 400_000
+
+
+def test_read_file_huge_line_is_never_held_whole(make_policy, workspace):
+    (workspace / "docs" / "blob.json").write_text("x" * 5_000_000 + "\nafter\n", encoding="utf-8")
+    policy = make_policy(filesystem={"max_read_bytes": 4096})
+    result, peak = _peak_bytes(lambda: files.read_file(policy, "docs/blob.json"))
+    assert result["truncated"] and result["content"] == "" and result["total_lines"] == 2
+    assert peak < 1_000_000
+    tail = files.read_file(policy, "docs/blob.json", offset=-1)
+    assert tail["content"] == "after\n" and tail["start_line"] == 1
+
+
+def test_read_file_tail_keeps_crlf_and_utf16(make_policy, workspace):
+    (workspace / "docs" / "crlf.txt").write_bytes(b"a\r\nb\r\nc\r\n")
+    (workspace / "docs" / "wide.txt").write_text("one\ntwo\nthree\n", encoding="utf-16")
+    policy = make_policy()
+    assert files.read_file(policy, "docs/crlf.txt", offset=-2)["content"] == "b\r\nc\r\n"
+    assert files.read_file(policy, "docs/wide.txt", offset=-1)["content"] == "three\n"

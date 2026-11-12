@@ -225,7 +225,7 @@ Each tool call writes a sequence of JSONL events that share a `request_id`:
 | `completed` | The operation finished. `success` says whether it achieved its goal: for commands, exit code 0 and no timeout. A command that ran and exited 1 is `completed` with `success: false`. |
 | `exited` | A background session's process ended, with its exit code. |
 
-`requested` also records which `listener` the call came in on (`local` or `remote`), and the later events carry the caller's `client`, which is the OAuth client id for remote calls. A `service_started` event records the policy and tool surface at startup. The audit log fails closed: if the `requested` or `started` event can't be written, the operation does not run. File content and stdin are logged only as a size and a hash, never the text.
+`requested` also records which `listener` the call came in on (`local` or `remote`), and the later events carry the caller's `client`, which is the OAuth client id for remote calls. A `service_started` event records the policy and tool surface at startup. The audit log fails closed: if the `requested` or `started` event can't be written, the operation does not run. File content and stdin are logged only as a size and a hash, never the text. Audit logs record commands and paths verbatim, so they are created readable only by their owner (mode 0600), and an existing log is tightened to 0600 at startup.
 
 ## Remote devices
 
