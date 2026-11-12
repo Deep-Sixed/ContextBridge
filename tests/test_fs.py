@@ -446,3 +446,20 @@ def test_config_rejects_bad_sections(tmp_path: Path, section: object, message: s
 
     with pytest.raises(ValueError, match=message):
         _config(tmp_path, section)
+
+
+def test_read_file_tail_memory_is_bounded(dirs: dict[str, Path]) -> None:
+    import tracemalloc
+
+    (dirs["ro"] / "log.txt").write_bytes(b"".join(b"line %07d\n" % i for i in range(400_000)))
+    fs = _fs(dirs)
+    tracemalloc.start()
+    try:
+        result = fs.read_file(str(dirs["ro"] / "log.txt"), offset=-1_000_000_000, length=1)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert (result["content"], result["start_line"], result["has_more"]) == ("line 0000000\n", 0, True)
+    assert peak < 1_000_000
+    last = fs.read_file(str(dirs["ro"] / "log.txt"), offset=-2)
+    assert (last["content"], last["start_line"], last["has_more"]) == ("line 0399998\nline 0399999\n", 399_998, False)

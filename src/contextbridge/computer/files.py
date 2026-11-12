@@ -19,7 +19,6 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterator
-from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -127,6 +126,26 @@ def list_directory(policy: ComputerPolicy, path: str, *, depth: int = 1) -> dict
     return {"path": str(root), "entries": entries, "truncated": truncated}
 
 
+def _bounded_lines(fh, budget: int) -> Iterator[str]:
+    """Yield each line of a text file, keeping at most ``budget + 1`` characters of it.
+
+    A longer line is read through to its end but never held whole, so a huge
+    line (or a file with no newlines) costs ``budget`` of memory, not its size.
+    Any clipped line is over ``budget`` bytes, so the caller treats it as truncated.
+    """
+    cap = budget + 1
+    while True:
+        line = fh.readline(cap)
+        if not line:
+            return
+        if len(line) == cap and not line.endswith(("\n", "\r")):
+            while True:  # skip the rest of this line
+                rest = fh.readline(cap)
+                if not rest or len(rest) < cap or rest.endswith(("\n", "\r")):
+                    break
+        yield line
+
+
 def read_file(
     policy: ComputerPolicy, path: str, *, offset: int = 0, length: int | None = None
 ) -> dict[str, Any]:
@@ -145,35 +164,24 @@ def read_file(
     total_lines = 0
     with resolved.open("r", encoding=encoding, errors="replace", newline="") as fh:
         if offset < 0:
-            tail: deque[str] = deque(maxlen=-offset)
-            for line in fh:
-                tail.append(line)
-                total_lines += 1
-            selected = list(tail)
-            if length is not None:
-                selected = selected[: max(0, length)]
-            start = total_lines - len(tail)
-            lines: list[str] = []
-            for line in selected:
-                used += len(line.encode("utf-8"))
-                if used > budget:
-                    truncated = True
-                    break
-                lines.append(line)
+            # Count first, then read forward: holding the last N lines would cost N lines of memory.
+            counted = sum(1 for _ in _bounded_lines(fh, budget))
+            fh.seek(0)
+            start = max(0, counted + offset)
         else:
             start = offset
-            lines = []
-            for index, line in enumerate(fh):
-                total_lines = index + 1
-                if index < offset:
-                    continue
-                if truncated or (length is not None and len(lines) >= length):
-                    continue
-                used += len(line.encode("utf-8"))
-                if used > budget:
-                    truncated = True
-                    continue
-                lines.append(line)
+        lines: list[str] = []
+        for index, line in enumerate(_bounded_lines(fh, budget)):
+            total_lines = index + 1
+            if index < start:
+                continue
+            if truncated or (length is not None and len(lines) >= length):
+                continue
+            used += len(line.encode("utf-8"))
+            if used > budget:
+                truncated = True
+                continue
+            lines.append(line)
     return {
         "path": str(resolved),
         "encoding": encoding,
