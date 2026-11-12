@@ -178,6 +178,40 @@ Both tools are off by default and only report; neither captures the screen, send
 
 `docs/phase-2-desktop-plan.md` describes the planned next steps (session discovery, screen capture, input), none of which exist yet.
 
+### MCP servers on a device (federation)
+
+A device can also run other MCP servers, such as agent-desktop for desktop automation or Playwright MCP for a browser, and offer their tools through the same ContextBridge connection. ChatGPT or Claude then needs one connector, not one per server per machine.
+
+List the servers in that machine's own config (`agent.yaml` on a device, `computer.yaml` for `local`):
+
+```yaml
+mcp_servers:
+  desktop:                       # server name: lowercase letters, digits, '-'
+    command: agent-desktop
+    args: [mcp]
+    scope: computer:execute      # default; the token and the device grant must both carry it
+    tool_scopes:                 # optional: other scopes for single tools (check names with list_devices)
+      desktop_snapshot: desktop:observe
+      desktop_screenshot: desktop:observe
+    # tools: [desktop_snapshot, desktop_click]   # optional allowlist of the server's own tool names
+    # env: {NAME: value}                         # added to the credential-stripped environment
+    # timeout_seconds: 120                       # per call, at most 600
+  browser:
+    command: npx
+    args: ["-y", "@playwright/mcp@<exact version>"]   # pin a version; never @latest
+```
+
+How it works:
+- The engine starts each server over stdio when the agent (or gateway) starts, lists its tools, and reports them to the gateway. A server that fails to start is logged and left out; one that exits is started again on its next call.
+- Each tool is offered as `<server>_<tool>`, and a tool already named with that prefix keeps its name, so agent-desktop's `desktop_snapshot` stays `desktop_snapshot`. Names never replace a built-in tool. A tool that has its own `device` argument is skipped.
+- Callers see each tool once, with an added `device` argument. It defaults to the only device offering the tool (or `local`), and is required when several devices offer it. `list_devices` shows each device's `mcp_tools`.
+- Only the machine's own config can add a server. The gateway can call the tools a device reports; it cannot start a program or change the list.
+- Every call is checked like a built-in one: the caller's token, the device's registry grant, and the server's scope. It is audited as `requested` → `started` → `completed` on the gateway and the device. Arguments are logged only as a size and a hash, and `completed` records `success: false` when the server reports an error.
+- Servers get the same credential-stripped environment as commands. They run with the agent's own account and privileges, so a server is as powerful as what it can do there: grant `computer:execute` (or the scope you chose) only to devices and clients that should drive it.
+- Text, images, and structured results are passed through, up to 12 MB per result.
+
+Desktop servers need a desktop: on Windows run the agent with the at-logon task (`install-agent.ps1`), not a boot-time task with no interactive session. Clients see new tools when they next list tools; this phase does not yet push change notifications, MCP resources, or prompts.
+
 ### Audit trail
 
 Each tool call writes a sequence of JSONL events that share a `request_id`:
@@ -471,6 +505,7 @@ Do not forward ports 8791, 8792, or 8794 to the internet. Publish 8793 only thro
 5. ~~Authenticated remote MCP endpoint for ChatGPT and Claude (OAuth front end, per-device permissions)~~
 6. ~~Failover acceptance test (drill + jailed CI test)~~
 7. ~~Native delete (trash with restore) and document tools (PDF, Word, Excel)~~
+8. ~~MCP federation, phase 1: MCP servers a device runs, offered through the gateway with a `device` argument~~
 
 ## Documentation
 

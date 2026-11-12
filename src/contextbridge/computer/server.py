@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import functools
 import os
 import platform
@@ -42,8 +43,9 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.auth import StaticTokenVerifier
 from fastmcp.server.middleware import Middleware, MiddlewareContext
-from fastmcp.tools.tool import Tool
-from mcp.types import ToolAnnotations
+from fastmcp.tools.tool import Tool, ToolResult
+from mcp.types import ContentBlock, ToolAnnotations
+from pydantic import TypeAdapter, ValidationError
 from starlette.middleware import Middleware as ASGIMiddleware
 
 from .. import __version__
@@ -56,6 +58,7 @@ from .audit import (
     ComputerAuditLog,
     bind_call,
     current_call,
+    digest_args,
     mark_started,
     outcome_fields,
     summarize_args,
@@ -79,10 +82,21 @@ from .dispatch import (
     Engine,
     InvalidArguments,
     available_tools,
+    build_federation,
     call_succeeded,
 )
+from .federation import TOOL_NAME, Federation, FederatedTool, FederationError, load_mcp_servers, result_text
 from .files import FileOperationError
 from .policy import ComputerPolicy, PolicyError, PolicyViolation, load_policy
+from .scopes import (
+    ALL_SCOPES,
+    SCOPE_DESKTOP_OBSERVE,
+    SCOPE_EXECUTE,
+    SCOPE_MEDIA_DISCOVER,
+    SCOPE_PROCESS,
+    SCOPE_READ,
+    SCOPE_WRITE,
+)
 
 TOKEN_ENV = "CONTEXTBRIDGE_COMPUTER_TOKEN"
 FS_TOKEN_ENV = "CONTEXTBRIDGE_FS_AUTH_TOKEN"
@@ -92,13 +106,6 @@ LOCAL_DEVICE = "local"
 LIST_DEVICES_TOOL = "list_devices"
 DEFAULT_REDIRECT_HOSTS = ("claude.ai", "claude.com", "chatgpt.com")
 
-SCOPE_READ = "computer:read"
-SCOPE_WRITE = "computer:write"
-SCOPE_EXECUTE = "computer:execute"
-SCOPE_PROCESS = "computer:process"
-SCOPE_DESKTOP_OBSERVE = "desktop:observe"
-SCOPE_MEDIA_DISCOVER = "media:discover"
-ALL_SCOPES = (SCOPE_READ, SCOPE_WRITE, SCOPE_EXECUTE, SCOPE_PROCESS, SCOPE_DESKTOP_OBSERVE, SCOPE_MEDIA_DISCOVER)
 
 TOOL_SCOPES: dict[str, str] = {
     **{name: SCOPE_READ for name in READ_TOOLS | DOCUMENT_READ_TOOLS},
@@ -132,8 +139,10 @@ class AuthorizationError(PermissionError):
     """Raised when the caller may not use a tool."""
 
 
-Authorizer = Callable[[str], str]
-"""Given a tool name, return the caller's client id or raise :class:`AuthorizationError`."""
+Authorizer = Callable[..., str]
+"""Called as ``authorize(tool)`` for a built-in tool, or ``authorize(tool, scope)`` for a
+federated one (whose scope comes from the device). Returns the caller's client id or raises
+:class:`AuthorizationError`."""
 
 DeviceGrant = Callable[[], frozenset[str] | None]
 """The devices the current caller may reach, or None for every device."""
@@ -144,8 +153,8 @@ def all_devices() -> frozenset[str] | None:
     return None
 
 
-def token_authorizer(tool: str) -> str:
-    """Authorize ``tool`` against the bearer token of the current request."""
+def token_authorizer(tool: str, scope: str | None = None) -> str:
+    """Authorize ``tool`` (needing ``scope``, else its built-in scope) against the current bearer token."""
     try:
         from fastmcp.server.dependencies import get_access_token
 
@@ -154,7 +163,7 @@ def token_authorizer(tool: str) -> str:
         token = None
     if token is None:
         raise AuthorizationError("Authentication required.")
-    scope = TOOL_SCOPES.get(tool)
+    scope = scope or TOOL_SCOPES.get(tool)
     if scope is None or scope not in (token.scopes or []):
         raise AuthorizationError(f"Token is not authorized for '{tool}' (needs {scope}).")
     return token.client_id
@@ -179,12 +188,46 @@ class DeviceRouter:
             tools |= self.hub.online_tools(devices)
         return frozenset(tools)
 
-    def check(self, device: str, tool: str) -> None:
-        """Raise AuthorizationError (denied) or DeviceUnavailable (failed) unless the call may proceed."""
+    def federated(self, devices: frozenset[str] | None = None) -> dict[str, dict[str, FederatedTool]]:
+        """Federated tools per online device (only those in ``devices``, unless None)."""
+        found: dict[str, dict[str, FederatedTool]] = {}
+        if self.local is not None and self.local.federated and (devices is None or LOCAL_DEVICE in devices):
+            found[LOCAL_DEVICE] = self.local.federated
+        if self.hub is not None:
+            found.update(self.hub.online_federated(devices))
+        return found
+
+    def device_allows(self, device: str, scope: str) -> bool:
+        """Whether ``device``'s registry grant includes ``scope`` (always true for ``local``)."""
+        if device == LOCAL_DEVICE:
+            return True
+        record = self.hub.registry.by_name(device) if self.hub is not None else None
+        return record is not None and scope in record.scopes
+
+    def offline(self, device: str) -> bool:
+        """Whether ``device`` is an enrolled remote device that is not connected."""
+        if device == LOCAL_DEVICE or self.hub is None:
+            return False
+        record = self.hub.registry.by_name(device)
+        return record is not None and record.active and self.hub.connection(device) is None
+
+    def federated_tool(self, device: str, tool: str) -> FederatedTool | None:
+        """The federated tool ``tool`` as ``device`` offers it, if it is online and offers it."""
+        if device == LOCAL_DEVICE:
+            return self.local.federated.get(tool) if self.local is not None else None
+        conn = self.hub.connection(device) if self.hub is not None else None
+        return conn.federated.get(tool) if conn is not None else None
+
+    def check(self, device: str, tool: str, scope: str | None = None) -> None:
+        """Raise AuthorizationError (denied) or DeviceUnavailable (failed) unless the call may proceed.
+
+        ``scope`` is given for a federated tool; built-in tools use their own scope.
+        """
+        needs = scope or TOOL_SCOPES[tool]
         if device == LOCAL_DEVICE:
             if self.local is None:
                 raise AuthorizationError("This gateway has no local device; choose one from list_devices.")
-            if tool not in self.local.tools:
+            if tool not in self.local.tools and tool not in self.local.federated:
                 raise AuthorizationError(f"Tool '{tool}' is not permitted on this computer.")
             return
         from ..remote.hub import DeviceUnavailable
@@ -197,12 +240,12 @@ class DeviceRouter:
         record = self.hub.registry.by_name(device)
         if record is None:
             raise AuthorizationError(f"Unknown device '{device}'.")
-        if TOOL_SCOPES[tool] not in record.scopes:
-            raise AuthorizationError(f"Device '{device}' is not authorized for '{tool}' (needs {TOOL_SCOPES[tool]}).")
+        if needs not in record.scopes:
+            raise AuthorizationError(f"Device '{device}' is not authorized for '{tool}' (needs {needs}).")
         conn = self.hub.connection(device)
         if conn is None:
             raise DeviceUnavailable(f"Device '{device}' is offline.")
-        if tool not in conn.tools:
+        if tool not in conn.tools and tool not in conn.federated:
             raise AuthorizationError(f"Tool '{tool}' is not enabled on device '{device}'.")
 
     async def call(self, device: str, tool: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -222,6 +265,8 @@ class DeviceRouter:
                     "info": {"hostname": socket.gethostname(), "platform": f"{platform.system()} {platform.release()}"},
                 }
             )
+            if self.local.federated:
+                rows[-1]["mcp_tools"] = sorted(self.local.federated)
         if self.hub is not None:
             rows.extend(self.hub.describe())
         return [row for row in rows if devices is None or row["device"] in devices]
@@ -241,7 +286,9 @@ async def _invoke(router: DeviceRouter, device: str, tool: str, args: dict[str, 
         raise ToolError(f"Denied by policy: {exc}") from exc
     except AuditError as exc:
         raise ToolError(f"Audit log unavailable; operation refused: {exc}") from exc
-    except (FileNotFoundError, FileOperationError, CommandError, UnicodeDecodeError, InvalidArguments) as exc:
+    except (
+        FileNotFoundError, FileOperationError, CommandError, UnicodeDecodeError, InvalidArguments, FederationError
+    ) as exc:
         raise ToolError(str(exc)) from exc
     except _device_errors() as exc:
         raise ToolError(str(exc)) from exc
@@ -251,6 +298,35 @@ async def _invoke(router: DeviceRouter, device: str, tool: str, args: dict[str, 
 
 def _elapsed_ms(started: float) -> int:
     return max(0, round((time.monotonic() - started) * 1000))
+
+
+_CONTENT = TypeAdapter(list[ContentBlock])
+
+
+class _FederatedListing(Tool):
+    """How a federated tool is listed. Calls never reach it: the middleware routes them to a device."""
+
+    async def run(self, arguments: dict[str, Any]) -> ToolResult:
+        raise ToolError("This tool is served by a device; call it through the gateway.")
+
+
+def federated_listing(name: str, offers: list[tuple[str, FederatedTool]]) -> Tool:
+    """The tool a caller sees for ``name``: the first offer's schema plus a ``device`` argument."""
+    devices = [device for device, _ in offers]
+    first = offers[0][1]
+    schema = copy.deepcopy(first.input_schema)
+    schema["type"] = "object"
+    properties = schema.setdefault("properties", {})
+    named = ", ".join(devices)
+    device_arg: dict[str, Any] = {"type": "string", "description": f"Device to run on: {named}."}
+    if len(devices) == 1 or LOCAL_DEVICE in devices:
+        device_arg["default"] = devices[0] if len(devices) == 1 else LOCAL_DEVICE
+    else:
+        schema["required"] = [*(schema.get("required") or []), "device"]
+    properties["device"] = device_arg
+    description = f"{first.description}\n\n(MCP server '{first.server}' on {named}.)".strip()
+    annotations = ToolAnnotations(**first.annotations) if first.annotations else None
+    return _FederatedListing(name=name, description=description, parameters=schema, annotations=annotations)
 
 
 class ComputerPolicyMiddleware(Middleware):
@@ -282,6 +358,54 @@ class ComputerPolicyMiddleware(Middleware):
             self._router.check(target, name)
         return client
 
+    def _offers(self, name: str | None = None) -> dict[str, list[tuple[str, FederatedTool]]]:
+        """Federated tools the caller may use, by name, with the devices offering each (``local`` first)."""
+        offers: dict[str, list[tuple[str, FederatedTool]]] = {}
+        per_device = self._router.federated(self._devices())
+        for device in sorted(per_device, key=lambda d: (d != LOCAL_DEVICE, d)):
+            for tool in per_device[device].values():
+                if tool.name in SERVER_TOOLS or (name is not None and tool.name != name):
+                    continue
+                if not self._router.device_allows(device, tool.scope):
+                    continue
+                try:
+                    self._authorize(tool.name, tool.scope)
+                except AuthorizationError:
+                    continue
+                offers.setdefault(tool.name, []).append((device, tool))
+        return offers
+
+    def _federated_target(self, name: str, device: str | None) -> str:
+        if device:
+            return device
+        devices = [d for d, _ in self._offers(name).get(name, [])]
+        if len(devices) == 1:
+            return devices[0]
+        if LOCAL_DEVICE in devices:
+            return LOCAL_DEVICE
+        if devices:
+            raise AuthorizationError(f"Choose a device for '{name}': {', '.join(devices)}.")
+        if self._router.federated_tool(LOCAL_DEVICE, name) is not None:
+            return LOCAL_DEVICE  # so the refusal names the scope the caller lacks
+        raise AuthorizationError(f"Tool '{name}' is not available.")
+
+    def _check_federated(self, name: str, device: str) -> tuple[str, FederatedTool]:
+        if not TOOL_NAME.match(name):
+            raise AuthorizationError("Unknown tool.")
+        granted = self._devices()
+        if granted is not None and device not in granted:
+            raise AuthorizationError(f"This client is not authorized for device '{device}'.")
+        tool = self._router.federated_tool(device, name)
+        if tool is None:
+            if self._router.offline(device):
+                from ..remote.hub import DeviceUnavailable
+
+                raise DeviceUnavailable(f"Device '{device}' is offline.")
+            raise AuthorizationError(f"Tool '{name}' is not offered by device '{device}'.")
+        client = self._authorize(name, tool.scope)
+        self._router.check(device, name, tool.scope)
+        return client, tool
+
     async def on_list_tools(self, context: MiddlewareContext[Any], call_next: Any) -> Sequence[Tool]:
         tools = await call_next(context)
         offered = self._router.available_tools(self._devices()) | {LIST_DEVICES_TOOL}
@@ -294,12 +418,16 @@ class ComputerPolicyMiddleware(Middleware):
             except AuthorizationError:
                 continue
             visible.append(tool)
+        for name, offers in sorted(self._offers().items()):
+            visible.append(federated_listing(name, offers))
         return visible
 
     async def on_call_tool(self, context: MiddlewareContext[Any], call_next: Any) -> Any:
+        name = str(getattr(context.message, "name", None) or "<unknown>")
+        if name not in SERVER_TOOLS:
+            return await self._call_federated(context, name)
         started = time.monotonic()
         request_id = uuid.uuid4().hex[:16]
-        name = str(getattr(context.message, "name", None) or "<unknown>")
         arguments = getattr(context.message, "arguments", None) or {}
         device = arguments.get("device") if isinstance(arguments.get("device"), str) else None
         if name != LIST_DEVICES_TOOL:
@@ -354,6 +482,70 @@ class ComputerPolicyMiddleware(Middleware):
         )
         return result
 
+    async def _call_federated(self, context: MiddlewareContext[Any], name: str) -> ToolResult:
+        """Authorize, audit, and run a tool from a device's MCP server, then relay its result."""
+        started = time.monotonic()
+        request_id = uuid.uuid4().hex[:16]
+        raw = getattr(context.message, "arguments", None) or {}
+        arguments = {k: v for k, v in raw.items() if k != "device"} if isinstance(raw, dict) else {}
+        device = raw.get("device") if isinstance(raw, dict) and isinstance(raw.get("device"), str) else None
+        tool_name = name if TOOL_NAME.match(name) else "<invalid>"
+        try:
+            self._audit.record(
+                "requested",
+                request_id=request_id,
+                tool=tool_name,
+                device=device,
+                listener=self._listener,
+                **digest_args(arguments),
+            )
+        except AuditError as exc:
+            raise ToolError(f"Audit log unavailable; refusing to run '{tool_name}'.") from exc
+
+        try:
+            device = self._federated_target(name, device)
+            client, tool = self._check_federated(name, device)
+        except AuthorizationError as exc:
+            self._audit.record("denied", request_id=request_id, tool=tool_name, device=device, reason=str(exc))
+            raise ToolError(str(exc)) from exc
+        except _device_errors() as exc:
+            self._audit.record("failed", request_id=request_id, tool=tool_name, device=device, reason=str(exc))
+            raise ToolError(str(exc)) from exc
+
+        call = CallAudit(self._audit, request_id, name, client, device=device)
+        binding = bind_call(call)
+        try:
+            result = await _invoke(self._router, device, name, arguments)
+        except Exception as exc:
+            cause = exc.__cause__ if isinstance(exc, ToolError) and exc.__cause__ else exc
+            event = "completed" if call.started else ("denied" if isinstance(cause, PolicyViolation) else "failed")
+            call.emit(
+                event,
+                success=False if event == "completed" else None,
+                detail=type(cause).__name__,
+                reason=str(exc)[:MAX_AUDIT_VALUE],
+                elapsed_ms=_elapsed_ms(started),
+            )
+            raise
+        finally:
+            unbind_call(binding)
+
+        def finish(success: bool, **fields: Any) -> None:
+            call.emit("completed", success=success, mcp_server=tool.server, elapsed_ms=_elapsed_ms(started), **fields)
+
+        if result.get("is_error") is True:
+            message = result_text(result)[:MAX_AUDIT_VALUE] or "the tool reported an error"
+            finish(False, reason=message)
+            raise ToolError(f"{name} on '{device}': {message}")
+        structured = result.get("structured_content")
+        try:
+            content = _CONTENT.validate_python(result.get("content") or [])
+        except ValidationError:
+            finish(False, reason="malformed result")
+            raise ToolError(f"{name} on '{device}' returned a malformed result.") from None
+        finish(True)
+        return ToolResult(content=content, structured_content=structured if isinstance(structured, dict) else None)
+
 
 def _instructions(policy: ComputerPolicy | None, remote: bool) -> str:
     parts = ["Policy-controlled access to computers. Every tool takes a 'device' argument (default 'local')."]
@@ -379,8 +571,17 @@ def _instructions(policy: ComputerPolicy | None, remote: bool) -> str:
     return " ".join(parts)
 
 
-def build_router(policy: ComputerPolicy | None, *, audit: ComputerAuditLog, hub: Any | None = None) -> DeviceRouter:
-    """The devices one or more MCP servers share: ``local`` under ``policy`` (if any) plus the hub's agents."""
+def build_router(
+    policy: ComputerPolicy | None,
+    *,
+    audit: ComputerAuditLog,
+    hub: Any | None = None,
+    federation: Federation | None = None,
+) -> DeviceRouter:
+    """The devices one or more MCP servers share: ``local`` under ``policy`` (if any) plus the hub's agents.
+
+    ``federation`` adds the MCP servers the gateway's own config runs to the ``local`` device.
+    """
 
     def report_exit(status: dict[str, Any]) -> None:
         audit.record(
@@ -391,7 +592,7 @@ def build_router(policy: ComputerPolicy | None, *, audit: ComputerAuditLog, hub:
             **{k: status[k] for k in ("session_id", "pid", "command", "exit_code", "timed_out", "runtime_seconds")},
         )
 
-    local = Engine(policy, on_exit=report_exit) if policy is not None else None
+    local = Engine(policy, on_exit=report_exit, federation=federation) if policy is not None else None
     return DeviceRouter(local, hub)
 
 
@@ -935,8 +1136,11 @@ def main(argv: list[str] | None = None) -> None:
         policy = (
             load_policy(cfg, protected=tuple(protected), hidden=tuple(hidden)) if "filesystem" in cfg else None
         )
+        mcp_servers = load_mcp_servers(cfg, base=base)
     except PolicyError as exc:
         raise SystemExit(f"{config_path}: {exc}") from None
+    if mcp_servers and policy is None:
+        raise SystemExit(f"{config_path}: mcp_servers run on the local device; configure filesystem too.")
     if policy is None and listener is None:
         raise SystemExit(f"{config_path}: configure a local device (filesystem) and/or enable agents.")
     for warning in policy.allowlist_warnings() if policy else ():
@@ -966,7 +1170,11 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     name = cfg.get("name", "ContextBridge Computer")
-    router = build_router(policy, audit=audit, hub=hub)
+    federation = build_federation(mcp_servers, policy) if policy is not None else None
+    if federation is not None:
+        federation.start()
+        audit.record("mcp_servers_started", servers=federation.describe(), tools=sorted(federation.tools))
+    router = build_router(policy, audit=audit, hub=hub, federation=federation)
     server = create_computer_server(None, audit=audit, router=router, name=name)
     remote_server = None
     if remote is not None:
@@ -1068,5 +1276,7 @@ def main(argv: list[str] | None = None) -> None:
             if hub is not None:
                 with contextlib.suppress(Exception):
                     await hub.close()
+            if federation is not None:
+                federation.close()
 
     anyio.run(serve_all)

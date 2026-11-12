@@ -44,8 +44,8 @@ HI = python_cmd("print('hi')")
 
 
 def allow_scopes(*scopes: str):
-    def authorize(tool: str) -> str:
-        if TOOL_SCOPES.get(tool) not in scopes:
+    def authorize(tool: str, scope: str | None = None) -> str:
+        if (scope or TOOL_SCOPES.get(tool)) not in scopes:
             raise AuthorizationError(f"Token is not authorized for '{tool}'.")
         return "test-client"
 
