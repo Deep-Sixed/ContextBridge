@@ -98,11 +98,13 @@ printf 'CONTEXTBRIDGE_COMPUTER_TOKEN=%s\n' "$(openssl rand -hex 32)" > /etc/cont
 chmod 600 /etc/contextbridge/gateway.env
 ```
 
-Admin commands run as the gateway account:
+Admin commands run as the gateway account. Add this to root's `~/.bashrc` so `cb-admin` exists in every root shell:
 
 ```sh
-alias cb-admin='runuser -u contextbridge -- /opt/contextbridge/venv/bin/contextbridge-admin --config /opt/contextbridge/config/computer.yaml'
+cb-admin() { (cd /opt/contextbridge && runuser -u contextbridge -- /opt/contextbridge/venv/bin/contextbridge-admin --config /opt/contextbridge/config/computer.yaml "$@"); }
 ```
+
+The `cd` matters: at startup FastMCP looks for a `.env` file in the current directory, and the `contextbridge` account cannot look inside `/root`, so running from root's home fails with `PermissionError: '.env'`. The parentheses run it in a subshell, so your own shell stays where it was.
 
 ## 4. Run it as a service
 
