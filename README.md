@@ -396,6 +396,11 @@ contextbridge-admin --config configs/computer.yaml oauth-revoke <client_id>   # 
 contextbridge-admin --config configs/computer.yaml oauth-unlock               # clear a consent lockout
 ```
 
+- **New devices need a new approval.** A grant names the devices ticked on the consent page, so a device enrolled later is not visible to existing clients, even with `allow_devices: ["*"]`. Revoke the client and reconnect it, ticking the new device.
+- **Missing tools are usually scopes.** A tool appears only when its scope is in both `allow_scopes` and the client's grant. For example, `list_windows` and `media_inventory` stay hidden until `desktop:observe` and `media:discover` are allowed.
+- **Keep approval prompts on in the client.** Claude and ChatGPT can ask before each tool call. Let the read-only tools run unprompted if you like, but keep approval for anything that writes, deletes, runs commands or kills processes. Text the assistant reads, such as a web page or a file, can contain planted instructions, and with prompts off those run unattended. Under `command_mode: unrestricted`, a command runs with all of the agent account's access, regardless of the device's file rules, so `run_command` and `start_process` matter most.
+- **Disconnect, not uninstall.** To reauthorize a connector, disconnect and reconnect it. Uninstalling it in the client removes the connector itself, and you have to add it again.
+
 ### How the remote endpoint is secured
 
 - **Owner consent on every authorization.** No client gets a token until you approve it on the consent page, which requires both the passphrase and a TOTP code.

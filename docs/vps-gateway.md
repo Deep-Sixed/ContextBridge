@@ -106,7 +106,7 @@ alias cb-admin='runuser -u contextbridge -- /opt/contextbridge/venv/bin/contextb
 
 ## 4. Run it as a service
 
-Create `/etc/systemd/system/contextbridge-gateway.service`:
+Create `/etc/systemd/system/contextbridge-gateway.service`. This guide uses the name `contextbridge-gateway` throughout; if you name the unit differently, use your name in the `systemctl` and `journalctl` commands.
 
 ```ini
 [Unit]
@@ -171,6 +171,13 @@ Copying the old gateway's state keeps every enrolled device (same `gateway_id`, 
 7. **Turn the old gateway machine into an agent.** Its files were the `local` device; on the VPS there is no `local`. Pair it as a normal device (`cb-admin pair <name>`), give it an agent config with the policy its old `filesystem`/`commands`/`processes` sections had, and enroll it. `pair` prints the `agents.public_url` address to use.
 8. **Re-approve clients for the new device.** Existing grants name `local`, which no longer exists. Revoke and reconnect each client (`cb-admin oauth-clients`, `cb-admin oauth-revoke <id>`) and tick the new device on the consent page.
 
+9. **Retire the old gateway** once the old machine works as an agent and has survived a reboot:
+   - stop and disable its gateway service, and check with `ss -tlnp` that none of its old ports are still listening;
+   - in Cloudflare, delete its old tunnel if no hostnames route to it any more, and uninstall `cloudflared` there;
+   - clean up old copies of `oauth.json`, including any in backup archives. First confirm which copy is live: it is the one in the VPS's `state` folder, and `cb-admin oauth-clients` should list your clients from it. Keep at most one backup of that live file, mode 600, somewhere only you can read. Delete every other copy; each holds a passphrase hash and an authenticator secret.
+
+**Starting fresh instead:** if the old gateway is unreachable, run `cb-admin owner-init` on the VPS, enroll each machine with `cb-admin pair` (set aside its old identity file first), and reconnect each client. The old `oauth.json` is then useless; delete it when you can.
+
 **Rollback:** stop the VPS gateway, move the `mcp.example.com` route back to the old tunnel, restore the old agent configs (URL and fingerprint), and start the old gateway. Keep the old state folder untouched until the VPS has run cleanly for a while.
 
 ## 7. Adding a new machine later
@@ -180,6 +187,19 @@ cb-admin pair laptop --scopes computer:read     # prints a one-time code (defaul
 ```
 
 On the new machine, copy `configs/agent.yaml`, set `name: laptop`, `gateway.url: wss://agents.example.com`, no fingerprint, and its own policy, then run `contextbridge-agent enroll --config <file> --code <code>` and start the agent. The machine needs nothing but outbound HTTPS.
+
+Existing ChatGPT and Claude approvals name their devices, so they can't see the new machine yet. Revoke and reconnect each client that should use it, ticking the new device on the consent page.
+
+## 8. Upgrading
+
+Upgrade the gateway first, then each agent, all to the same git revision.
+
+1. **Gateway:** the upgrade steps in section 2, then `systemctl restart contextbridge-gateway`.
+2. **Each agent, one at a time:** install the new revision into a new folder or virtual environment next to the old one, point the agent's service or scheduled task at it, and restart it. Keep the agent config and identity file where they are; no re-enrollment is needed.
+3. **Check:** `list_devices` shows each agent online with the new `agent_version`, and a test command runs on it. Move on to the next agent only after that.
+4. **Clean up:** after a few days without problems, delete the old installation folders.
+
+New versions can add tools. Review the client's tool permissions after upgrading, and set any new write or delete tools to require approval.
 
 ## Checks
 
