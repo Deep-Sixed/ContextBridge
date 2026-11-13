@@ -54,6 +54,7 @@ remote:
   allow_scopes: [computer:read]   # the most any remote client can be approved for; add more deliberately
   allow_devices: [local]   # device names remote clients may be offered; "*" for every enrolled device
   allowed_redirect_hosts: [claude.ai, claude.com, chatgpt.com]   # who may register as a client
+  # add 127.0.0.1 and "::1" to let desktop MCP clients (local agents) sign in; see README "Local agents and desktop apps"
   access_token_minutes: 60
   refresh_token_days: 30   # a client unused this long must be approved again
 

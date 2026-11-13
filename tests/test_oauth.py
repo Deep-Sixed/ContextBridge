@@ -247,15 +247,14 @@ def test_device_grant_limits_tools_and_listing(policy, tmp_path):
 # --------------------------------------------- authorization server (ASGI)
 
 
-@pytest.fixture
-def remote(policy, tmp_path, store):
+def _remote(policy, tmp_path, store, redirect_hosts):
     audit_path = tmp_path / "audit.jsonl"
     audit = ComputerAuditLog(audit_path, echo=False)
     settings = RemoteSettings(
         public_url=PUBLIC,
         allow_scopes=(SCOPE_READ, SCOPE_WRITE),
         allow_devices=("local",),
-        allowed_redirect_hosts=("claude.ai", "localhost"),
+        allowed_redirect_hosts=redirect_hosts,
     )
     server = create_remote_server(build_router(policy, audit=audit), audit=audit, settings=settings, store=store)
     app = server.http_app()
@@ -264,6 +263,17 @@ def remote(policy, tmp_path, store):
         return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=PUBLIC)
 
     return SimpleNamespace(client=client, store=store, audit_path=audit_path)
+
+
+@pytest.fixture
+def remote(policy, tmp_path, store):
+    return _remote(policy, tmp_path, store, ("claude.ai", "localhost"))
+
+
+@pytest.fixture
+def remote_local_apps(policy, tmp_path, store):
+    """A gateway that also lets desktop apps (OpenCode, local agents) sign in through a loopback redirect."""
+    return _remote(policy, tmp_path, store, ("claude.ai", "127.0.0.1", "::1"))
 
 
 async def register(http: httpx.AsyncClient, *, redirect: str = REDIRECT, name: str = "Claude", **extra) -> httpx.Response:
@@ -279,13 +289,19 @@ async def register(http: httpx.AsyncClient, *, redirect: str = REDIRECT, name: s
 
 
 async def start_authorization(
-    http: httpx.AsyncClient, client_id: str, *, scope: str | None = None, state="s1", resource=PUBLIC + "/mcp"
+    http: httpx.AsyncClient,
+    client_id: str,
+    *,
+    scope: str | None = None,
+    state="s1",
+    resource=PUBLIC + "/mcp",
+    redirect: str = REDIRECT,
 ):
     verifier, challenge = pkce()
     params = {
         "response_type": "code",
         "client_id": client_id,
-        "redirect_uri": REDIRECT,
+        "redirect_uri": redirect,
         "code_challenge": challenge,
         "code_challenge_method": "S256",
         "state": state,
@@ -313,13 +329,13 @@ async def approve(http, page, store, *, scopes=(SCOPE_READ,), devices=("local",)
     return await http.post("/consent", data=data)
 
 
-async def exchange(http, client_id: str, verifier: str, code: str) -> httpx.Response:
+async def exchange(http, client_id: str, verifier: str, code: str, *, redirect: str = REDIRECT) -> httpx.Response:
     return await http.post(
         "/token",
         data={
             "grant_type": "authorization_code",
             "code": code,
-            "redirect_uri": REDIRECT,
+            "redirect_uri": redirect,
             "client_id": client_id,
             "code_verifier": verifier,
             "resource": PUBLIC + "/mcp",
@@ -357,6 +373,68 @@ def test_registration_only_for_allowed_https_redirects(remote, redirect):
     response = anyio.run(scenario)
     assert response.status_code == 400 and response.json()["error"] == "invalid_redirect_uri"
     assert remote.store.clients() == []
+
+
+@pytest.mark.parametrize(
+    "redirect",
+    ["http://127.0.0.1:53682/callback", "http://127.0.0.1:1/cb", "http://[::1]:8000/oauth/callback"],
+)
+def test_listed_loopback_hosts_let_desktop_apps_register_on_any_port(remote_local_apps, redirect):
+    async def scenario():
+        async with await remote_local_apps.client() as http:
+            return await register(http, redirect=redirect, name="OpenCode")
+
+    response = anyio.run(scenario)
+    assert response.status_code == 201, response.text
+    assert [c["client_name"] for c in remote_local_apps.store.clients()] == ["OpenCode"]
+
+
+@pytest.mark.parametrize(
+    "redirect",
+    [
+        "http://127.0.0.2:5000/cb",  # loopback, but not a listed host
+        "http://127.0.0.1.evil.example:5000/cb",
+        "http://claude.ai/callback",  # a listed host, but plain http off loopback
+        "file:///tmp/cb",
+    ],
+)
+def test_loopback_redirects_are_exact_listed_hosts_and_http_only_there(remote_local_apps, redirect):
+    async def scenario():
+        async with await remote_local_apps.client() as http:
+            return await register(http, redirect=redirect)
+
+    response = anyio.run(scenario)
+    assert response.status_code == 400 and response.json()["error"] == "invalid_redirect_uri"
+    assert remote_local_apps.store.clients() == []
+
+
+def test_loopback_redirects_are_refused_unless_listed(remote):
+    async def scenario():
+        async with await remote.client() as http:
+            return await register(http, redirect="http://127.0.0.1:53682/callback")
+
+    response = anyio.run(scenario)
+    assert response.status_code == 400 and response.json()["error"] == "invalid_redirect_uri"
+
+
+def test_desktop_app_gets_its_code_on_loopback_after_owner_consent(remote_local_apps):
+    redirect = "http://127.0.0.1:53682/callback"
+
+    async def scenario():
+        async with await remote_local_apps.client() as http:
+            client_id = (await register(http, redirect=redirect, name="OpenCode")).json()["client_id"]
+            verifier, page = await start_authorization(http, client_id, redirect=redirect)
+            approved = await approve(http, page, remote_local_apps.store)
+            location = urlsplit(approved.headers["location"])
+            code = parse_qs(location.query)["code"][0]
+            token = await exchange(http, client_id, verifier, code, redirect=redirect)
+            return page, approved, location, token
+
+    page, approved, location, token = anyio.run(scenario)
+    assert page.status_code == 200 and "127.0.0.1:53682" in page.text  # the consent page names where the code goes
+    assert approved.status_code == 302
+    assert (location.scheme, location.netloc, location.path) == ("http", "127.0.0.1:53682", "/callback")
+    assert token.status_code == 200 and token.json()["access_token"]
 
 
 def test_consent_flow_issues_tokens_limited_to_approved_scopes_and_devices(remote):
