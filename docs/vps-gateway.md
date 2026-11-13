@@ -106,7 +106,7 @@ alias cb-admin='runuser -u contextbridge -- /opt/contextbridge/venv/bin/contextb
 
 ## 4. Run it as a service
 
-Create `/etc/systemd/system/contextbridge-gateway.service`:
+Create `/etc/systemd/system/contextbridge-gateway.service`. This guide uses the name `contextbridge-gateway` throughout; if you name the unit differently, use your name in the `systemctl` and `journalctl` commands.
 
 ```ini
 [Unit]
@@ -174,7 +174,7 @@ Copying the old gateway's state keeps every enrolled device (same `gateway_id`, 
 9. **Retire the old gateway** once the old machine works as an agent and has survived a reboot:
    - stop and disable its gateway service, and check with `ss -tlnp` that none of its old ports are still listening;
    - in Cloudflare, delete its old tunnel if no hostnames route to it any more, and uninstall `cloudflared` there;
-   - delete every leftover copy of the old `oauth.json`, including any in backup archives. The VPS has the live copy; the others are only a passphrase hash and an authenticator secret waiting to leak.
+   - clean up old copies of `oauth.json`, including any in backup archives. First confirm which copy is live: it is the one in the VPS's `state` folder, and `cb-admin oauth-clients` should list your clients from it. Keep at most one backup of that live file, mode 600, somewhere only you can read. Delete every other copy; each holds a passphrase hash and an authenticator secret.
 
 **Starting fresh instead:** if the old gateway is unreachable, run `cb-admin owner-init` on the VPS, enroll each machine with `cb-admin pair` (set aside its old identity file first), and reconnect each client. The old `oauth.json` is then useless; delete it when you can.
 
