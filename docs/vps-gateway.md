@@ -81,7 +81,7 @@ remote:
   state: ../state/oauth.json
   allow_scopes: [computer:read]   # widen deliberately
   allow_devices: ["*"]            # or list device names
-  allowed_redirect_hosts: [claude.ai, claude.com, chatgpt.com]
+  allowed_redirect_hosts: [claude.ai, claude.com, chatgpt.com]   # add 127.0.0.1 and "::1" for desktop MCP clients
 
 # No filesystem/commands/processes sections: the VPS has no "local" device.
 ```
