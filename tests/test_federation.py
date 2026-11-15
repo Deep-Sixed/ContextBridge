@@ -13,7 +13,7 @@ import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from test_computer_server import allow_scopes
-from test_remote import DEVICE, connected_agent, gateway, mcp
+from test_remote import DEVICE, connected_agent, gateway, mcp, wait_for
 
 from contextbridge.computer import federation as fed
 from contextbridge.computer.audit import ComputerAuditLog
@@ -293,6 +293,72 @@ def test_gateway_hides_and_refuses_tools_outside_the_callers_scopes(policy, tmp_
 
 
 # ------------------------------------------------------------------ remote
+
+
+def _late_server(ready: Path) -> dict:
+    """An mcp_servers section whose server exits until ``ready`` exists, then runs the fake server."""
+    launcher = (
+        "import os, runpy, sys\n"
+        f"if not os.path.exists({str(ready)!r}): sys.exit(2)\n"
+        f"sys.argv = [{FAKE!r}]\n"
+        f"runpy.run_path({FAKE!r}, run_name='__main__')\n"
+    )
+    return {"fake": {"command": sys.executable, "args": ["-c", launcher], "startup_seconds": 60}}
+
+
+def test_gateway_learns_tools_a_connected_agent_gains_later(tmp_path, workspace, monkeypatch):
+    # An agent's MCP server may start only after the agent has connected (a retry succeeding,
+    # say). The gateway must offer its tools then, without waiting for the agent to reconnect.
+    monkeypatch.setattr(fed, "RETRY_START_SECONDS", 0.2)
+    ready = tmp_path / "ready"
+
+    async def scenario():
+        async with gateway(tmp_path) as gw, connected_agent(
+            tmp_path, workspace, gw, mcp_servers=_late_server(ready)
+        ) as remote:
+            before = set(gw.hub.online_federated().get(DEVICE, {}))
+            ready.write_text("", encoding="utf-8")
+            await wait_for(lambda: bool(gw.hub.online_federated().get(DEVICE)), timeout=60)
+            async with mcp(gw) as client:
+                names = {t.name for t in await client.list_tools()}
+                echoed = await client.call_tool("fake_echo", {"text": "late"})
+            still_connected = gw.hub.connection(DEVICE) is not None and remote.agent.connected.is_set()
+            return before, names, echoed, still_connected
+
+    before, names, echoed, still_connected = asyncio.run(scenario())
+    assert before == set()
+    assert FAKE_TOOLS <= names
+    assert echoed.structured_content["echo"] == "late"
+    assert still_connected  # learned without dropping the connection
+    gateway_log = audit_events(tmp_path / "gateway-audit.jsonl")
+    assert [e["event"] for e in gateway_log].count("device_connected") == 1
+    changed = [e for e in gateway_log if e["event"] == "device_tools_changed"]
+    assert changed and set(changed[-1]["mcp_tools"]) == FAKE_TOOLS
+
+
+def test_agent_sends_no_tool_update_to_a_gateway_that_does_not_accept_one(tmp_path, workspace, monkeypatch):
+    # An older gateway announces no features and refuses unknown messages as a protocol error,
+    # which an agent treats as fatal. Such a gateway learns new tools on the next connection.
+    from contextbridge.remote import hub as hub_module
+
+    monkeypatch.setattr(hub_module, "GATEWAY_FEATURES", ())
+    monkeypatch.setattr(fed, "RETRY_START_SECONDS", 0.2)
+    ready = tmp_path / "ready"
+
+    async def scenario():
+        async with gateway(tmp_path) as gw, connected_agent(
+            tmp_path, workspace, gw, mcp_servers=_late_server(ready)
+        ) as remote:
+            ready.write_text("", encoding="utf-8")
+            await wait_for(lambda: bool(remote.agent.engine.federated), timeout=60)
+            await asyncio.sleep(0.5)  # time for an update that must not be sent
+            return set(gw.hub.online_federated().get(DEVICE, {})), remote.agent.connected.is_set()
+
+    learned, connected = asyncio.run(scenario())
+    assert learned == set() and connected
+    agent_log = audit_events(tmp_path / "agent-audit.jsonl")
+    assert not any(e["event"] == "mcp_tools_reported" for e in agent_log)
+    assert [e["event"] for e in agent_log].count("gateway_connected") == 1
 
 
 def test_remote_device_offers_its_mcp_servers(tmp_path, workspace):

@@ -205,7 +205,7 @@ mcp_servers:
 ```
 
 How it works:
-- The engine starts each server over stdio when the agent (or gateway) starts, lists its tools, and reports them to the gateway. A server that fails to start is logged and left out; one that exits is started again on its next call.
+- The engine starts each server over stdio when the agent (or gateway) starts, lists its tools, and reports them to the gateway. A server that fails to start is logged and tried again in the background, after 5 seconds and then less often (up to every 5 minutes); one that exits is started again on its next call. When a device's tools change while it is connected, the agent sends the new list to the gateway at once (`device_tools_changed` in the gateway's audit log). A gateway older than the agent learns it on the agent's next connection instead, so upgrade the gateway first.
 - Each tool is offered as `<server>_<tool>`, and a tool already named with that prefix keeps its name, so agent-desktop's `desktop_snapshot` stays `desktop_snapshot`. Names never replace a built-in tool. A tool that has its own `device` argument is skipped.
 - Callers see each tool once, with an added `device` argument. It defaults to the only device offering the tool (or `local`), and is required when several devices offer it. `list_devices` shows each device's `mcp_tools`.
 - Only the machine's own config can add a server. The gateway can call the tools a device reports; it cannot start a program or change the list.
