@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,7 +12,7 @@ import pytest
 import yaml
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
-from helpers import assert_no_injection_text
+from helpers import PY, assert_no_injection_text
 
 from contextbridge.computer.audit import AuditError, ComputerAuditLog
 from contextbridge.computer.policy import PolicyError, load_policy
@@ -137,6 +138,52 @@ def test_every_tool_has_a_plain_description(make_policy, audit):
     for name, text in descriptions.items():
         assert len(text) >= 40, f"{name} has no useful description"
         assert_no_injection_text(f"{name} description", text)
+
+
+_IDENTIFIER = re.compile(r"\b[a-z]+(?:_[a-z0-9]+)+\b")
+# Result fields some descriptions name in a plain word, so the identifier scan can't see them.
+_PLAIN_FIELDS = {
+    "read_file": {"truncated"},
+    "list_directory": {"truncated"},
+    "search_files": {"truncated"},
+    "search_code": {"truncated"},
+    "start_process": {"prompt"},
+    "read_process_output": {"running"},
+}
+
+
+def test_descriptions_name_only_real_parameters_tools_and_result_fields(make_policy, audit, workspace):
+    """Every parameter, tool or result field a description names exists, the fields in real results."""
+    policy = make_policy(processes={"allow_kill": True})
+    (workspace / "work" / "old.txt").write_text("x\n", encoding="utf-8")
+
+    async def explore(client):
+        tools = {t.name: t for t in await client.list_tools()}
+
+        async def call(name, args):
+            return (await client.call_tool(name, args)).structured_content
+
+        session = await call("start_process", {"command": f"{PY} -i -q -u", "wait_seconds": 20})
+        results = {
+            "read_file": await call("read_file", {"path": "docs/notes.md"}),
+            "list_directory": await call("list_directory", {"path": "."}),
+            "search_files": await call("search_files", {"path": ".", "pattern": "*.md"}),
+            "search_code": await call("search_code", {"path": ".", "pattern": "alpha"}),
+            "delete_file": await call("delete_file", {"path": "work/old.txt"}),
+            "start_process": session,
+            "read_process_output": await call("read_process_output", {"session_id": session["session_id"]}),
+        }
+        results["list_deleted"] = (await call("list_deleted", {}))["items"][0]
+        await call("force_terminate", {"session_id": session["session_id"]})
+        return tools, results
+
+    tools, results = run(create_computer_server(policy, audit=audit, authorize=allow_scopes(*ALL_SCOPES)), explore)
+    for name, tool in tools.items():
+        parameters = set((tool.inputSchema or {}).get("properties") or {})
+        fields = set(results.get(name, {}))
+        named = set(_IDENTIFIER.findall(tool.description or "")) | _PLAIN_FIELDS.get(name, set())
+        unknown = named - parameters - set(tools) - fields
+        assert not unknown, f"{name}'s description names {sorted(unknown)}, which it neither takes nor returns"
 
 
 def test_tool_annotations(policy, audit):

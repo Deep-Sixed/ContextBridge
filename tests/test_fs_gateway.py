@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -147,6 +148,41 @@ def test_tools_declare_annotations_schemas_and_descriptions(tmp_path: Path) -> N
         assert properties == EXPECTED_INPUTS[tool.name], f"{tool.name} inputs: {properties}"
         assert tool.description, f"{tool.name} has no description"
         assert_no_injection_text(f"{tool.name} description", tool.description)
+
+
+_IDENTIFIER = re.compile(r"\b[a-z]+(?:_[a-z0-9]+)+\b")
+# Result fields some descriptions name in a plain word, so the identifier scan can't see them.
+_PLAIN_FIELDS = {"list_directory": {"truncated"}}
+
+
+def test_descriptions_name_only_real_parameters_tools_and_result_fields(tmp_path: Path) -> None:
+    """Every parameter, tool or result field a description names exists, the fields in real results."""
+    server = _server(tmp_path)
+    ro = str(Path(os.path.realpath(tmp_path / "ro")))
+
+    async def go() -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+        async with Client(server) as client:
+            tools = {t.name: t for t in await client.list_tools()}
+
+            async def call(name: str, args: dict[str, Any]) -> dict[str, Any]:
+                return (await client.call_tool(name, args)).structured_content
+
+            started = await call("start_search", {"path": ro, "pattern": "hel+o", "search_type": "content"})
+            results = {
+                "read_file": await call("read_file", {"path": f"{ro}/notes.txt"}),
+                "list_directory": await call("list_directory", {"path": ro}),
+                "start_search": started,
+                "get_more_search_results": await call("get_more_search_results", {"search_id": started["search_id"]}),
+            }
+            return tools, results
+
+    tools, results = anyio.run(go)
+    for name, tool in tools.items():
+        parameters = set((tool.inputSchema or {}).get("properties") or {})
+        fields = set(results.get(name, {}))
+        named = set(_IDENTIFIER.findall(tool.description or "")) | _PLAIN_FIELDS.get(name, set())
+        unknown = named - parameters - set(tools) - fields
+        assert not unknown, f"{name}'s description names {sorted(unknown)}, which it neither takes nor returns"
 
 
 def test_instructions_name_each_root_and_its_mode(tmp_path: Path) -> None:
