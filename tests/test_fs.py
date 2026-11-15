@@ -322,6 +322,11 @@ def test_edit_block_replaces_exact_text(dirs: dict[str, Path]) -> None:
     with pytest.raises(FsError, match="not found") as excinfo:
         fs.edit_block(str(target), "c = 1", "c = 2")
     assert excinfo.value.code == "no_match"
+    with pytest.raises(FsError, match="not found") as excinfo:
+        fs.edit_block(str(target), "b  = 1", "b = 2")
+    assert excinfo.value.code == "no_match"
+    assert "line 2" in str(excinfo.value) and "only in whitespace" in str(excinfo.value)
+    assert "b{- -} = 1" in str(excinfo.value)
     assert target.read_text(encoding="utf-8") == "a = 1\nb = 1\n"
 
     assert fs.edit_block(str(target), "b = 1", "b = 2")["replacements"] == 1

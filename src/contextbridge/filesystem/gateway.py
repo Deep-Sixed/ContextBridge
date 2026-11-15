@@ -244,7 +244,8 @@ def create_fs_server(
             file_path: str, old_string: str, new_string: str, expected_replacements: int = 1
         ) -> dict[str, Any]:
             """Replace exact text in a file. Fails unless old_string occurs exactly
-            expected_replacements times."""
+            expected_replacements times. When old_string is not found, the error shows the
+            closest text in the file and how it differs."""
             return await run(
                 fs.edit_block,
                 file_path,

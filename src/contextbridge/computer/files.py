@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ..nearmiss import closest_match, describe
 from . import search_worker
 from .audit import mark_started
 from .policy import ComputerPolicy, PolicyViolation
@@ -521,7 +522,7 @@ def edit_block(
         original = fh.read()
     found = original.count(old_string)
     if found != expected_replacements:
-        hint = " Check whitespace and line endings." if found == 0 else ""
+        hint = " " + describe(old_string, closest_match(original, old_string)) if found == 0 else ""
         raise FileOperationError(
             f"Expected {expected_replacements} occurrence(s) of old_string in {path}, found {found}.{hint}"
         )

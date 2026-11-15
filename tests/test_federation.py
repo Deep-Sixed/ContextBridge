@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import time
 from pathlib import Path
 
 import anyio
@@ -162,6 +163,35 @@ def test_server_that_fails_to_start_is_left_out(policy):
         federation.close()
     assert rows["fake"]["running"] is True and rows["broken"]["running"] is False and rows["broken"]["error"]
     assert any("'broken' did not start" in m for m in messages)
+
+
+def test_server_that_fails_at_startup_is_retried_until_it_starts(policy, tmp_path, monkeypatch):
+    # e.g. a device that boots before something its MCP server needs is ready
+    monkeypatch.setattr(fed, "RETRY_START_SECONDS", 0.2)
+    ready = tmp_path / "ready"
+    launcher = (
+        "import os, runpy, sys\n"
+        f"if not os.path.exists({str(ready)!r}): sys.exit(2)\n"
+        f"sys.argv = [{FAKE!r}]\n"
+        f"runpy.run_path({FAKE!r}, run_name='__main__')\n"
+    )
+    section = {"fake": {"command": sys.executable, "args": ["-c", launcher], "startup_seconds": 60}}
+    messages: list[str] = []
+    federation = Federation(load_mcp_servers({"mcp_servers": section}), env=policy.child_env(), log=messages.append)
+    federation.start()
+    try:
+        assert federation.tools == {} and federation.describe()[0]["running"] is False
+        ready.write_text("", encoding="utf-8")
+        deadline = time.monotonic() + 60
+        while not federation.tools and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert set(federation.tools) == FAKE_TOOLS
+        assert federation.call("fake_echo", {"text": "late"})["structured_content"]["echo"] == "late"
+        row = federation.describe()[0]
+        assert row["running"] is True and "error" not in row
+    finally:
+        federation.close()
+    assert any("'fake' did not start" in m for m in messages) and any("'fake' started" in m for m in messages)
 
 
 def test_crashed_server_is_started_again(policy, monkeypatch):
