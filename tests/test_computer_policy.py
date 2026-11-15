@@ -70,6 +70,38 @@ def test_default_deny_covers_common_credential_files(policy, raw):
         policy.resolve(raw)
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [".SSH/config", ".Env", "docs/Server.PEM", "ID_RSA", "work/.ContextBridge-Trash/20260101T000000Z-0a0b0c0d/x"],
+)
+def test_denied_names_match_in_any_letter_case(policy, raw):
+    # On a case-insensitive filesystem (macOS by default, vfat, NTFS mounts) ".SSH" opens ".ssh".
+    with pytest.raises(PolicyViolation, match="denied"):
+        policy.resolve(raw)
+
+
+def test_hidden_and_protected_paths_match_in_any_letter_case(workspace):
+    (workspace / "work" / "computer.yaml").write_text("x", encoding="utf-8")
+    (workspace / "state.json").write_text("{}", encoding="utf-8")
+    policy = load_policy(
+        {"filesystem": {"roots": [str(workspace)], "writable_roots": [str(workspace / "work")]}},
+        protected=(workspace / "work" / "computer.yaml",),
+        hidden=(workspace / "state.json",),
+    )
+    with pytest.raises(PolicyViolation, match="denied"):
+        policy.resolve("STATE.JSON")
+    with pytest.raises(PolicyViolation, match="protected"):
+        policy.resolve("work/Computer.YAML", write=True)
+    assert policy.is_untouchable(workspace / "work" / "COMPUTER.yaml")
+    (workspace / "work" / "Cfg").mkdir()
+    spelled = load_policy(
+        {"filesystem": {"roots": [str(workspace)], "writable_roots": [str(workspace / "work")]}},
+        protected=(workspace / "work" / "cfg" / "computer.yaml",),
+    )
+    with pytest.raises(PolicyViolation, match="protected"):
+        spelled.guard_move(workspace / "work" / "Cfg")
+
+
 # Each of these makes allowlist mode unrestricted: git through its -c options and aliases.
 _RUNS_OTHER_PROGRAMS = {"git", "bash", "sh", "zsh", "cmd", "powershell", "pwsh", "python", "python3", "py", "node"}
 

@@ -133,6 +133,20 @@ def _is_plain_entry(path: Path) -> bool:
     return getattr(st, "st_reparse_tag", 0) != _IO_REPARSE_TAG_MOUNT_POINT
 
 
+def _fold(path: Path) -> str:
+    """``path`` for comparison with a hidden or protected path, ignoring letter case.
+
+    A case-insensitive filesystem (macOS by default, vfat, NTFS mounts) opens the same file
+    under any spelling, and realpath keeps the spelling it was given.
+    """
+    return str(path).casefold()
+
+
+def _listed(path: Path, paths: frozenset[Path]) -> bool:
+    folded = _fold(path)
+    return any(_fold(p) == folded for p in paths)
+
+
 def _within(path: Path, roots: tuple[Path, ...]) -> Path | None:
     for root in roots:
         if path == root or path.is_relative_to(root):
@@ -198,17 +212,19 @@ class ComputerPolicy:
         return max(containing, key=lambda r: len(r.parts)) if containing else None
 
     def _is_denied(self, path: Path) -> bool:
+        # Letter case is ignored on every OS: ".SSH" opens ".ssh" on a case-insensitive filesystem.
         for part in path.parts[1:]:
-            if (part.casefold() if self.windows else part) == TRASH_DIRNAME:
+            name = part.casefold()
+            if name == TRASH_DIRNAME:
                 return True
             for pattern in self.deny:
-                if fnmatch.fnmatch(part, pattern):
+                if fnmatch.fnmatchcase(name, pattern.casefold()):
                     return True
         return False
 
     def is_untouchable(self, path: Path) -> bool:
         """True for a path no file tool may read, write, or delete (denied, hidden, or protected)."""
-        return self._is_denied(path) or path in self.protected
+        return self._is_denied(path) or _listed(path, self.protected)
 
     def resolve(self, raw: str, *, write: bool = False, follow_symlinks: bool = True) -> Path:
         """Resolve ``raw`` and verify it is inside the readable (or writable) roots.
@@ -245,9 +261,9 @@ class ComputerPolicy:
         if _within(resolved, roots) is None:
             kind = "writable" if write else "readable"
             raise PolicyViolation(f"{raw} is outside the {kind} roots of this computer.")
-        if self._is_denied(resolved) or resolved in self.hidden:
+        if self._is_denied(resolved) or _listed(resolved, self.hidden):
             raise PolicyViolation(f"{raw} matches a denied path pattern.")
-        if write and resolved in self.protected:
+        if write and _listed(resolved, self.protected):
             raise PolicyViolation(f"{raw} is protected and cannot be modified through ContextBridge.")
         return resolved
 
@@ -255,7 +271,8 @@ class ComputerPolicy:
         """Refuse to move a root, or a directory holding a protected path, out from under the policy."""
         if source in self.roots or source in self.writable_roots:
             raise PolicyViolation(f"{source} is a configured root and cannot be moved.")
-        if any(p.is_relative_to(source) for p in self.protected | self.hidden):
+        folded = Path(_fold(source))
+        if any(Path(_fold(p)).is_relative_to(folded) for p in self.protected | self.hidden):
             raise PolicyViolation(f"{source} contains a protected path and cannot be moved.")
 
     def is_visible(self, path: Path) -> bool:
