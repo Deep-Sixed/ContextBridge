@@ -4,13 +4,10 @@ Most failed edits are near misses: different indentation, tabs for spaces, ``\\r
 line endings, a changed word. Showing where the closest text is and how it differs
 lets the caller copy the exact text instead of guessing again.
 
-The idea, the 0.7 similarity threshold and the ``{-removed-}{+added+}`` diff notation
-follow Desktop Commander's ``edit_block`` (``src/tools/edit.ts``; MIT License, see
-THIRD_PARTY_NOTICES.md). The search differs: Desktop Commander bisects the file by
-Levenshtein distance with a native library, while this compares the query with every
-run of lines of about its length using :mod:`difflib`, needing no dependency, under a
-time limit. The diff marks every difference, not only the span from the first to the
-last, and shows invisible characters such as tabs and ``\\r``.
+The search compares the query with runs of lines of about its length using
+:mod:`difflib`, needing no dependency, under a time limit. The diff marks every
+difference as ``{-removed-}{+added+}`` and shows invisible characters such as tabs
+and ``\\r``.
 """
 
 from __future__ import annotations
