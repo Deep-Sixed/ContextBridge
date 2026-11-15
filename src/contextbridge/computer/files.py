@@ -453,10 +453,13 @@ def _encode_for_write(policy: ComputerPolicy, content: str, encoding: str = "utf
     return data
 
 
-def _append_encoding(path: Path) -> str:
+def _append_encoding(path: Path, raw: str) -> str:
     """The encoding for text appended to ``path``: the file's own UTF-16 byte order, else UTF-8.
 
     Appended text carries no byte-order mark of its own: the file already starts with one.
+    The byte order is read from that mark, never taken from this machine. A file that looks
+    binary is refused: UTF-16 without a mark (``cmd /u`` output) is one, and its byte order
+    can only be guessed.
     """
     with path.open("rb") as fh:
         head = fh.read(2)
@@ -464,6 +467,8 @@ def _append_encoding(path: Path) -> str:
         return "utf-16-le"
     if head == b"\xfe\xff":
         return "utf-16-be"
+    if _text_encoding(path) is None:
+        raise FileOperationError(f"{raw} looks like a binary file; text cannot be appended to it.")
     return "utf-8"
 
 
@@ -480,7 +485,7 @@ def write_file(policy: ComputerPolicy, path: str, content: str, *, mode: str = "
         raise FileOperationError(f"Not a regular file: {path}")
     _require_parent(resolved, path)
     created = not resolved.exists()
-    encoding = _append_encoding(resolved) if mode == "append" and not created else "utf-8"
+    encoding = _append_encoding(resolved, path) if mode == "append" and not created else "utf-8"
     data = _encode_for_write(policy, content, encoding)
     mark_started(path=str(resolved), bytes=len(data))
     if mode == "append":

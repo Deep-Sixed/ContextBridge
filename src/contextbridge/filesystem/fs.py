@@ -152,6 +152,9 @@ def _lines(fh: BinaryIO, label: str, max_bytes: int) -> Iterator[bytes]:
         yield line
 
 
+_BINARY_SNIFF_BYTES = 8192  # as the search worker's check for a binary file
+
+
 def _decode(data: bytes, label: str) -> str:
     if b"\0" in data:
         raise FsError(f"{label}: not a UTF-8 text file", code="binary")
@@ -392,9 +395,11 @@ class Filesystem:
             if mode == "append":
                 flags = os.O_RDWR | os.O_APPEND | os.O_CREAT | _O_NOFOLLOW | _O_CLOEXEC
                 with os.fdopen(os.open(target.path, flags, 0o666), "a+b") as fh:
-                    # UTF-8 appended to a UTF-16 file would leave it unreadable in either encoding.
+                    # UTF-8 appended to a UTF-16 file (with or without a byte-order mark) or to
+                    # any other binary file would leave it unreadable.
                     fh.seek(0)
-                    if fh.read(2) in (b"\xff\xfe", b"\xfe\xff"):
+                    head = fh.read(_BINARY_SNIFF_BYTES)
+                    if head[:2] in (b"\xff\xfe", b"\xfe\xff") or b"\0" in head:
                         raise FsError(f"{path}: not a UTF-8 text file", code="binary")
                     fh.write(data)
             else:

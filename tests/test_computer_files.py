@@ -343,6 +343,20 @@ def test_append_to_utf16_file_keeps_its_encoding(policy, workspace, byte_order):
     assert files.read_file(policy, "work/wide.log")["content"] == "first line\r\nzweite Zeile ü\n"
 
 
+@pytest.mark.parametrize(
+    "original",
+    ["first line\r\n".encode("utf-16-le"), "first line\r\n".encode("utf-16-be"), b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"],
+    ids=["utf-16-le without a mark", "utf-16-be without a mark", "binary"],
+)
+def test_append_to_binary_or_unmarked_utf16_file_is_refused(policy, workspace, original):
+    """Without a byte-order mark the byte order is a guess (`cmd /u` writes such files)."""
+    target = workspace / "work" / "unmarked.log"
+    target.write_bytes(original)
+    with pytest.raises(files.FileOperationError, match="binary"):
+        files.write_file(policy, "work/unmarked.log", "second\n", mode="append")
+    assert target.read_bytes() == original
+
+
 def test_append_to_utf8_bom_and_empty_files_writes_utf8(policy, workspace):
     with_bom = workspace / "work" / "bom.txt"
     with_bom.write_bytes(b"\xef\xbb\xbfone\n")
