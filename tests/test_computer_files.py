@@ -348,6 +348,57 @@ def test_utf16_files_from_powershell_are_text(policy, workspace):
     assert raw.decode("utf-16") == "first line\r\nsecond Zeile ü\r\n"
 
 
+@pytest.mark.parametrize("byte_order", ["utf-16-le", "utf-16-be"])
+def test_edit_block_keeps_a_utf16_files_byte_order(policy, workspace, byte_order):
+    """The edited file is byte for byte the original with the text replaced: same mark, same order."""
+    target = workspace / "work" / "wide.log"
+    bom = b"\xff\xfe" if byte_order == "utf-16-le" else b"\xfe\xff"
+    target.write_bytes(bom + "first line\r\nzweite Zeile ü\r\n".encode(byte_order))
+    files.edit_block(policy, "work/wide.log", "zweite", "second")
+    assert target.read_bytes() == bom + "first line\r\nsecond Zeile ü\r\n".encode(byte_order)
+    assert files.read_file(policy, "work/wide.log")["content"] == "first line\r\nsecond Zeile ü\r\n"
+    # A second edit starts from the rewritten file and must not add another mark.
+    files.edit_block(policy, "work/wide.log", "first", "1st")
+    assert target.read_bytes() == bom + "1st line\r\nsecond Zeile ü\r\n".encode(byte_order)
+
+
+@pytest.mark.parametrize("byte_order", ["utf-16-le", "utf-16-be"])
+def test_append_to_utf16_file_keeps_its_encoding(policy, workspace, byte_order):
+    """Appended text is encoded like the file, without a second byte-order mark."""
+    target = workspace / "work" / "wide.log"
+    bom = b"\xff\xfe" if byte_order == "utf-16-le" else b"\xfe\xff"
+    target.write_bytes(bom + "first line\r\n".encode(byte_order))
+    files.write_file(policy, "work/wide.log", "zweite Zeile ü\n", mode="append")
+    raw = target.read_bytes()
+    assert raw == bom + "first line\r\nzweite Zeile ü\n".encode(byte_order)
+    assert files.read_file(policy, "work/wide.log")["content"] == "first line\r\nzweite Zeile ü\n"
+
+
+@pytest.mark.parametrize(
+    "original",
+    ["first line\r\n".encode("utf-16-le"), "first line\r\n".encode("utf-16-be"), b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"],
+    ids=["utf-16-le without a mark", "utf-16-be without a mark", "binary"],
+)
+def test_append_to_binary_or_unmarked_utf16_file_is_refused(policy, workspace, original):
+    """Without a byte-order mark the byte order is a guess (`cmd /u` writes such files)."""
+    target = workspace / "work" / "unmarked.log"
+    target.write_bytes(original)
+    with pytest.raises(files.FileOperationError, match="binary"):
+        files.write_file(policy, "work/unmarked.log", "second\n", mode="append")
+    assert target.read_bytes() == original
+
+
+def test_append_to_utf8_bom_and_empty_files_writes_utf8(policy, workspace):
+    with_bom = workspace / "work" / "bom.txt"
+    with_bom.write_bytes(b"\xef\xbb\xbfone\n")
+    files.write_file(policy, "work/bom.txt", "zwei ü\n", mode="append")
+    assert with_bom.read_bytes() == b"\xef\xbb\xbfone\n" + "zwei ü\n".encode()
+    empty = workspace / "work" / "empty.txt"
+    empty.write_bytes(b"")
+    files.write_file(policy, "work/empty.txt", "ü\n", mode="append")
+    assert empty.read_bytes() == "ü\n".encode()
+
+
 def test_utf8_bom_is_preserved_on_edit(policy, workspace):
     target = workspace / "work" / "bom.txt"
     target.write_bytes(b"\xef\xbb\xbfhello\r\n")

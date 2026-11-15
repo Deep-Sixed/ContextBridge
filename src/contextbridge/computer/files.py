@@ -453,6 +453,25 @@ def _encode_for_write(policy: ComputerPolicy, content: str, encoding: str = "utf
     return data
 
 
+def _append_encoding(path: Path, raw: str) -> str:
+    """The encoding for text appended to ``path``: the file's own UTF-16 byte order, else UTF-8.
+
+    Appended text carries no byte-order mark of its own: the file already starts with one.
+    The byte order is read from that mark, never taken from this machine. A file that looks
+    binary is refused: UTF-16 without a mark (``cmd /u`` output) is one, and its byte order
+    can only be guessed.
+    """
+    with path.open("rb") as fh:
+        head = fh.read(2)
+    if head == b"\xff\xfe":
+        return "utf-16-le"
+    if head == b"\xfe\xff":
+        return "utf-16-be"
+    if _text_encoding(path) is None:
+        raise FileOperationError(f"{raw} looks like a binary file; text cannot be appended to it.")
+    return "utf-8"
+
+
 def _require_parent(path: Path, raw: str) -> None:
     if not path.parent.is_dir():
         raise FileOperationError(f"Parent directory of {raw} does not exist; create it first.")
@@ -465,8 +484,9 @@ def write_file(policy: ComputerPolicy, path: str, content: str, *, mode: str = "
     if resolved.exists() and not resolved.is_file():
         raise FileOperationError(f"Not a regular file: {path}")
     _require_parent(resolved, path)
-    data = _encode_for_write(policy, content)
     created = not resolved.exists()
+    encoding = _append_encoding(resolved, path) if mode == "append" and not created else "utf-8"
+    data = _encode_for_write(policy, content, encoding)
     mark_started(path=str(resolved), bytes=len(data))
     if mode == "append":
         with resolved.open("ab") as fh:
@@ -506,7 +526,14 @@ def edit_block(
             f"Expected {expected_replacements} occurrence(s) of old_string in {path}, found {found}.{hint}"
         )
     updated = original.replace(old_string, new_string)
-    data = _encode_for_write(policy, updated, encoding)  # keeps the file's encoding and BOM
+    if encoding == "utf-16":
+        # Python's "utf-16" writes this machine's byte order. Keep the file's own: the
+        # byte-order mark is U+FEFF, written first in the order the file's mark shows.
+        with resolved.open("rb") as fh:
+            big_endian = fh.read(2) == b"\xfe\xff"
+        data = _encode_for_write(policy, "﻿" + updated, "utf-16-be" if big_endian else "utf-16-le")
+    else:
+        data = _encode_for_write(policy, updated, encoding)  # keeps the file's encoding and BOM
     mark_started(path=str(resolved), replacements=found)
     _atomic_write(resolved, data)
     return {"path": str(resolved), "replacements": found}

@@ -248,6 +248,27 @@ def test_get_file_info(dirs: dict[str, Path]) -> None:
 # -- writing ----------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "original",
+    [
+        b"\xff\xfe" + "first line\r\n".encode("utf-16-le"),
+        b"\xfe\xff" + "first line\r\n".encode("utf-16-be"),
+        "first line\r\n".encode("utf-16-le"),  # no byte-order mark, as `cmd /u` writes
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR",
+    ],
+    ids=["utf-16-le", "utf-16-be", "utf-16 without a mark", "binary"],
+)
+def test_append_to_utf16_or_binary_file_is_refused(dirs: dict[str, Path], original: bytes) -> None:
+    """This route is UTF-8 only: UTF-8 appended to a UTF-16 or binary file would garble it."""
+    fs = _fs(dirs)
+    target = dirs["rw"] / "wide.log"
+    target.write_bytes(original)
+    with pytest.raises(FsError) as refused:
+        fs.write_file(str(target), "second\n", mode="append")
+    assert refused.value.code == "binary"
+    assert target.read_bytes() == original
+
+
 def test_write_file_creates_with_umask_and_appends(dirs: dict[str, Path]) -> None:
     fs = _fs(dirs)
     target = dirs["rw"] / "new.txt"
