@@ -401,6 +401,20 @@ contextbridge-admin --config configs/computer.yaml oauth-unlock               # 
 - **Keep approval prompts on in the client.** Claude and ChatGPT can ask before each tool call. Let the read-only tools run unprompted if you like, but keep approval for anything that writes, deletes, runs commands or kills processes. Text the assistant reads, such as a web page or a file, can contain planted instructions, and with prompts off those run unattended. Under `command_mode: unrestricted`, a command runs with all of the agent account's access, regardless of the device's file rules, so `run_command` and `start_process` matter most.
 - **Disconnect, not uninstall.** To reauthorize a connector, disconnect and reconnect it. Uninstalling it in the client removes the connector itself, and you have to add it again.
 
+### Local agents and desktop apps
+
+Desktop MCP clients, such as a coding agent driving a local model, sign in like Claude and ChatGPT but receive the authorization code on their own machine: they redirect to `http://127.0.0.1:<port>/callback` on a port they pick each time (RFC 8252). To let them register, list the loopback hosts they use:
+
+```yaml
+remote:
+  allowed_redirect_hosts: [claude.ai, claude.com, chatgpt.com, 127.0.0.1, "::1"]
+```
+
+- **Plain HTTP only on loopback.** `127.0.0.1` and `::1` (and `localhost`, if listed) accept `http://` on any port; every other listed host still needs HTTPS.
+- **Exact hosts.** A loopback address you don't list, such as `127.0.0.2`, is refused, and so is a name that only starts with one (`127.0.0.1.example.com`).
+- **Consent is unchanged.** Each client still needs the owner's passphrase and authenticator code. The consent page names where the code goes (`127.0.0.1:<port>`), and you tick its scopes and devices. Approve a local model's client narrowly, for example `desktop:observe` and `computer:read` on one device.
+- **Why it is safe.** A loopback redirect only reaches the computer whose browser approved the request, so a code can't be sent anywhere else. It doesn't help an attacker who can't already run programs on that computer.
+
 ### How the remote endpoint is secured
 
 - **Owner consent on every authorization.** No client gets a token until you approve it on the consent page, which requires both the passphrase and a TOTP code.
@@ -414,7 +428,7 @@ contextbridge-admin --config configs/computer.yaml oauth-unlock               # 
   - **Device policy still applies.** The device's own policy is enforced on top, exactly as for local calls.
 - **Standard OAuth 2.1 for MCP.** The endpoint follows the MCP authorization spec:
   - **Discovery:** RFC 9728 protected-resource metadata and RFC 8414 authorization-server metadata.
-  - **Registration:** Dynamic Client Registration, accepted only for HTTPS redirect URIs on `remote.allowed_redirect_hosts` (Claude and ChatGPT by default).
+  - **Registration:** Dynamic Client Registration, accepted only for redirect URIs on `remote.allowed_redirect_hosts` (Claude and ChatGPT by default). They must use HTTPS, except on a listed loopback host such as `127.0.0.1`, where plain HTTP on any port is allowed for desktop apps ([Local agents and desktop apps](#local-agents-and-desktop-apps)).
   - **PKCE:** S256 is required.
   - **Bound tokens:** tokens are tied to this server's `/mcp` resource.
 - **Tokens.** Access tokens are opaque and short-lived (60 minutes by default). Refresh tokens rotate on every use, and presenting an already-rotated refresh token revokes the client's whole grant. A client that doesn't refresh for `refresh_token_days` (30 by default) must be approved again.
