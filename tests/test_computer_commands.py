@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 
 import psutil
@@ -110,6 +111,29 @@ def test_session_limit_and_lifetime(make_policy):
     assert result["running"] is False
     assert result["timed_out"] is True
     sessions.shutdown()
+
+
+def _watchdogs() -> list[threading.Timer]:
+    return [t for t in threading.enumerate() if isinstance(t, threading.Timer)]
+
+
+def test_finished_session_leaves_no_watchdog_thread(make_policy):
+    # Each session gets a lifetime timer. One that outlives its process holds a thread and the
+    # session's output buffer for up to max_session_seconds, so many short sessions pile up.
+    policy = make_policy(commands={"mode": "allowlist", "allow": [PY]})
+    sessions = SessionManager(policy)
+    before = set(_watchdogs())
+    for _ in range(5):
+        sid = sessions.start(python_cmd("print('done')"), wait_seconds=0)["session_id"]
+        deadline = time.monotonic() + 10
+        while sessions.read(sid)["running"] and time.monotonic() < deadline:
+            time.sleep(0.05)
+        final = sessions.read(sid)
+        assert final["running"] is False and final["timed_out"] is False
+    deadline = time.monotonic() + 5
+    while set(_watchdogs()) - before and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert set(_watchdogs()) - before == set()
 
 
 @posix_only

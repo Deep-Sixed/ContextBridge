@@ -185,6 +185,8 @@ class _Session:
         self.base = 0  # absolute offset of buffer[0]
         self.cursor = 0  # absolute offset of the next unread byte
         self.timed_out = False
+        # The lifetime timer, set by SessionManager.start; cancelled once the process exits.
+        self.watchdog: threading.Timer | None = None
         self.changed = threading.Condition()
         self.reader = threading.Thread(target=_pump, args=(proc.stdout, self._append), daemon=True)
         self.reader.start()
@@ -193,6 +195,8 @@ class _Session:
 
     def _wait_for_exit(self) -> None:
         self.proc.wait()
+        if self.watchdog is not None:
+            self.watchdog.cancel()
         self.reader.join(_SESSION_DRAIN_SECONDS)
         self.tree.release()
         if self._on_exit is None:
@@ -316,7 +320,11 @@ class SessionManager:
             self._sessions[session.id] = session
         watchdog = threading.Timer(lifetime, self._expire, args=(session,))
         watchdog.daemon = True
+        session.watchdog = watchdog
         watchdog.start()
+        if not session.running():
+            # It exited before the exit waiter could see the timer; nothing is left to expire.
+            watchdog.cancel()
         result = session.read(wait_seconds)
         result["lifetime_seconds"] = lifetime
         return result
