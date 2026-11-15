@@ -40,7 +40,8 @@ HANDSHAKE_TIMEOUT_SECONDS = 10.0
 AUTH_CONTEXT = b"contextbridge-agent-auth-v1"
 
 # Error codes after which an agent must stop reconnecting. Any other code (such as
-# "already_connected" or "replaced") is retried with backoff.
+# "already_connected", "replaced", or "timeout" for a handshake that took too long) is
+# retried with backoff.
 FATAL_ERRORS = frozenset({"revoked", "unknown_device", "bad_signature", "bad_code", "protocol", "version"})
 
 

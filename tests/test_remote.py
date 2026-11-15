@@ -289,6 +289,58 @@ def test_unknown_and_offline_devices(tmp_path, workspace):
 # ---------------------------------------------------------- authentication
 
 
+def test_handshake_timeout_is_not_a_fatal_error_for_the_agent(tmp_path, workspace, monkeypatch):
+    # A stalled link or a suspended laptop can outlast the gateway's handshake wait. The agent
+    # stops for good on a FATAL_ERRORS code, so a timeout must not be reported with one.
+    from websockets.asyncio.client import connect
+
+    from contextbridge.remote import agent as agent_module
+    from contextbridge.remote import hub as hub_module
+    from contextbridge.remote.agent import AgentError
+    from contextbridge.remote.protocol import FATAL_ERRORS, PROTOCOL_VERSION
+
+    monkeypatch.setattr(hub_module, "HANDSHAKE_TIMEOUT_SECONDS", 0.2)
+
+    async def scenario():
+        async with gateway(tmp_path) as gw:
+            code, _ = gw.registry.create_enrollment(DEVICE, list(ALL_SCOPES))
+            config = load_agent_config(write_agent_config(tmp_path, workspace, gw.url))
+            identity = await enroll(config, code)
+
+            async with connect(gw.url) as silent:  # connects, then never says hello
+                first = json.loads(await asyncio.wait_for(silent.recv(), 5))
+            async with connect(gw.url) as stalled:  # says hello, then never answers the challenge
+                await stalled.send(
+                    encode({"type": "hello", "version": PROTOCOL_VERSION, "device_id": identity.device_id})
+                )
+                assert json.loads(await asyncio.wait_for(stalled.recv(), 5))["type"] == "challenge"
+                second = json.loads(await asyncio.wait_for(stalled.recv(), 5))
+            # What the agent makes of that reply: it must be free to reconnect.
+            with pytest.raises(AgentError):
+                await agent_module._expect(SimpleNamespace(recv=lambda: asyncio.sleep(0, encode(second))), "auth")
+            return first, second
+
+    first, second = asyncio.run(scenario())
+    for reply in (first, second):
+        assert reply["type"] == "error"
+        assert reply["code"] not in FATAL_ERRORS, reply
+
+
+def test_malformed_handshake_is_still_fatal(tmp_path):
+    from websockets.asyncio.client import connect
+
+    from contextbridge.remote.protocol import FATAL_ERRORS
+
+    async def scenario():
+        async with gateway(tmp_path) as gw:
+            async with connect(gw.url) as ws:
+                await ws.send("not json")
+                return json.loads(await asyncio.wait_for(ws.recv(), 5))
+
+    reply = asyncio.run(scenario())
+    assert reply["code"] == "protocol" and reply["code"] in FATAL_ERRORS
+
+
 def test_wrong_key_and_unknown_device_are_refused(tmp_path, workspace):
     async def scenario():
         async with gateway(tmp_path) as gw:
