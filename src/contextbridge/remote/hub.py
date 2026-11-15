@@ -355,9 +355,13 @@ class AgentHub:
                 await self._enroll(ws, first, client)
                 return
             conn = await self._authenticate(ws, first, client)
-        except (TimeoutError, ProtocolError) as exc:
+        except TimeoutError:
             self._failed(client)
-            await self._refuse(ws, "protocol", str(exc) or "handshake timed out")
+            await self._refuse(ws, "handshake_timeout", "handshake timed out")
+            return
+        except ProtocolError as exc:
+            self._failed(client)
+            await self._refuse(ws, "protocol", str(exc))
             return
         except ConnectionClosed:
             return
