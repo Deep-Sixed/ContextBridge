@@ -241,7 +241,10 @@ class ComputerPolicy:
             problem = windows_path_problem(raw.strip())
             if problem:
                 raise PolicyViolation(f"{raw}: {problem}.")
-        candidate = Path(raw.strip()).expanduser()
+        try:
+            candidate = Path(raw.strip()).expanduser()
+        except RuntimeError:  # "~user" for a user this machine does not have
+            raise PolicyViolation(f"{raw} names a home directory that does not exist.") from None
         if not candidate.is_absolute():
             candidate = self.roots[0] / candidate
         if follow_symlinks:
