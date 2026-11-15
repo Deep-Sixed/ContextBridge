@@ -70,6 +70,24 @@ def test_default_deny_covers_common_credential_files(policy, raw):
         policy.resolve(raw)
 
 
+def test_denied_patterns_ignore_case_even_on_posix(policy):
+    for raw in (".SSH/id_ed25519", ".Env", "nested/.CONTEXTBRIDGE-TRASH/entry"):
+        with pytest.raises(PolicyViolation, match="denied"):
+            policy.resolve(raw)
+
+
+def test_unknown_user_home_returns_policy_denial(policy):
+    if os.name != "nt":
+        with pytest.raises(PolicyViolation, match="unknown home"):
+            policy.resolve("~contextbridge_missing_user_293847/something")
+
+
+def test_cannot_move_parent_of_configured_root(policy):
+    parent = policy.roots[0].parent
+    with pytest.raises(PolicyViolation, match="configured root"):
+        policy.guard_move(parent)
+
+
 # Each of these makes allowlist mode unrestricted: git through its -c options and aliases.
 _RUNS_OTHER_PROGRAMS = {"git", "bash", "sh", "zsh", "cmd", "powershell", "pwsh", "python", "python3", "py", "node"}
 
