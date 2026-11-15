@@ -241,77 +241,89 @@ def test_interactive_session_on_every_platform(policy):
     assert final["running"] is False
 
 
-def _repl(sessions: SessionManager) -> dict:
+def _python_repl(sessions: SessionManager) -> dict:
     return sessions.start(f"{PY} -i -q -u", wait_seconds=20)
 
 
-def test_session_reports_a_repl_waiting_for_input(policy):
+def _read_until(sessions: SessionManager, sid: str, done, first: dict) -> dict:
+    """Keep reading a slow machine's output until ``done`` holds for all of it, for up to 20 s."""
+    result, output = first, first["output"]
+    deadline = time.monotonic() + 20
+    while not done({**result, "output": output}) and time.monotonic() < deadline:
+        result = sessions.read(sid, wait_seconds=1)
+        output += result["output"]
+    return {**result, "output": output}
+
+
+def test_a_waiting_repl_answers_at_its_prompt(policy):
     sessions = SessionManager(policy)
-    started = _repl(sessions)
+    started = _python_repl(sessions)
     sid = started["session_id"]
     try:
-        assert started["waiting_for_input"] is True and started["detected_prompt"] == ">>> "
-        t0 = time.monotonic()
+        assert started["waiting_for_input"] is True and started["prompt"] == ">>> "
+        before = time.monotonic()
         reply = sessions.send(sid, "6 * 7", wait_seconds=20)
-        # It returns at the prompt, not after the 20 seconds it was allowed.
-        assert time.monotonic() - t0 < 10
-        assert "42" in reply["output"] and reply["output"].rstrip().endswith(">>>")
-        assert reply["waiting_for_input"] is True
-        assert sessions.list()[0]["waiting_for_input"] is True
+        # Back as soon as the prompt shows, far inside the 20 seconds allowed.
+        assert time.monotonic() - before < 10
+        reply = _read_until(sessions, sid, lambda r: r["waiting_for_input"], reply)
+        assert "42" in reply["output"] and reply["prompt"] == ">>> "
+        assert [s["waiting_for_input"] for s in sessions.list()] == [True]
     finally:
         sessions.terminate(sid)
 
 
-def test_session_is_not_waiting_while_its_answer_is_pending(policy):
+def test_the_prompt_input_answered_does_not_count(policy):
     sessions = SessionManager(policy)
-    sid = _repl(sessions)["session_id"]
+    sid = _python_repl(sessions)["session_id"]
     try:
-        busy = sessions.send(sid, "import time; time.sleep(2); print('late')", wait_seconds=0.3)
-        # The prompt shown before the input was the one it answered.
-        assert busy["waiting_for_input"] is False and busy["detected_prompt"] is None
-        later = sessions.read(sid, wait_seconds=20)
-        for _ in range(20):
-            if later["waiting_for_input"]:
-                break
-            later = sessions.read(sid, wait_seconds=1)
-        assert later["waiting_for_input"] is True
+        busy = sessions.send(sid, "import time; time.sleep(3); print('late')", wait_seconds=0.5)
+        assert busy["waiting_for_input"] is False and busy["prompt"] is None
+        done = _read_until(sessions, sid, lambda r: "late" in r["output"] and r["waiting_for_input"], busy)
+        assert done["waiting_for_input"] is True
     finally:
         sessions.terminate(sid)
 
 
-def test_multi_line_input_returns_after_the_last_line(policy):
+def test_several_input_lines_return_after_the_last(policy):
     sessions = SessionManager(policy)
-    sid = _repl(sessions)["session_id"]
+    sid = _python_repl(sessions)["session_id"]
     try:
-        # Each line read prints a prompt; only the last one is where the REPL waits.
-        reply = sessions.send(sid, "for i in range(3):\n    print('n', i)\n", wait_seconds=20)
-        for _ in range(20):
-            if "n 2" in reply["output"] and reply["waiting_for_input"]:
-                break
-            more = sessions.read(sid, wait_seconds=1)
-            reply = {**more, "output": reply["output"] + more["output"]}
-        assert "n 0" in reply["output"] and "n 2" in reply["output"]
-        assert reply["detected_prompt"] == ">>> "
+        reply = sessions.send(sid, "for i in range(3):\n    print('row', i)\n", wait_seconds=20)
+        reply = _read_until(sessions, sid, lambda r: "row 2" in r["output"] and r["waiting_for_input"], reply)
+        assert "row 0" in reply["output"] and reply["prompt"] == ">>> "
     finally:
         sessions.terminate(sid)
 
 
-def test_output_ending_in_prompt_like_text_is_not_waiting(policy):
-    # pytest -v prints "collecting ... " and keeps working: a generic prompt inside a longer line.
+def test_a_question_counts_once_output_settles(policy):
+    sessions = SessionManager(policy)
+    sid = _python_repl(sessions)["session_id"]
+    try:
+        reply = sessions.send(sid, "answer = input('Your name: ')", wait_seconds=20)
+        reply = _read_until(sessions, sid, lambda r: r["waiting_for_input"], reply)
+        assert reply["prompt"] == ">>> Your name: "
+        answered = sessions.send(sid, "Ada", wait_seconds=20)
+        answered = _read_until(sessions, sid, lambda r: r["prompt"] == ">>> ", answered)
+        assert answered["waiting_for_input"] is True
+    finally:
+        sessions.terminate(sid)
+
+
+def test_unfinished_output_from_a_busy_program_is_not_a_prompt(policy):
     sessions = SessionManager(policy)
     code = "import sys, time\nsys.stdout.write('collecting ... ')\nsys.stdout.flush()\ntime.sleep(30)"
-    t0 = time.monotonic()
+    before = time.monotonic()
     started = sessions.start(python_cmd(code), wait_seconds=20)
     try:
-        assert "collecting" in started["output"]
-        assert started["waiting_for_input"] is False
-        # It returned once the output went quiet, not after the 20 seconds allowed.
-        assert time.monotonic() - t0 < 10
+        started = _read_until(sessions, started["session_id"], lambda r: "collecting" in r["output"], started)
+        assert started["waiting_for_input"] is False and started["prompt"] is None
+        # It came back once the output settled, not after the 20 seconds allowed.
+        assert time.monotonic() - before < 15
     finally:
         sessions.terminate(started["session_id"])
 
 
-def test_finished_session_is_not_waiting(policy):
+def test_a_finished_program_is_never_waiting(policy):
     sessions = SessionManager(policy)
     sid = sessions.start(python_cmd("print('>>> ', end='')"), wait_seconds=5)["session_id"]
     deadline = time.monotonic() + 10

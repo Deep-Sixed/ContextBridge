@@ -24,18 +24,18 @@ import psutil
 from .audit import mark_started
 from .oscompat import decode_output
 from .policy import ComputerPolicy, PolicyViolation
-from .prompts import TAIL_CHARS, detect_prompt
 from .proctree import IS_WINDOWS, ProcessTree
+from .waiting import TAIL_CHARS, Prompt, find_prompt
 
 _READ_CHUNK = 65536
 _MAX_WAIT_SECONDS = 30.0
 _JOIN_SECONDS = 5.0
 _SESSION_DRAIN_SECONDS = 0.5
-# How long a session's output must stay quiet before start_process and
-# interact_with_process return it, when it doesn't end at a prompt.
-_SETTLE_SECONDS = 0.2
-# A UTF-8 character takes at most 4 bytes, so this many bytes hold the tail a prompt is looked for in.
-_PROMPT_TAIL_BYTES = TAIL_CHARS * 4
+# Output that has stopped arriving for this long is settled: start_process and
+# interact_with_process return it, and a question at its end counts as a prompt.
+_SETTLE_SECONDS = 0.3
+# Bytes holding at least TAIL_CHARS characters, whatever their UTF-8 width.
+_TAIL_BYTES = TAIL_CHARS * 4
 
 
 class CommandError(ValueError):
@@ -190,9 +190,9 @@ class _Session:
         self.buffer = bytearray()
         self.base = 0  # absolute offset of buffer[0]
         self.cursor = 0  # absolute offset of the next unread byte
-        # Absolute offset of the output's end when input was last sent. A prompt before it is
-        # the one that input answered, not a sign that the process is waiting again.
-        self.input_mark = 0
+        # Absolute offset of the output's end when input was last sent: a prompt before it
+        # was answered by that input, so it no longer means the program is waiting.
+        self.answered_to = 0
         self.last_output = time.monotonic()
         self.timed_out = False
         # The lifetime timer, set by SessionManager.start; cancelled once the process exits.
@@ -233,35 +233,26 @@ class _Session:
     def running(self) -> bool:
         return self.proc.poll() is None
 
-    def _prompt(self) -> str | None:
-        """The prompt the process waits at, if its output since the last input ends in one.
-
-        Call with ``changed`` held.
-        """
-        if self.end <= self.input_mark or not self.running():
+    def prompt(self) -> Prompt | None:
+        """The prompt the program waits at now, if any. Call with ``changed`` held."""
+        if self.end <= self.answered_to or not self.running():
             return None
-        return detect_prompt(decode_output(bytes(self.buffer[-_PROMPT_TAIL_BYTES:])))
+        settled = time.monotonic() - self.last_output >= _SETTLE_SECONDS
+        return find_prompt(decode_output(bytes(self.buffer[-_TAIL_BYTES:])), settled=settled)
 
-    def mark_input(self) -> int:
-        """Record that input is about to be sent: the prompt now showing is answered by it.
-
-        Returns the offset the output that follows the input starts at.
-        """
+    def before_input(self) -> int:
+        """Note that input is about to be sent; return where the output answering it will start."""
         with self.changed:
-            self.input_mark = self.end
-            return self.input_mark
+            self.answered_to = self.end
+            return self.answered_to
 
-    def read(
-        self, wait_seconds: float, *, settle_since: int | None = None, prompt_ends_wait: bool = True
-    ) -> dict[str, Any]:
-        """Return the unread output, waiting up to ``wait_seconds`` for some.
+    def read(self, wait_seconds: float, *, answer_from: int | None = None, lines_sent: int = 1) -> dict[str, Any]:
+        """The output not read yet, waiting up to ``wait_seconds`` for some.
 
-        The wait ends at the first unread output. With ``settle_since`` (an output
-        offset) it instead waits for output past that offset, and then goes on until
-        the process waits at a prompt or its output has been quiet for a moment, so an
-        answer arrives whole instead of chunk by chunk. A process reading several input
-        lines prints a prompt after each, so the caller clears ``prompt_ends_wait`` for
-        such input and only the quiet moment ends the wait.
+        Plain reads return at the first new output. With ``answer_from``, the wait is for the
+        program's answer to what was started or sent: output past that offset, complete. It
+        ends when the program waits at a prompt or its output settles. After several input
+        lines (``lines_sent``) a prompt may be for the next line, so only settling ends it.
         """
         deadline = time.monotonic() + max(0.0, min(wait_seconds, _MAX_WAIT_SECONDS))
         with self.changed:
@@ -269,14 +260,15 @@ class _Session:
                 now = time.monotonic()
                 if now >= deadline:
                     break
-                if settle_since is None:
+                if answer_from is None:
                     if self.cursor < self.end:
                         break
-                elif self.end > settle_since:
-                    quiet = now - self.last_output >= _SETTLE_SECONDS
-                    if quiet or (prompt_ends_wait and self._prompt() is not None):
+                elif self.end > answer_from:
+                    if now - self.last_output >= _SETTLE_SECONDS:
                         break
-                self.changed.wait(min(deadline - now, 0.1 if settle_since is None else 0.05))
+                    if lines_sent <= 1 and self.prompt() is not None:
+                        break
+                self.changed.wait(min(deadline - now, 0.05))
         if not self.running():
             self.reader.join(_SESSION_DRAIN_SECONDS)
         with self.changed:
@@ -293,7 +285,7 @@ class _Session:
     def status(self) -> dict[str, Any]:
         code = self.proc.poll()
         with self.changed:
-            prompt = self._prompt()
+            prompt = self.prompt()
         return {
             "session_id": self.id,
             "command": self.command,
@@ -305,7 +297,7 @@ class _Session:
             "runtime_seconds": round(time.time() - self.started, 1),
             "unread_bytes": max(0, self.end - max(self.cursor, self.base)),
             "waiting_for_input": prompt is not None,
-            "detected_prompt": prompt,
+            "prompt": prompt.text if prompt else None,
         }
 
 
@@ -376,7 +368,7 @@ class SessionManager:
         if not session.running():
             # It exited before the exit waiter could see the timer; nothing is left to expire.
             watchdog.cancel()
-        result = session.read(wait_seconds, settle_since=0)
+        result = session.read(wait_seconds, answer_from=0)
         result["lifetime_seconds"] = lifetime
         return result
 
@@ -397,14 +389,13 @@ class SessionManager:
         line_end = "\r\n" if IS_WINDOWS else "\n"
         payload = (text + (line_end if newline else "")).encode("utf-8")
         mark_started(session_id=session_id, pid=session.proc.pid, input_bytes=len(payload))
-        sent_at = session.mark_input()
+        answer_from = session.before_input()
         try:
             session.proc.stdin.write(payload)
             session.proc.stdin.flush()
         except (BrokenPipeError, OSError, ValueError):
             raise CommandError(f"Session {session_id} is not accepting input.") from None
-        # After the first of several lines the prompt shown is for the next line, not the answer.
-        return session.read(wait_seconds, settle_since=sent_at, prompt_ends_wait=payload.count(b"\n") <= 1)
+        return session.read(wait_seconds, answer_from=answer_from, lines_sent=payload.count(b"\n"))
 
     def terminate(self, session_id: str) -> dict[str, Any]:
         session = self._get(session_id)
