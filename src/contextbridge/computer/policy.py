@@ -255,7 +255,9 @@ class ComputerPolicy:
         return resolved
 
     def guard_move(self, source: Path) -> None:
-        """Refuse to move a root, or a directory holding a protected path, out from under the policy."""
+        """Refuse to move a root, or a directory holding a root or protected path, out from under the policy."""
+        if any(root != source and root.is_relative_to(source) for root in (*self.roots, *self.writable_roots)):
+            raise PolicyViolation(f"{source} contains a configured root and cannot be moved.")
         if source in self.roots or source in self.writable_roots:
             raise PolicyViolation(f"{source} is a configured root and cannot be moved.")
         if any(p.is_relative_to(source) for p in self.protected | self.hidden):

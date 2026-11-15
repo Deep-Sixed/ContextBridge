@@ -278,6 +278,23 @@ def test_move_refuses_roots_and_protected_ancestors(workspace):
     assert config.exists()
 
 
+def test_move_and_delete_refuse_a_folder_that_holds_a_configured_root(workspace):
+    from contextbridge.computer import trash
+
+    inner = workspace / "work" / "projects" / "inner"
+    inner.mkdir(parents=True)
+    (inner / "keep.txt").write_text("x", encoding="utf-8")
+    policy = load_policy(
+        {"filesystem": {"roots": [str(workspace)], "writable_roots": [str(workspace / "work"), str(inner)]}}
+    )
+    # Moving or deleting the parent would carry the root away while the policy still names its old path.
+    with pytest.raises(PolicyViolation, match="configured root"):
+        files.move_file(policy, "work/projects", "work/elsewhere")
+    with pytest.raises(PolicyViolation, match="configured root"):
+        trash.delete_file(policy, "work/projects", recursive=True)
+    assert (inner / "keep.txt").exists()
+
+
 def test_move_refuses_a_trailing_dotdot(policy, workspace):
     (workspace / "work" / "a" / "b").mkdir(parents=True)
     (workspace / "work" / "a" / "f.txt").write_text("x", encoding="utf-8")
