@@ -516,6 +516,39 @@ def test_consent_flow_issues_tokens_limited_to_approved_scopes_and_devices(remot
         assert event in events
 
 
+def test_registration_flood_during_consent_does_not_undo_the_owners_approval(remote):
+    # While the owner is on the consent page, strangers can register enough clients to push the
+    # waiting one out of the full table. The owner's approval must still produce a working client.
+    async def scenario():
+        async with await remote.client() as http:
+            client_id = (await register(http)).json()["client_id"]
+            verifier, page = await start_authorization(http, client_id)
+            for n in range(MAX_CLIENTS):
+                assert (await register(http, name=f"Stranger {n}")).status_code == 201
+            evicted = remote.store.get_client(client_id) is None
+            approved = await approve(http, page, remote.store)
+            code = parse_qs(urlsplit(approved.headers["location"]).query)["code"][0]
+            tokens = await exchange(http, client_id, verifier, code)
+            return evicted, approved, tokens
+
+    evicted, approved, tokens = anyio.run(scenario)
+    assert evicted  # the flood did push the waiting client out
+    assert approved.status_code == 302
+    assert tokens.status_code == 200, tokens.text
+    assert tokens.json()["access_token"]
+    assert len(remote.store.clients()) == MAX_CLIENTS  # the table stays within its limit
+
+
+def test_approval_is_refused_cleanly_when_no_slot_can_be_freed(store):
+    for i in range(MAX_CLIENTS):
+        store.save_client({"client_id": f"c{i}", "redirect_uris": [REDIRECT]})
+        store.save_code(f"code{i}", {"client_id": f"c{i}", "expires_at": time.time() + 60})  # every slot approved
+    dropped = {"client_id": "dropped", "redirect_uris": [REDIRECT]}
+    with pytest.raises(OAuthStateError, match="too many registered clients"):
+        store.save_code("x", {"client_id": "dropped", "expires_at": time.time() + 60}, client=dropped)
+    assert store.get_code("x") is None and store.get_client("dropped") is None
+
+
 def test_owner_can_deny(remote):
     async def scenario():
         async with await remote.client() as http:

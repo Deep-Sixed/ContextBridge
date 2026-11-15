@@ -100,6 +100,8 @@ class _Pending:
     form_token: str
     expires_at: float
     redirect_origin: str = field(default="")
+    # The client as registered, so an approval can reinstate it if the full table dropped it meanwhile.
+    client: dict[str, Any] = field(default_factory=dict)
 
 
 def _is_loopback(host: str) -> bool:
@@ -214,6 +216,7 @@ class ContextBridgeOAuthProvider(OAuthProvider):
             form_token=secrets.token_urlsafe(24),
             expires_at=now + PENDING_SECONDS,
             redirect_origin=f"{redirect.scheme}://{redirect.netloc}",
+            client=client.model_dump(mode="json", exclude_none=True),
         )
         self._log("oauth_authorization_requested", client=client.client_id, scopes=params.scopes)
         return f"{self.settings.public_url.rstrip('/')}/consent?request={request_id}"
@@ -264,6 +267,17 @@ class ContextBridgeOAuthProvider(OAuthProvider):
             return self._form(request_id, pending, error="Choose at least one permission and one device.", status=400)
 
         code = new_token()
+        try:
+            self._save_code(code, pending, scopes, devices)
+        except OAuthStateError as exc:  # the client was dropped and every slot now holds an approved one
+            return self._form(request_id, pending, error=f"Cannot approve: {exc}.", status=409)
+        del self._pending[request_id]
+        self._log("oauth_consent_granted", client=pending.client_id, scopes=scopes, devices=devices)
+        return RedirectResponse(
+            construct_redirect_uri(str(pending.params.redirect_uri), code=code, state=state), status_code=302
+        )
+
+    def _save_code(self, code: str, pending: _Pending, scopes: list[str], devices: list[str]) -> None:
         self.store.save_code(
             code,
             {
@@ -276,11 +290,7 @@ class ContextBridgeOAuthProvider(OAuthProvider):
                 "resource": self.settings.resource_url,
                 "expires_at": time.time() + CODE_SECONDS,
             },
-        )
-        del self._pending[request_id]
-        self._log("oauth_consent_granted", client=pending.client_id, scopes=scopes, devices=devices)
-        return RedirectResponse(
-            construct_redirect_uri(str(pending.params.redirect_uri), code=code, state=state), status_code=302
+            client=pending.client,
         )
 
     def _grantable(self, pending: _Pending) -> list[str]:

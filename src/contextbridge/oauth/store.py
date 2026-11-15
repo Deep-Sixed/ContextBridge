@@ -264,13 +264,16 @@ class OAuthStore:
     def save_client(self, client: dict[str, Any]) -> None:
         """Store a newly registered client. When full, the oldest never-approved client makes room."""
         with self.update() as state:
-            clients = state["clients"]
-            if client["client_id"] not in clients and len(clients) >= MAX_CLIENTS:
-                unapproved = sorted((c["registered_at"], cid) for cid, c in clients.items() if not c.get("authorized"))
-                if not unapproved:
-                    raise OAuthStateError(f"too many registered clients (limit {MAX_CLIENTS}); revoke some first")
-                del clients[unapproved[0][1]]
-            clients[client["client_id"]] = {**client, "registered_at": time.time(), "authorized": False}
+            self._make_room(state["clients"], client["client_id"])
+            state["clients"][client["client_id"]] = {**client, "registered_at": time.time(), "authorized": False}
+
+    @staticmethod
+    def _make_room(clients: dict[str, Any], client_id: str) -> None:
+        if client_id not in clients and len(clients) >= MAX_CLIENTS:
+            unapproved = sorted((c["registered_at"], cid) for cid, c in clients.items() if not c.get("authorized"))
+            if not unapproved:
+                raise OAuthStateError(f"too many registered clients (limit {MAX_CLIENTS}); revoke some first")
+            del clients[unapproved[0][1]]
 
     def clients(self) -> list[dict[str, Any]]:
         grants = self.state["grants"]
@@ -282,12 +285,21 @@ class OAuthStore:
 
     # ---------------------------------------------------------------- codes
 
-    def save_code(self, code: str, record: dict[str, Any]) -> None:
+    def save_code(self, code: str, record: dict[str, Any], *, client: dict[str, Any] | None = None) -> None:
+        """Store an authorization code the owner just approved, and mark its client approved.
+
+        ``client`` is the client as it was registered. Anyone can register clients, and a full
+        table drops its oldest never-approved one, so the client being approved may be gone by
+        now; the owner's approval puts it back, at the expense of another never-approved client.
+        """
         with self.update() as state:
+            stored = state["clients"].get(record["client_id"])
+            if stored is None and client and client.get("client_id") == record["client_id"]:
+                self._make_room(state["clients"], record["client_id"])
+                stored = state["clients"][record["client_id"]] = {**client, "registered_at": time.time()}
             state["codes"][token_hash(code)] = record
-            client = state["clients"].get(record["client_id"])
-            if client is not None:
-                client["authorized"] = True
+            if stored is not None:
+                stored["authorized"] = True
 
     def get_code(self, code: str) -> dict[str, Any] | None:
         record = self.state["codes"].get(token_hash(code))
