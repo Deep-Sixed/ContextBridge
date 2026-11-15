@@ -118,7 +118,10 @@ class PolicyViolation(PermissionError):
 
 
 def _real(path: str | Path) -> Path:
-    return Path(os.path.realpath(Path(path).expanduser()))
+    try:
+        return Path(os.path.realpath(Path(path).expanduser()))
+    except (RuntimeError, KeyError) as exc:
+        raise PolicyViolation(f"Cannot expand path {path}: unknown home directory.") from exc
 
 
 def _is_plain_entry(path: Path) -> bool:
@@ -199,10 +202,10 @@ class ComputerPolicy:
 
     def _is_denied(self, path: Path) -> bool:
         for part in path.parts[1:]:
-            if (part.casefold() if self.windows else part) == TRASH_DIRNAME:
+            if part.casefold() == TRASH_DIRNAME.casefold():
                 return True
             for pattern in self.deny:
-                if fnmatch.fnmatch(part, pattern):
+                if fnmatch.fnmatchcase(part.casefold(), pattern.casefold()):
                     return True
         return False
 
@@ -253,8 +256,8 @@ class ComputerPolicy:
 
     def guard_move(self, source: Path) -> None:
         """Refuse to move a root, or a directory holding a protected path, out from under the policy."""
-        if source in self.roots or source in self.writable_roots:
-            raise PolicyViolation(f"{source} is a configured root and cannot be moved.")
+        if any(root == source or root.is_relative_to(source) for root in (*self.roots, *self.writable_roots)):
+            raise PolicyViolation(f"{source} contains a configured root and cannot be moved.")
         if any(p.is_relative_to(source) for p in self.protected | self.hidden):
             raise PolicyViolation(f"{source} contains a protected path and cannot be moved.")
 
