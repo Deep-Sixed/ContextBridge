@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from ..nearmiss import closest_match, describe
+
 TRASH_DIR_NAME = ".contextbridge-trash"
 DEFAULT_MAX_READ_BYTES = 1024 * 1024
 DEFAULT_MAX_WRITE_BYTES = 1024 * 1024
@@ -423,7 +425,8 @@ class Filesystem:
         text = _decode(data, path)
         found = text.count(old_string)
         if found == 0:
-            raise FsError(f"{path}: old_string not found", code="no_match")
+            near = describe(old_string, closest_match(text, old_string))
+            raise FsError(f"{path}: old_string not found. {near}", code="no_match")
         if found != expected_replacements:
             raise FsError(
                 f"{path}: expected {expected_replacements} occurrence(s) of old_string, found "
