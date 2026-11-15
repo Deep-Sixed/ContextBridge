@@ -17,10 +17,11 @@ IS_WINDOWS = os.name == "nt"
 # arguments and allows command injection (the "BatBadBut" class of bugs).
 WINDOWS_EXECUTABLE_EXTENSIONS = (".com", ".exe")
 
+# Windows also treats COM and LPT followed by a superscript one, two or three as devices.
 _WINDOWS_RESERVED_NAMES = frozenset(
     {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
-    | {f"COM{i}" for i in range(10)}
-    | {f"LPT{i}" for i in range(10)}
+    | {f"COM{i}" for i in [*range(10), *"¹²³"]}
+    | {f"LPT{i}" for i in [*range(10), *"¹²³"]}
 )
 _WINDOWS_INVALID_CHARS = frozenset('<>"|?*') | {chr(c) for c in range(32)}
 
