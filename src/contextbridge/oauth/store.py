@@ -91,6 +91,7 @@ class OAuthStore:
             "version": STATE_VERSION,
             "owner": None,
             "lockout": {"failures": [], "locked_until": 0},
+            "consent_lockouts": {},
             "clients": {},
             "codes": {},
             "grants": {},
@@ -169,6 +170,10 @@ class OAuthStore:
     def _prune(state: dict[str, Any]) -> None:
         now = time.time()
         state["codes"] = {k: v for k, v in state["codes"].items() if v["expires_at"] > now}
+        state["consent_lockouts"] = {
+            k: v for k, v in state.get("consent_lockouts", {}).items()
+            if v.get("locked_until", 0) > now or any(now - t < LOCKOUT_WINDOW_SECONDS for t in v.get("failures", []))
+        }
         for grant in state["grants"].values():
             grant["access"] = {k: exp for k, exp in grant["access"].items() if exp > now}
         state["grants"] = {
@@ -194,23 +199,32 @@ class OAuthStore:
         with self.update() as state:
             state["owner"] = {"passphrase": hashed, "totp_secret": totp_secret, "totp_last_counter": 0}
             state["lockout"] = {"failures": [], "locked_until": 0}
+            state["consent_lockouts"] = {}
 
-    def locked_until(self) -> float:
-        until = float(self.state["lockout"].get("locked_until", 0))
+    def locked_until(self, consent_id: str | None = None) -> float:
+        lockout = (self.state.get("consent_lockouts", {}).get(token_hash(consent_id), {})
+                   if consent_id is not None else self.state["lockout"])
+        until = float(lockout.get("locked_until", 0))
         return until if until > time.time() else 0.0
 
     def unlock(self) -> None:
         with self.update() as state:
             state["lockout"] = {"failures": [], "locked_until": 0}
+            state["consent_lockouts"] = {}
 
-    def verify_owner(self, passphrase: str, code: str) -> str | None:
+    def verify_owner(self, passphrase: str, code: str, *, consent_id: str | None = None) -> str | None:
         """Check the passphrase and TOTP code. Returns None on success, else the reason it failed.
 
         Failures count toward a lockout; a TOTP code is accepted only once.
         """
         with self.update() as state:
             now = time.time()
-            lockout = state["lockout"]
+            if consent_id is not None:
+                # Separate consent attempts prevent one client locking out another.
+                keyed = state.setdefault("consent_lockouts", {})
+                lockout = keyed.setdefault(token_hash(consent_id), {"failures": [], "locked_until": 0})
+            else:
+                lockout = state["lockout"]
             if lockout.get("locked_until", 0) > now:
                 return "locked"
             owner = state.get("owner") or {}
@@ -238,10 +252,7 @@ class OAuthStore:
         with self.update() as state:
             clients = state["clients"]
             if client["client_id"] not in clients and len(clients) >= MAX_CLIENTS:
-                unapproved = sorted((c["registered_at"], cid) for cid, c in clients.items() if not c.get("authorized"))
-                if not unapproved:
-                    raise OAuthStateError(f"too many registered clients (limit {MAX_CLIENTS}); revoke some first")
-                del clients[unapproved[0][1]]
+                raise OAuthStateError(f"too many registered clients (limit {MAX_CLIENTS}); revoke some first")
             clients[client["client_id"]] = {**client, "registered_at": time.time(), "authorized": False}
 
     def clients(self) -> list[dict[str, Any]]:
