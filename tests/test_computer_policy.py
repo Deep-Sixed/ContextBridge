@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from helpers import REPO, symlink_or_skip
+from helpers import REPO, UNLISTED_PY, symlink_or_skip
 
 from contextbridge.computer.policy import PolicyError, PolicyViolation, load_policy
 
@@ -188,7 +188,7 @@ def test_allowlist_resolves_program_on_path(policy):
 
 @pytest.mark.parametrize(
     "command",
-    ["rm -rf /", "python3 -c 'print(1)'", "/tmp/evil/echo hi", "./echo hi"],
+    ["rm -rf /", f"{UNLISTED_PY} -c 'print(1)'", "/tmp/evil/echo hi", "./echo hi"],
 )
 def test_allowlist_rejects_unlisted_programs(policy, command):
     with pytest.raises(PolicyViolation, match="allowlist"):

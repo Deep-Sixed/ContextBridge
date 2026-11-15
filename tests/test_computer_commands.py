@@ -7,7 +7,7 @@ import time
 
 import psutil
 import pytest
-from helpers import PY, python_cmd
+from helpers import PY, UNLISTED_PY, python_cmd
 
 from contextbridge.computer import commands
 from contextbridge.computer.commands import BoundedCapture, CommandError, SessionManager
@@ -139,7 +139,7 @@ def test_finished_session_leaves_no_watchdog_thread(make_policy):
 @posix_only
 def test_session_rejects_unlisted_program(policy):
     with pytest.raises(PolicyViolation, match="allowlist"):
-        SessionManager(policy).start("python3")
+        SessionManager(policy).start(UNLISTED_PY)
 
 
 def test_list_processes_includes_self():

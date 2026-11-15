@@ -21,6 +21,9 @@ from fastmcp.client.auth import BearerAuth
 REPO = Path(__file__).resolve().parents[1]
 IS_WINDOWS = os.name == "nt"
 PY = Path(sys.executable).stem  # the allowlist name of this interpreter ("python" in CI and venvs)
+# An interpreter name the test policies never allow. Not a fixed "python3": the policies
+# allow PY, which is "python3" where the tests run under an interpreter of that name.
+UNLISTED_PY = "python" if PY == "python3" else "python3"
 
 # Phrases a server's instructions and tool descriptions must never contain: they read like
 # prompt injection to the agent that receives them.
