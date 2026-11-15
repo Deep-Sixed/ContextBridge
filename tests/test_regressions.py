@@ -278,10 +278,6 @@ def test_a_finished_command_leaves_nothing_running(policy, workspace):
 # ------------------------------------------------------------------ Windows names
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Finding F-1: COM¹-COM³ and LPT¹-LPT³ (superscript digits) are not refused.",
-)
 @pytest.mark.parametrize("name", ["COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³", "com¹.txt"])
 def test_superscript_device_names_are_refused(workspace, name):
     """CWE-67. Windows treats COM and LPT followed by the superscript digits ¹ ² ³ as
