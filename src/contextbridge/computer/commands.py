@@ -3,8 +3,9 @@
 Commands run without an intermediate shell in allowlist mode, with credentials
 stripped from the environment, inside a readable root, under a hard timeout,
 and with bounded output capture. Timed-out commands are killed with their whole
-process tree (see :mod:`.proctree`). On Windows, nothing a command starts
-outlives it.
+process tree (see :mod:`.proctree`). When a command or session ends, so does
+whatever it left running in the background: on Windows everything it started, on
+POSIX everything that stayed in its process group.
 """
 
 from __future__ import annotations
@@ -207,8 +208,9 @@ class _Session:
         self.proc.wait()
         if self.watchdog is not None:
             self.watchdog.cancel()
-        self.reader.join(_SESSION_DRAIN_SECONDS)
+        # Before draining: a background child left running would hold the output pipe open.
         self.tree.release()
+        self.reader.join(_SESSION_DRAIN_SECONDS)
         if self._on_exit is None:
             return
         try:

@@ -1,7 +1,10 @@
 """Start a child process so that it and everything it starts can be killed together.
 
 POSIX: the child leads a new session (process group); killing sends SIGKILL to
-the group and to any descendants psutil can still see.
+the group and to any descendants psutil can still see. When the child has exited,
+releasing the tree kills the group too, so background programs it started that
+stayed in the group do not outlive it. A program that left the group (``setsid``,
+a daemon that detaches into a session of its own) is out of reach on POSIX.
 
 Windows: the child starts suspended, is placed in a Job Object, and only then
 resumed, so it cannot start anything outside the job. Killing terminates the
@@ -114,6 +117,7 @@ class ProcessTree:
         stderr: int | IO[Any] | None,
     ) -> None:
         self._job: int | None = None
+        self._group_ended = False
         self.contained = True
         common = {"cwd": cwd, "env": env, "stdin": stdin, "stdout": stdout, "stderr": stderr}
         if not IS_WINDOWS:
@@ -175,13 +179,33 @@ class ProcessTree:
             pass
 
     def release(self) -> None:
-        """Drop the containment handle. On Windows this ends anything the process left running."""
+        """The command is done: end anything it left running, and drop the containment handle.
+
+        Windows: closing the job ends everything in it. POSIX: once the process has exited,
+        its process group is killed, once. Called while the process still runs, it only
+        drops the handle; the caller kills the tree first when it means to end it.
+        """
+        self._close_job()
+        if IS_WINDOWS or self._group_ended or self.proc.poll() is None:
+            return
+        self._group_ended = True
+        try:
+            # The group outlives its leader while members remain, and POSIX never reuses a
+            # number still in use as a group ID. Callers release right after the exit, so
+            # a number an empty group has freed has had no time to be given out again.
+            os.killpg(self.proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    def _close_job(self) -> None:
         job, self._job = self._job, None
         if job is not None:  # pragma: no cover - Windows
             _kernel32.CloseHandle(job)
 
     def __del__(self) -> None:
+        # Only the handle: killing a group here, at some later collection, could reach a
+        # group that has since been given the same number.
         try:
-            self.release()
+            self._close_job()
         except Exception:  # interpreter shutdown; the OS closes the handle with the process
             pass
