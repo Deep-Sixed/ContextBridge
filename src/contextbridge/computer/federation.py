@@ -264,6 +264,7 @@ class Federation:
         self._log = log or (lambda message: print(f"[federation] {message}", file=sys.stderr, flush=True))
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
+        self._repair_task: asyncio.Future[Any] | None = None
         self._tools: dict[str, FederatedTool] = {}
         self._routes: dict[str, tuple[str, str]] = {}  # exposed name -> (server, downstream tool)
         self._lock = threading.Lock()
@@ -287,11 +288,23 @@ class Federation:
                 server.error = f"{type(exc).__name__}: {exc}"[:300]
                 self._log(f"MCP server '{server.config.name}' did not start: {server.error}")
         self._rebuild()
+        self._repair_task = asyncio.run_coroutine_threadsafe(self._repair_loop(), loop)
+
+    async def _repair_loop(self) -> None:
+        """Retry unavailable MCP servers and refresh their published tools."""
+        while True:
+            await asyncio.sleep(max(RESTART_INTERVAL_SECONDS, 0.1))
+            for server in self._servers.values():
+                if server.session is None:
+                    await self._restart(server)
 
     def close(self) -> None:
         loop, thread = self._loop, self._thread
         if loop is None or thread is None:
             return
+        if self._repair_task is not None:
+            self._repair_task.cancel()
+            self._repair_task = None
         with contextlib.suppress(Exception):
             asyncio.run_coroutine_threadsafe(self._stop_all(), loop).result(timeout=10)
         loop.call_soon_threadsafe(loop.stop)
@@ -450,6 +463,8 @@ class Federation:
         task = server.task
         server.task = None
         server.session = None
+        server.tools = {}
+        self._rebuild()
         if server.stop is not None:
             server.stop.set()
         if task is not None and not task.done():
