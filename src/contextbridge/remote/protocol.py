@@ -10,18 +10,24 @@ Session::
     agent   → {"type": "hello", "version", "device_id"}
     gateway → {"type": "challenge", "nonce", "gateway_id"}
     agent   → {"type": "auth", "signature", "capabilities": {"tools", "policy", "info", "federated"}}
-    gateway → {"type": "welcome", "heartbeat_seconds"}
+    gateway → {"type": "welcome", "heartbeat_seconds", "features"}
 
     gateway → {"type": "call", "seq", "request_id", "tool", "args"}
     agent   → {"type": "started", "request_id", "fields"}
     agent   → {"type": "result", "request_id", "ok", "result" | "error": {"kind", "message"}, "started"}
     agent   → {"type": "heartbeat"}
     agent   → {"type": "event", "event": "exited", ...}
+    agent   → {"type": "tools", "federated"}   (only if "features" lists "tool_updates")
     gateway → {"type": "error", "code", "message"}   (then closes)
 
 ``federated`` lists tools from MCP servers the agent's own config runs
 (:class:`~contextbridge.computer.federation.FederatedTool` in wire form); a
-``call`` names one exactly as listed.
+``call`` names one exactly as listed. When that list changes during a session (a
+server that failed to start comes up, say), the agent sends it again in a
+``tools`` message, which replaces the one from ``auth``. A gateway that predates
+this sends no ``features`` and would refuse an unknown message as a protocol
+error, which an agent treats as fatal, so an agent sends ``tools`` only to a
+gateway whose ``welcome`` lists ``tool_updates``.
 
 The signature is Ed25519 over :func:`auth_payload`, binding the device, this
 gateway, and a fresh 32-byte nonce. ``seq`` increases strictly per connection
@@ -42,6 +48,10 @@ AUTH_CONTEXT = b"contextbridge-agent-auth-v1"
 # Error codes after which an agent must stop reconnecting. Any other code (such as
 # "already_connected", "replaced", or "timeout" for a handshake that took too long) is
 # retried with backoff.
+# Optional messages a gateway accepts, announced in "welcome".
+FEATURE_TOOL_UPDATES = "tool_updates"
+GATEWAY_FEATURES = (FEATURE_TOOL_UPDATES,)
+
 FATAL_ERRORS = frozenset({"revoked", "unknown_device", "bad_signature", "bad_code", "protocol", "version"})
 
 

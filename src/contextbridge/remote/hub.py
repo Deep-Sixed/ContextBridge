@@ -33,6 +33,7 @@ from ..computer.dispatch import ENGINE_TOOLS, RESERVED_TOOL_NAMES
 from ..computer.federation import FederatedTool, tools_from_wire
 from ..computer.policy import PolicyViolation
 from .protocol import (
+    GATEWAY_FEATURES,
     HANDSHAKE_TIMEOUT_SECONDS,
     MAX_MESSAGE_BYTES,
     PROTOCOL_VERSION,
@@ -456,7 +457,9 @@ class AgentHub:
             self._connections[device.device_id] = conn
             self._last_seen_wall[device.device_id] = time.time()
             try:
-                await conn.send({"type": "welcome", "heartbeat_seconds": self.heartbeat_seconds})
+                await conn.send(
+                    {"type": "welcome", "heartbeat_seconds": self.heartbeat_seconds, "features": list(GATEWAY_FEATURES)}
+                )
             except ConnectionClosed:
                 self._drop(conn, "connection lost")
                 raise
@@ -491,6 +494,15 @@ class AgentHub:
                 pending = conn.pending.get(str(msg.get("request_id")))
                 if pending is not None and not pending.future.done():
                     pending.future.set_result(msg)
+            elif kind == "tools":
+                # The agent's MCP tools changed mid-session; validated exactly as at the handshake.
+                conn.federated = tools_from_wire(msg.get("federated"), reserved=RESERVED_TOOL_NAMES)
+                self._log(
+                    "device_tools_changed",
+                    device=conn.device.name,
+                    device_id=conn.device.device_id,
+                    mcp_tools=sorted(conn.federated),
+                )
             elif kind == "event" and msg.get("event") == "exited":
                 fields = {k: msg.get(k) for k in ("session_id", "pid", "command", "exit_code", "timed_out")}
                 self._log("exited", tool="session", device=conn.device.name, success=msg.get("success"), **fields)

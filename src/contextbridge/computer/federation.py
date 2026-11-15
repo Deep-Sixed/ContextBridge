@@ -15,8 +15,10 @@ tools another scope (``desktop:observe`` for a screenshot tool, say).
 The servers run in one background thread with its own event loop, so the
 synchronous :class:`~.dispatch.Engine` can call them from any worker thread. A
 server that exits is started again on its next call. One that never started is
-tried again in the background, less and less often, until it does; a remote
-agent reports the tools it gained the next time it connects to the gateway.
+tried again in the background, less and less often, until it does. A remote
+agent sends the gateway its new tool list as soon as it changes, if the gateway
+accepts tool updates (see :mod:`contextbridge.remote.protocol`); an older gateway
+learns it the next time the agent connects.
 """
 
 from __future__ import annotations
@@ -273,6 +275,8 @@ class Federation:
         self._tools: dict[str, FederatedTool] = {}
         self._routes: dict[str, tuple[str, str]] = {}  # exposed name -> (server, downstream tool)
         self._lock = threading.Lock()
+        # Called (on the federation thread) whenever the set of offered tools changes after start().
+        self.on_change: Callable[[], None] | None = None
 
     # ------------------------------------------------------------ lifecycle
 
@@ -516,4 +520,10 @@ class Federation:
                 )
                 routes[name] = (server.config.name, tool.name)
         with self._lock:
+            changed = tools != self._tools
             self._tools, self._routes = tools, routes
+        if changed and self.on_change is not None:
+            try:
+                self.on_change()
+            except Exception as exc:  # noqa: BLE001 -- a listener must never break the federation
+                self._log(f"tool change listener failed: {exc}")

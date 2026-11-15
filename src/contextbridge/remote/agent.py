@@ -54,6 +54,7 @@ from ..hardening import protect_process_secrets
 from ..net import is_loopback
 from .protocol import (
     FATAL_ERRORS,
+    FEATURE_TOOL_UPDATES,
     HANDSHAKE_TIMEOUT_SECONDS,
     MAX_MESSAGE_BYTES,
     PROTOCOL_VERSION,
@@ -319,6 +320,10 @@ class Agent:
         self._calls = asyncio.Semaphore(config.max_concurrent_calls)
         self._seen: OrderedDict[str, None] = OrderedDict()
         self._last_seq = 0
+        self._gateway_features: frozenset[str] = frozenset()
+        self._advertised: list[dict[str, Any]] | None = None  # the federated tools the gateway last heard
+        if federation is not None:
+            federation.on_change = self._federation_changed
         self._tasks: set[asyncio.Task[None]] = set()
         self._stopping = asyncio.Event()
         self._backoff = 1.0
@@ -376,13 +381,18 @@ class Agent:
                 "tools": sorted(self.engine.tools),
                 "policy": self.config.policy.summary(),
                 "info": _host_info(),
-                "federated": [tool.to_wire() for tool in self.engine.federated.values()],
+                "federated": self._federated_wire(),
             }
             await ws.send(encode({"type": "auth", "signature": signature, "capabilities": capabilities}))
             welcome = await _expect(ws, "welcome")
             if self._stopping.is_set():
                 return  # stop() may have run before the handshake published self._ws.
             heartbeat = min(max(float(welcome.get("heartbeat_seconds") or 15), 1.0), 300.0)
+            features = welcome.get("features")
+            self._gateway_features = frozenset(f for f in features if isinstance(f, str)) if isinstance(
+                features, list
+            ) else frozenset()
+            self._advertised = capabilities["federated"]
 
             self._ws = ws
             self._last_seq = 0
@@ -396,6 +406,7 @@ class Agent:
                 mcp_tools=sorted(self.engine.federated) or None,
             )
             beat = asyncio.create_task(self._heartbeats(ws, heartbeat))
+            await self._report_tools()  # in case they changed during the handshake
             try:
                 async for raw in ws:
                     msg = decode(raw)
@@ -415,6 +426,32 @@ class Agent:
                 self._log("gateway_disconnected", gateway=self.config.gateway_url)
         finally:
             await ws.close()
+
+    def _federated_wire(self) -> list[dict[str, Any]]:
+        return [tool.to_wire() for _, tool in sorted(self.engine.federated.items())]
+
+    def _federation_changed(self) -> None:
+        """Runs on the federation thread when the MCP tools this agent offers change."""
+        loop = self._loop
+        if loop is not None and not loop.is_closed():
+            asyncio.run_coroutine_threadsafe(self._report_tools(), loop)
+
+    async def _report_tools(self) -> None:
+        """Tell the gateway the current MCP tools, if they changed and it accepts updates.
+
+        A gateway without the feature learns them on the agent's next connection instead.
+        """
+        if self._ws is None or FEATURE_TOOL_UPDATES not in self._gateway_features:
+            return
+        current = self._federated_wire()
+        if current == self._advertised:
+            return
+        try:
+            await self._send({"type": "tools", "federated": current})
+        except (ConnectionClosed, OSError):
+            return  # the next connection reports them in its handshake
+        self._advertised = current
+        self._log("mcp_tools_reported", mcp_tools=[t["name"] for t in current])
 
     async def _heartbeats(self, ws: ClientConnection, interval: float) -> None:
         with contextlib.suppress(ConnectionClosed, asyncio.CancelledError):
