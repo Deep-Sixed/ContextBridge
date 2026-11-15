@@ -14,7 +14,9 @@ tools another scope (``desktop:observe`` for a screenshot tool, say).
 
 The servers run in one background thread with its own event loop, so the
 synchronous :class:`~.dispatch.Engine` can call them from any worker thread. A
-server that exits is started again on its next call.
+server that exits is started again on its next call. One that never started is
+tried again in the background, less and less often, until it does; a remote
+agent reports the tools it gained the next time it connects to the gateway.
 """
 
 from __future__ import annotations
@@ -42,6 +44,9 @@ DEFAULT_TIMEOUT_SECONDS = 120.0
 MAX_TIMEOUT_SECONDS = 600.0
 DEFAULT_STARTUP_SECONDS = 30.0
 RESTART_INTERVAL_SECONDS = 5.0
+# A server that did not start is tried again after this long, then at doubling intervals up to the cap.
+RETRY_START_SECONDS = 5.0
+RETRY_START_MAX_SECONDS = 300.0
 MAX_TOOLS_PER_DEVICE = 256
 MAX_DESCRIPTION_CHARS = 2000
 MAX_SCHEMA_BYTES = 64 * 1024
@@ -264,6 +269,7 @@ class Federation:
         self._log = log or (lambda message: print(f"[federation] {message}", file=sys.stderr, flush=True))
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
+        self._retry: Any = None  # the background retry of servers that did not start
         self._tools: dict[str, FederatedTool] = {}
         self._routes: dict[str, tuple[str, str]] = {}  # exposed name -> (server, downstream tool)
         self._lock = threading.Lock()
@@ -287,11 +293,39 @@ class Federation:
                 server.error = f"{type(exc).__name__}: {exc}"[:300]
                 self._log(f"MCP server '{server.config.name}' did not start: {server.error}")
         self._rebuild()
+        if any(self._never_started(server) for server in self._servers.values()):
+            self._retry = asyncio.run_coroutine_threadsafe(self._retry_unstarted(), loop)
+
+    @staticmethod
+    def _never_started(server: _Server) -> bool:
+        # A server that ran once keeps its tools listed and is restarted by the next call to one.
+        return server.session is None and not server.tools
+
+    async def _retry_unstarted(self) -> None:
+        """Keep trying the servers that did not start, so their tools appear once they can."""
+        delay = RETRY_START_SECONDS
+        while any(self._never_started(server) for server in self._servers.values()):
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, RETRY_START_MAX_SECONDS)
+            for server in self._servers.values():
+                if not self._never_started(server):
+                    continue
+                await self._stop(server)
+                try:
+                    await self._launch(server)
+                except Exception as exc:  # noqa: BLE001 -- still not ready; the first failure was logged
+                    server.error = f"{type(exc).__name__}: {exc}"[:300]
+                    continue
+                self._rebuild()
+                self._log(f"MCP server '{server.config.name}' started on a retry")
 
     def close(self) -> None:
         loop, thread = self._loop, self._thread
         if loop is None or thread is None:
             return
+        if self._retry is not None:
+            self._retry.cancel()
+            self._retry = None
         with contextlib.suppress(Exception):
             asyncio.run_coroutine_threadsafe(self._stop_all(), loop).result(timeout=10)
         loop.call_soon_threadsafe(loop.stop)
