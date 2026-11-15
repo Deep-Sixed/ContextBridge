@@ -332,6 +332,20 @@ def test_utf16_files_from_powershell_are_text(policy, workspace):
 
 
 @pytest.mark.parametrize("byte_order", ["utf-16-le", "utf-16-be"])
+def test_edit_block_keeps_a_utf16_files_byte_order(policy, workspace, byte_order):
+    """The edited file is byte for byte the original with the text replaced: same mark, same order."""
+    target = workspace / "work" / "wide.log"
+    bom = b"\xff\xfe" if byte_order == "utf-16-le" else b"\xfe\xff"
+    target.write_bytes(bom + "first line\r\nzweite Zeile ü\r\n".encode(byte_order))
+    files.edit_block(policy, "work/wide.log", "zweite", "second")
+    assert target.read_bytes() == bom + "first line\r\nsecond Zeile ü\r\n".encode(byte_order)
+    assert files.read_file(policy, "work/wide.log")["content"] == "first line\r\nsecond Zeile ü\r\n"
+    # A second edit starts from the rewritten file and must not add another mark.
+    files.edit_block(policy, "work/wide.log", "first", "1st")
+    assert target.read_bytes() == bom + "1st line\r\nsecond Zeile ü\r\n".encode(byte_order)
+
+
+@pytest.mark.parametrize("byte_order", ["utf-16-le", "utf-16-be"])
 def test_append_to_utf16_file_keeps_its_encoding(policy, workspace, byte_order):
     """Appended text is encoded like the file, without a second byte-order mark."""
     target = workspace / "work" / "wide.log"

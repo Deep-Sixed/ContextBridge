@@ -526,7 +526,14 @@ def edit_block(
             f"Expected {expected_replacements} occurrence(s) of old_string in {path}, found {found}.{hint}"
         )
     updated = original.replace(old_string, new_string)
-    data = _encode_for_write(policy, updated, encoding)  # keeps the file's encoding and BOM
+    if encoding == "utf-16":
+        # Python's "utf-16" writes this machine's byte order. Keep the file's own: the
+        # byte-order mark is U+FEFF, written first in the order the file's mark shows.
+        with resolved.open("rb") as fh:
+            big_endian = fh.read(2) == b"\xfe\xff"
+        data = _encode_for_write(policy, "﻿" + updated, "utf-16-be" if big_endian else "utf-16-le")
+    else:
+        data = _encode_for_write(policy, updated, encoding)  # keeps the file's encoding and BOM
     mark_started(path=str(resolved), replacements=found)
     _atomic_write(resolved, data)
     return {"path": str(resolved), "replacements": found}
