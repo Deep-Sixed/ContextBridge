@@ -10,7 +10,11 @@ counts as a prompt when its shape is one programs use:
   one mark per line on the same unfinished line (``>>> ... ``).
 - **named**: a name, closed by ``> `` (``julia> ``, ``sqlite> ``, ``iex(1)> ``), or
   PowerShell's ``PS <location>> ``.
-- **shell**: a POSIX shell prompt, which ends in ``$ ``, ``# `` or ``% ``.
+- **shell**: a POSIX shell prompt, ending in ``$ ``, ``# `` or ``% ``. Ordinary output ends
+  that way too (``Progress 45 % ``, ``Total: 30$ ``), so the sign must stand alone, follow
+  the end of a name or path (``~/proj$ ``, ``root@box:/# ``, ``postgres=# ``), follow a shell
+  name and version (``bash-5.2$ ``), or follow a space on a line naming ``user@host``
+  (zsh's ``me@laptop project % ``). A sign right after a number is never a prompt.
 - **cmd**: cmd.exe's prompt, a drive path followed by ``>`` with no space.
 - **question**: anything else ending in ``? ``, ``: `` or ``] `` (``Password: ``,
   ``Continue? [y/N] ``). Programs also print such text while working (``Loading: ``), so
@@ -36,7 +40,11 @@ _POWERSHELL = re.compile(r"(?:\[\w+\]: )?PS \S.*> \Z")
 # An interpreter prompt after other text on its line: output with no newline, or an
 # answered question ("Your name: >>> ")
 _AFTER_OUTPUT = re.compile(r".*(>>> )\Z")
-_SHELL = re.compile(r".*[$#%] \Z")
+_SHELL_ALONE = re.compile(r"[$#%] \Z")
+_SHELL_AFTER_NAME = re.compile(r".*[A-Za-z_~/\])=:][$#%] \Z")
+_SHELL_AFTER_VERSION = re.compile(r"(?:.*\s)?[A-Za-z]\w*-\d+(?:\.\d+)*[$#] \Z")
+_SHELL_AFTER_USER_HOST = re.compile(r".*\S@\S.*\s[$#%] \Z")
+_SHELL_RULES = (_SHELL_ALONE, _SHELL_AFTER_NAME, _SHELL_AFTER_VERSION, _SHELL_AFTER_USER_HOST)
 _CMD = re.compile(r"[A-Za-z]:\\[^\r\n<>|\"*?]*>\Z")
 _QUESTION = re.compile(r".*\S[?:\]] \Z")
 
@@ -68,7 +76,7 @@ def find_prompt(output: str, *, settled: bool = False) -> Prompt | None:
         return Prompt(found.group(1) + ("" if found.group(1).endswith(" ") else " "), "named")
     if _CMD.fullmatch(line):
         return Prompt(line, "cmd")
-    if _SHELL.fullmatch(line):
+    if any(rule.fullmatch(line) for rule in _SHELL_RULES):
         return Prompt(line, "shell")
     if settled and _QUESTION.fullmatch(line):
         return Prompt(line.strip() + " ", "question")
