@@ -396,6 +396,9 @@ class Agent:
                 mcp_tools=sorted(self.engine.federated) or None,
             )
             beat = asyncio.create_task(self._heartbeats(ws, heartbeat))
+            advertised = tuple(sorted((name, tool.to_wire().__repr__()) for name, tool in self.engine.federated.items()))
+            watcher = (asyncio.create_task(self._watch_federation(ws, advertised))
+                       if self.engine.federation is not None else None)
             try:
                 async for raw in ws:
                     msg = decode(raw)
@@ -410,11 +413,23 @@ class Agent:
                         raise ProtocolError(f"unexpected message {msg['type']!r}")
             finally:
                 beat.cancel()
+                if watcher is not None:
+                    watcher.cancel()
                 self._ws = None
                 self.connected.clear()
                 self._log("gateway_disconnected", gateway=self.config.gateway_url)
         finally:
             await ws.close()
+
+    async def _watch_federation(self, ws: ClientConnection, advertised: tuple[tuple[str, str], ...]) -> None:
+        """Reauthenticate to refresh gateway tool listings after federation changes."""
+        while True:
+            await asyncio.sleep(2)
+            current = tuple(sorted((name, tool.to_wire().__repr__()) for name, tool in self.engine.federated.items()))
+            if current != advertised:
+                self._log("federated_tools_changed")
+                await ws.close(code=1000, reason="federated tools changed")
+                return
 
     async def _heartbeats(self, ws: ClientConnection, interval: float) -> None:
         with contextlib.suppress(ConnectionClosed, asyncio.CancelledError):
