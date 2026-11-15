@@ -206,6 +206,18 @@ def test_edit_block(policy, workspace):
     assert target.read_text() == "x = 3\ny = 2\n"
 
 
+def test_edit_block_near_miss_shows_the_closest_text(policy, workspace):
+    target = workspace / "work" / "win.py"
+    original = b"def f():\r\n    return 1\r\n"
+    target.write_bytes(original)
+    with pytest.raises(FileOperationError) as refused:
+        files.edit_block(policy, str(target), "def f():\n    return 1\n", "def f():\n    return 2\n")
+    message = str(refused.value)
+    assert "found 0" in message and "line 1" in message
+    assert "only in line endings: the file uses \\r\\n" in message and "{+\\r+}" in message
+    assert target.read_bytes() == original
+
+
 def test_edit_block_preserves_crlf(policy, workspace):
     target = workspace / "work" / "win.txt"
     target.write_bytes(b"a\r\nb\r\n")

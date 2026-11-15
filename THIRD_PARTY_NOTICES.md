@@ -6,6 +6,8 @@ ContextBridge includes work adapted from the following projects.
 
 The prompt tables and matching rules in `src/contextbridge/computer/prompts.py`, and the test cases in `tests/test_prompts.py`, are adapted from `src/utils/process-detection.ts` and `test/test-prompt-detection.js` in [Desktop Commander MCP](https://github.com/wonderwhy-er/DesktopCommanderMCP) (v0.3.3).
 
+The near-miss feedback in `src/contextbridge/nearmiss.py` (reporting the closest text when `edit_block` finds no match, the 0.7 similarity threshold and the `{-removed-}{+added+}` diff notation) follows `src/tools/edit.ts` in the same project. Its search is a new implementation.
+
 ```
 MIT License
 
