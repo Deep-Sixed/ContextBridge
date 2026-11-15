@@ -129,6 +129,13 @@ def test_kill_process_refuses_protected_pids():
             commands.kill_process(pid)
 
 
+@pytest.mark.parametrize("pid", [-1, -4242])
+def test_kill_process_refuses_negative_pids(pid):
+    # On POSIX a negative pid addresses a whole process group (-1: every process the user may signal).
+    with pytest.raises(CommandError, match="No such process"):
+        commands.kill_process(pid)
+
+
 @posix_only
 def test_kill_process_terminates_child():
     import subprocess
