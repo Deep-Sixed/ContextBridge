@@ -185,6 +185,7 @@ class _Session:
         self.base = 0  # absolute offset of buffer[0]
         self.cursor = 0  # absolute offset of the next unread byte
         self.timed_out = False
+        self.watchdog: threading.Timer | None = None
         self.changed = threading.Condition()
         self.reader = threading.Thread(target=_pump, args=(proc.stdout, self._append), daemon=True)
         self.reader.start()
@@ -193,6 +194,8 @@ class _Session:
 
     def _wait_for_exit(self) -> None:
         self.proc.wait()
+        if self.watchdog is not None:
+            self.watchdog.cancel()
         self.reader.join(_SESSION_DRAIN_SECONDS)
         self.tree.release()
         if self._on_exit is None:
@@ -316,7 +319,9 @@ class SessionManager:
             self._sessions[session.id] = session
         watchdog = threading.Timer(lifetime, self._expire, args=(session,))
         watchdog.daemon = True
-        watchdog.start()
+        session.watchdog = watchdog
+        if session.running():
+            watchdog.start()
         result = session.read(wait_seconds)
         result["lifetime_seconds"] = lifetime
         return result
@@ -405,6 +410,8 @@ def list_processes(*, name_filter: str | None = None, limit: int = 200) -> dict[
 
 
 def kill_process(pid: int, *, force: bool = False) -> dict[str, Any]:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid < 0:
+        raise PolicyViolation("Process ID must be a non-negative integer.")
     protected = {0, 1, 4, os.getpid(), os.getppid()}
     if pid in protected:
         raise PolicyViolation(f"Process {pid} is protected and cannot be signalled.")
