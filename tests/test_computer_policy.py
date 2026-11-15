@@ -100,6 +100,15 @@ def test_protected_paths_are_never_writable(workspace):
         policy.resolve(str(config), write=True)
 
 
+def test_unknown_home_directory_is_a_policy_denial(policy):
+    # pathlib raises RuntimeError for "~user" when there is no such user; that must reach the
+    # caller as a denial like any other path outside the roots, not as an internal error.
+    with pytest.raises(PolicyViolation):
+        policy.resolve("~contextbridge-no-such-user-293847/notes.txt")
+    with pytest.raises(PolicyViolation):
+        policy.resolve("~contextbridge-no-such-user-293847/notes.txt", write=True, follow_symlinks=False)
+
+
 def test_empty_and_nul_paths_are_rejected(policy):
     for raw in ("", "   ", "docs/\x00notes.md"):
         with pytest.raises(PolicyViolation):
