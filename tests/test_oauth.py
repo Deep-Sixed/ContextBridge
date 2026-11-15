@@ -204,13 +204,21 @@ def test_a_revocation_by_another_process_applies_immediately(store):
     assert store.find_access(access) is None
 
 
-def test_full_client_table_evicts_unapproved_clients_first(store):
+def test_full_client_table_preserves_existing_clients(store):
     for i in range(MAX_CLIENTS):
         store.save_client({"client_id": f"c{i}", "redirect_uris": [REDIRECT]})
     store.save_code("x", {"client_id": "c1", "expires_at": time.time() + 60})  # c1 is approved
-    store.save_client({"client_id": "new", "redirect_uris": [REDIRECT]})
+    with pytest.raises(OAuthStateError, match="too many registered clients"):
+        store.save_client({"client_id": "new", "redirect_uris": [REDIRECT]})
     ids = {c["client_id"] for c in store.clients()}
-    assert "new" in ids and "c1" in ids and "c0" not in ids and len(ids) == MAX_CLIENTS
+    assert "new" not in ids and "c1" in ids and "c0" in ids and len(ids) == MAX_CLIENTS
+
+
+def test_separate_consent_requests_do_not_share_owner_lockout(store):
+    for _ in range(5):
+        store.verify_owner("incorrect", "000000", consent_id="attacker-request")
+    assert store.verify_owner("incorrect", "000000", consent_id="attacker-request") == "locked"
+    assert store.verify_owner(PASSPHRASE, next_code(store), consent_id="owner-request") is None
 
 
 # ------------------------------------------------- per-device authorization
