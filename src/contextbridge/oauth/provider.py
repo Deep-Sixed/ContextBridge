@@ -185,8 +185,8 @@ class ContextBridgeOAuthProvider(OAuthProvider):
             raise AuthorizeError("invalid_request", "this server only issues tokens for its own MCP endpoint")
         now = time.time()
         self._pending = {k: v for k, v in self._pending.items() if v.expires_at > now}
-        while len(self._pending) >= MAX_PENDING:
-            self._pending.pop(next(iter(self._pending)))
+        if len(self._pending) >= MAX_PENDING:
+            raise AuthorizeError("temporarily_unavailable", "too many pending authorization requests")
         request_id = secrets.token_urlsafe(24)
         redirect = urlsplit(str(params.redirect_uri))
         self._pending[request_id] = _Pending(
@@ -230,11 +230,11 @@ class ContextBridgeOAuthProvider(OAuthProvider):
                 status_code=302,
             )
 
-        failure = self.store.verify_owner(str(form.get("passphrase", "")), str(form.get("totp", "")))
+        failure = self.store.verify_owner(str(form.get("passphrase", "")), str(form.get("totp", "")), consent_id=request_id)
         if failure is not None:
             self._log("oauth_consent_failed", client=pending.client_id, reason=failure)
             if failure == "locked":
-                minutes = max(1, round((self.store.locked_until() - time.time()) / 60))
+                minutes = max(1, round((self.store.locked_until(request_id) - time.time()) / 60))
                 return _page(f"Too many failed attempts. Approval is locked for about {minutes} minutes.", status=429)
             return self._form(request_id, pending, error="Wrong passphrase or authenticator code.", status=401)
 
