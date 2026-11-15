@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 
 import psutil
@@ -112,6 +113,29 @@ def test_session_limit_and_lifetime(make_policy):
     sessions.shutdown()
 
 
+def _watchdogs() -> list[threading.Timer]:
+    return [t for t in threading.enumerate() if isinstance(t, threading.Timer)]
+
+
+def test_finished_session_leaves_no_watchdog_thread(make_policy):
+    # Each session gets a lifetime timer. One that outlives its process holds a thread and the
+    # session's output buffer for up to max_session_seconds, so many short sessions pile up.
+    policy = make_policy(commands={"mode": "allowlist", "allow": [PY]})
+    sessions = SessionManager(policy)
+    before = set(_watchdogs())
+    for _ in range(5):
+        sid = sessions.start(python_cmd("print('done')"), wait_seconds=0)["session_id"]
+        deadline = time.monotonic() + 10
+        while sessions.read(sid)["running"] and time.monotonic() < deadline:
+            time.sleep(0.05)
+        final = sessions.read(sid)
+        assert final["running"] is False and final["timed_out"] is False
+    deadline = time.monotonic() + 5
+    while set(_watchdogs()) - before and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert set(_watchdogs()) - before == set()
+
+
 @posix_only
 def test_session_rejects_unlisted_program(policy):
     with pytest.raises(PolicyViolation, match="allowlist"):
@@ -127,6 +151,13 @@ def test_kill_process_refuses_protected_pids():
     for pid in (1, os.getpid(), os.getppid()):
         with pytest.raises(PolicyViolation, match="protected"):
             commands.kill_process(pid)
+
+
+@pytest.mark.parametrize("pid", [-1, -4242])
+def test_kill_process_refuses_negative_pids(pid):
+    # On POSIX a negative pid addresses a whole process group (-1: every process the user may signal).
+    with pytest.raises(CommandError, match="No such process"):
+        commands.kill_process(pid)
 
 
 @posix_only
