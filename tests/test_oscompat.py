@@ -62,6 +62,9 @@ def test_windows_splitting_rejects_unterminated_quotes():
         (r"docs\CON", "reserved"),
         (r"docs\nul.txt", "reserved"),
         (r"docs\COM1", "reserved"),
+        (r"docs\COM¹", "reserved"),
+        (r"docs\com².txt", "reserved"),
+        (r"docs\LPT³", "reserved"),
         (".env.", "ending in a dot or space"),
         (".env ", "ending in a dot or space"),
         (r"\\?\C:\Windows", "device-namespace"),
@@ -74,14 +77,16 @@ def test_windows_path_problems(raw, problem):
     assert problem in windows_path_problem(raw)
 
 
-@pytest.mark.parametrize("raw", [r"C:\Users\me\docs\notes.md", "docs/notes.md", r"..\x", r"\\server\share\f.txt", "~"])
+@pytest.mark.parametrize(
+    "raw", [r"C:\Users\me\docs\notes.md", "docs/notes.md", r"..\x", r"\\server\share\f.txt", "~", "COM⁴", "COM¹0", "LPT¹x"]
+)
 def test_ordinary_windows_paths_are_fine(raw):
     assert windows_path_problem(raw) is None
 
 
 def test_policy_applies_windows_name_rules(workspace):
     policy = replace(load_policy({"filesystem": {"roots": [str(workspace)]}}), windows=True)
-    for raw in ("docs/notes.md:secret", ".env.", "docs/CON", "docs/notes.md::$DATA"):
+    for raw in ("docs/notes.md:secret", ".env.", "docs/CON", "docs/notes.md::$DATA", "docs/COM¹", "docs/lpt².log"):
         with pytest.raises(PolicyViolation):
             policy.resolve(raw)
     assert policy.resolve("docs/notes.md") == workspace / "docs" / "notes.md"
