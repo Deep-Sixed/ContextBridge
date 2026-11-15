@@ -422,7 +422,7 @@ remote:
 
 - **Owner consent on every authorization.** No client gets a token until you approve it on the consent page, which requires both the passphrase and a TOTP code.
   - **Single-use codes.** A TOTP code works only once.
-  - **Lockout.** Five failures lock approvals for 15 minutes, and `oauth-unlock` clears the lock early. Anyone can trigger the lockout, but no one can get past it.
+  - **Lockout.** Five failures lock approvals for 15 minutes, and `oauth-unlock` clears the lock early. Anyone can trigger the lockout, but no one can get past it. By default one lockout covers every caller, so a stranger's failures lock you out too; behind a tunnel, set `remote.client_ip_header` (for Cloudflare, `CF-Connecting-IP`) and each client address is locked out on its own. Name only a header the tunnel sets itself, replacing anything the client sent: a client that can choose the value can dodge the lockout. From a list such as `X-Forwarded-For`, only the last entry is used.
   - **Stored hashed.** The passphrase is kept only as an scrypt hash.
 - **Least privilege.**
   - **Per-client grants.** Each client gets only the scopes and devices you tick.

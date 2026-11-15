@@ -39,6 +39,7 @@ LOCKOUT_WINDOW_SECONDS = 15 * 60
 LOCKOUT_SECONDS = 15 * 60
 MIN_PASSPHRASE_LENGTH = 12
 UNUSED_CLIENT_SECONDS = 24 * 3600
+MAX_LOCKOUT_ADDRESSES = 1000
 MAX_CLIENTS = 50
 _SCRYPT = {"n": 2**14, "r": 8, "p": 1}
 
@@ -176,6 +177,15 @@ class OAuthStore:
             for gid, g in state["grants"].items()
             if g["revoked_at"] is None and g["refresh_expires_at"] > now
         }
+        # Per-address lockouts: forget an address once its lock and its counted failures have lapsed.
+        lockouts = {
+            address: lock
+            for address, lock in state.get("lockouts", {}).items()
+            if lock.get("locked_until", 0) > now
+            or any(now - t < LOCKOUT_WINDOW_SECONDS for t in lock.get("failures", []))
+        }
+        if lockouts or "lockouts" in state:
+            state["lockouts"] = lockouts
         authorized = {g["client_id"] for g in state["grants"].values()}
         state["clients"] = {
             cid: c
@@ -194,23 +204,41 @@ class OAuthStore:
         with self.update() as state:
             state["owner"] = {"passphrase": hashed, "totp_secret": totp_secret, "totp_last_counter": 0}
             state["lockout"] = {"failures": [], "locked_until": 0}
+            state.pop("lockouts", None)
 
-    def locked_until(self) -> float:
-        until = float(self.state["lockout"].get("locked_until", 0))
+    @staticmethod
+    def _lockout(state: dict[str, Any], client: str | None) -> dict[str, Any]:
+        """The lockout record failures count against: ``client``'s own, or the shared one for None."""
+        if client is None:
+            return state["lockout"]
+        lockouts = state.setdefault("lockouts", {})
+        if client not in lockouts:
+            while len(lockouts) >= MAX_LOCKOUT_ADDRESSES:  # bounded: the longest-tracked address goes first
+                del lockouts[next(iter(lockouts))]
+            lockouts[client] = {"failures": [], "locked_until": 0}
+        return lockouts[client]
+
+    def locked_until(self, client: str | None = None) -> float:
+        state = self.state
+        lockout = state["lockout"] if client is None else state.get("lockouts", {}).get(client, {})
+        until = float(lockout.get("locked_until", 0))
         return until if until > time.time() else 0.0
 
     def unlock(self) -> None:
         with self.update() as state:
             state["lockout"] = {"failures": [], "locked_until": 0}
+            state.pop("lockouts", None)
 
-    def verify_owner(self, passphrase: str, code: str) -> str | None:
+    def verify_owner(self, passphrase: str, code: str, *, client: str | None = None) -> str | None:
         """Check the passphrase and TOTP code. Returns None on success, else the reason it failed.
 
-        Failures count toward a lockout; a TOTP code is accepted only once.
+        Failures count toward a lockout; a TOTP code is accepted only once. ``client`` is the
+        caller's address when a proxy reports one: failures then lock out that address alone,
+        so a stranger cannot lock the owner out. With None, one lockout covers every caller.
         """
         with self.update() as state:
             now = time.time()
-            lockout = state["lockout"]
+            lockout = self._lockout(state, client)
             if lockout.get("locked_until", 0) > now:
                 return "locked"
             owner = state.get("owner") or {}
