@@ -139,6 +139,31 @@ def test_repeated_failures_lock_consent_until_unlocked(store):
     assert store.verify_owner(PASSPHRASE, next_code(store)) is None
 
 
+def test_per_address_lockout_leaves_other_addresses_and_the_shared_lockout_alone(store):
+    for _ in range(4):
+        assert store.verify_owner("nope", "000000", client="203.0.113.9") == "bad_credentials"
+    assert store.verify_owner("nope", "000000", client="203.0.113.9") == "locked"
+    assert store.locked_until("203.0.113.9") > time.time() + 14 * 60
+    assert store.verify_owner(PASSPHRASE, next_code(store), client="203.0.113.9") == "locked"
+    assert store.locked_until("198.51.100.7") == 0 and store.locked_until() == 0
+    assert store.verify_owner(PASSPHRASE, next_code(store), client="198.51.100.7") is None
+    store.unlock()  # oauth-unlock clears per-address locks too
+    assert store.verify_owner(PASSPHRASE, next_code(store), client="203.0.113.9") is None
+
+
+def test_per_address_lockouts_are_bounded_and_forgotten(store, monkeypatch):
+    from contextbridge.oauth import store as store_module
+
+    monkeypatch.setattr(store_module, "MAX_LOCKOUT_ADDRESSES", 3)
+    for n in range(6):
+        store.verify_owner("nope", "000000", client=f"203.0.113.{n}")
+    assert list(store.state["lockouts"]) == ["203.0.113.3", "203.0.113.4", "203.0.113.5"]
+    real = time.time
+    monkeypatch.setattr(store_module.time, "time", lambda: real() + store_module.LOCKOUT_WINDOW_SECONDS + 1)
+    store.verify_owner("nope", "000000", client="203.0.113.99")
+    assert list(store.state["lockouts"]) == ["203.0.113.99"]  # lapsed failures are dropped
+
+
 def _grant(store: OAuthStore, client_id: str = "c1") -> tuple[str, str, str]:
     store.save_client({"client_id": client_id, "redirect_uris": [REDIRECT]})
     code = "code-" + secrets.token_hex(8)
@@ -247,8 +272,7 @@ def test_device_grant_limits_tools_and_listing(policy, tmp_path):
 # --------------------------------------------- authorization server (ASGI)
 
 
-@pytest.fixture
-def remote(policy, tmp_path, store):
+def _remote(policy, tmp_path, store, **extra):
     audit_path = tmp_path / "audit.jsonl"
     audit = ComputerAuditLog(audit_path, echo=False)
     settings = RemoteSettings(
@@ -256,6 +280,7 @@ def remote(policy, tmp_path, store):
         allow_scopes=(SCOPE_READ, SCOPE_WRITE),
         allow_devices=("local",),
         allowed_redirect_hosts=("claude.ai", "localhost"),
+        **extra,
     )
     server = create_remote_server(build_router(policy, audit=audit), audit=audit, settings=settings, store=store)
     app = server.http_app()
@@ -264,6 +289,17 @@ def remote(policy, tmp_path, store):
         return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=PUBLIC)
 
     return SimpleNamespace(client=client, store=store, audit_path=audit_path)
+
+
+@pytest.fixture
+def remote(policy, tmp_path, store):
+    return _remote(policy, tmp_path, store)
+
+
+@pytest.fixture
+def remote_behind_proxy(policy, tmp_path, store):
+    """The remote listener behind a tunnel that reports each client's address in a header."""
+    return _remote(policy, tmp_path, store, client_ip_header="CF-Connecting-IP")
 
 
 async def register(http: httpx.AsyncClient, *, redirect: str = REDIRECT, name: str = "Claude", **extra) -> httpx.Response:
@@ -301,7 +337,9 @@ async def start_authorization(
     return verifier, page
 
 
-async def approve(http, page, store, *, scopes=(SCOPE_READ,), devices=("local",), passphrase=PASSPHRASE, code=None):
+async def approve(
+    http, page, store, *, scopes=(SCOPE_READ,), devices=("local",), passphrase=PASSPHRASE, code=None, headers=None
+):
     data = {
         **form_fields(page.text),
         "scope": list(scopes),
@@ -310,7 +348,7 @@ async def approve(http, page, store, *, scopes=(SCOPE_READ,), devices=("local",)
         "totp": code or next_code(store),
         "action": "approve",
     }
-    return await http.post("/consent", data=data)
+    return await http.post("/consent", data=data, headers=headers)
 
 
 async def exchange(http, client_id: str, verifier: str, code: str) -> httpx.Response:
@@ -447,6 +485,61 @@ def test_consent_locks_after_repeated_failures(remote):
     statuses, locked = anyio.run(scenario)
     assert statuses == [401, 401, 401, 401, 429]
     assert locked.status_code == 429 and "locked" in locked.text
+
+
+ATTACKER = {"CF-Connecting-IP": "203.0.113.9"}
+OWNER = {"CF-Connecting-IP": "198.51.100.7"}
+
+
+async def _lock_out(http, store, headers) -> list[int]:
+    """Five wrong guesses from one address, as any stranger who registers a client can send."""
+    client_id = (await register(http, name="Stranger")).json()["client_id"]
+    _, page = await start_authorization(http, client_id)
+    return [
+        (await approve(http, page, store, passphrase="guess " * 3, code="123456", headers=headers)).status_code
+        for _ in range(5)
+    ]
+
+
+def test_a_stranger_cannot_lock_the_owner_out_behind_a_proxy(remote_behind_proxy):
+    remote = remote_behind_proxy
+
+    async def scenario():
+        async with await remote.client() as http:
+            statuses = await _lock_out(http, remote.store, ATTACKER)
+            client_id = (await register(http)).json()["client_id"]
+            _, page = await start_authorization(http, client_id)
+            mine = await approve(http, page, remote.store, headers=OWNER)
+            _, page = await start_authorization(http, client_id)
+            theirs = await approve(http, page, remote.store, headers=ATTACKER)
+            return statuses, mine, theirs
+
+    statuses, mine, theirs = anyio.run(scenario)
+    assert statuses == [401, 401, 401, 401, 429]
+    assert mine.status_code == 302 and "code=" in mine.headers["location"]  # the owner still gets through
+    assert theirs.status_code == 429  # the address that failed stays locked, even with the right credentials
+
+
+def test_client_address_header_is_ignored_unless_configured(remote):
+    # Without remote.client_ip_header anyone could dodge the lockout by inventing addresses.
+    async def scenario():
+        async with await remote.client() as http:
+            client_id = (await register(http)).json()["client_id"]
+            _, page = await start_authorization(http, client_id)
+            statuses = [
+                (
+                    await approve(
+                        http, page, remote.store, passphrase="guess " * 3, code="123456",
+                        headers={"CF-Connecting-IP": f"203.0.113.{n}"},
+                    )
+                ).status_code
+                for n in range(5)
+            ]
+            return statuses, await approve(http, page, remote.store, headers=OWNER)
+
+    statuses, locked = anyio.run(scenario)
+    assert statuses == [401, 401, 401, 401, 429]
+    assert locked.status_code == 429
 
 
 def test_refresh_rotates_and_reuse_revokes_the_grant(remote):
@@ -659,6 +752,8 @@ def remote_config(tmp_path, workspace, monkeypatch):
         ({"allow_scopes": []}, "non-empty list"),
         ({"state": None}, "remote.state is required"),
         ({"refresh_token_days": 0}, "refresh_token_days"),
+        ({"client_ip_header": ""}, "client_ip_header"),
+        ({"client_ip_header": 7}, "client_ip_header"),
     ],
 )
 def test_remote_misconfiguration_fails_startup(remote_config, remote, message):

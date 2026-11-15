@@ -82,6 +82,7 @@ remote:
   allow_scopes: [computer:read]   # widen deliberately
   allow_devices: ["*"]            # or list device names
   allowed_redirect_hosts: [claude.ai, claude.com, chatgpt.com]
+  client_ip_header: CF-Connecting-IP   # lock out a failing address, not every approver
 
 # No filesystem/commands/processes sections: the VPS has no "local" device.
 ```

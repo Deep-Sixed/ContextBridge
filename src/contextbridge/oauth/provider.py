@@ -79,6 +79,9 @@ class RemoteSettings:
     allowed_redirect_hosts: tuple[str, ...]
     access_seconds: int = 3600
     refresh_seconds: int = 30 * 86400
+    # The header a proxy on this host sets to the real client address (e.g. CF-Connecting-IP).
+    # When set, consent failures lock out that address alone instead of every caller.
+    client_ip_header: str | None = None
 
     @property
     def resource_url(self) -> str:
@@ -141,6 +144,18 @@ class ContextBridgeOAuthProvider(OAuthProvider):
 
     def offered_devices(self) -> list[str]:
         return [d for d in self._offered_devices() if self.settings.device_allowed(d)]
+
+    def _client_address(self, request: Request) -> str | None:
+        """The caller's address as the configured proxy header reports it, or None to share one lockout."""
+        if not self.settings.client_ip_header:
+            return None
+        value = request.headers.get(self.settings.client_ip_header)
+        if not value:
+            return None
+        try:
+            return str(ipaddress.ip_address(value.split(",")[0].strip()))
+        except ValueError:
+            return None
 
     def _check_redirect(self, uri: str) -> None:
         parts = urlsplit(uri)
@@ -230,11 +245,14 @@ class ContextBridgeOAuthProvider(OAuthProvider):
                 status_code=302,
             )
 
-        failure = self.store.verify_owner(str(form.get("passphrase", "")), str(form.get("totp", "")))
+        address = self._client_address(request)
+        failure = self.store.verify_owner(
+            str(form.get("passphrase", "")), str(form.get("totp", "")), client=address
+        )
         if failure is not None:
-            self._log("oauth_consent_failed", client=pending.client_id, reason=failure)
+            self._log("oauth_consent_failed", client=pending.client_id, reason=failure, peer=address)
             if failure == "locked":
-                minutes = max(1, round((self.store.locked_until() - time.time()) / 60))
+                minutes = max(1, round((self.store.locked_until(address) - time.time()) / 60))
                 return _page(f"Too many failed attempts. Approval is locked for about {minutes} minutes.", status=429)
             return self._form(request_id, pending, error="Wrong passphrase or authenticator code.", status=401)
 

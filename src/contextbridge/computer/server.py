@@ -1092,6 +1092,13 @@ class RemoteListenerConfig:
             raise SystemExit(
                 f"{where}: remote.host must be a loopback address; publish it through a TLS tunnel, not a bind."
             )
+        header = cfg.get("client_ip_header")
+        if header is not None and (not isinstance(header, str) or not header.strip()):
+            raise SystemExit(
+                f"{where}: remote.client_ip_header names the header a proxy on this host sets "
+                "(e.g. CF-Connecting-IP)."
+            )
+        self.client_ip_header = header.strip() if isinstance(header, str) else None
         parts = urlsplit(self.public_url)
         if (
             not parts.hostname
@@ -1144,6 +1151,7 @@ class RemoteListenerConfig:
             allowed_redirect_hosts=tuple(self.redirect_hosts),
             access_seconds=self.access_seconds,
             refresh_seconds=self.refresh_seconds,
+            client_ip_header=self.client_ip_header,
         )
 
 
