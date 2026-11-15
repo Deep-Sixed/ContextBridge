@@ -287,6 +287,8 @@ def _device_errors() -> tuple[type[Exception], ...]:
 
 async def _invoke(router: DeviceRouter, device: str, tool: str, args: dict[str, Any]) -> dict[str, Any]:
     """Run a tool call, turning expected failures into client-facing ToolErrors."""
+    # The middleware authorized and audited an empty device as "local"; route it the same way.
+    device = device or LOCAL_DEVICE
     try:
         return await router.call(device, tool, args)
     except PolicyViolation as exc:
