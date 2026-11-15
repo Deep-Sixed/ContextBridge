@@ -390,8 +390,12 @@ class Filesystem:
             if os.path.lexists(target.path) and not target.path.is_file():
                 raise FsError(f"{path}: not a regular file", code="not_a_file")
             if mode == "append":
-                flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | _O_NOFOLLOW | _O_CLOEXEC
-                with os.fdopen(os.open(target.path, flags, 0o666), "ab") as fh:
+                flags = os.O_RDWR | os.O_APPEND | os.O_CREAT | _O_NOFOLLOW | _O_CLOEXEC
+                with os.fdopen(os.open(target.path, flags, 0o666), "a+b") as fh:
+                    # UTF-8 appended to a UTF-16 file would leave it unreadable in either encoding.
+                    fh.seek(0)
+                    if fh.read(2) in (b"\xff\xfe", b"\xfe\xff"):
+                        raise FsError(f"{path}: not a UTF-8 text file", code="binary")
                     fh.write(data)
             else:
                 _atomic_write(target.path, data)

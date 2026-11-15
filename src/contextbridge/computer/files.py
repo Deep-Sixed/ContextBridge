@@ -453,6 +453,20 @@ def _encode_for_write(policy: ComputerPolicy, content: str, encoding: str = "utf
     return data
 
 
+def _append_encoding(path: Path) -> str:
+    """The encoding for text appended to ``path``: the file's own UTF-16 byte order, else UTF-8.
+
+    Appended text carries no byte-order mark of its own: the file already starts with one.
+    """
+    with path.open("rb") as fh:
+        head = fh.read(2)
+    if head == b"\xff\xfe":
+        return "utf-16-le"
+    if head == b"\xfe\xff":
+        return "utf-16-be"
+    return "utf-8"
+
+
 def _require_parent(path: Path, raw: str) -> None:
     if not path.parent.is_dir():
         raise FileOperationError(f"Parent directory of {raw} does not exist; create it first.")
@@ -465,8 +479,9 @@ def write_file(policy: ComputerPolicy, path: str, content: str, *, mode: str = "
     if resolved.exists() and not resolved.is_file():
         raise FileOperationError(f"Not a regular file: {path}")
     _require_parent(resolved, path)
-    data = _encode_for_write(policy, content)
     created = not resolved.exists()
+    encoding = _append_encoding(resolved) if mode == "append" and not created else "utf-8"
+    data = _encode_for_write(policy, content, encoding)
     mark_started(path=str(resolved), bytes=len(data))
     if mode == "append":
         with resolved.open("ab") as fh:

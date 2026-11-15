@@ -331,6 +331,29 @@ def test_utf16_files_from_powershell_are_text(policy, workspace):
     assert raw.decode("utf-16") == "first line\r\nsecond Zeile ü\r\n"
 
 
+@pytest.mark.parametrize("byte_order", ["utf-16-le", "utf-16-be"])
+def test_append_to_utf16_file_keeps_its_encoding(policy, workspace, byte_order):
+    """Appended text is encoded like the file, without a second byte-order mark."""
+    target = workspace / "work" / "wide.log"
+    bom = b"\xff\xfe" if byte_order == "utf-16-le" else b"\xfe\xff"
+    target.write_bytes(bom + "first line\r\n".encode(byte_order))
+    files.write_file(policy, "work/wide.log", "zweite Zeile ü\n", mode="append")
+    raw = target.read_bytes()
+    assert raw == bom + "first line\r\nzweite Zeile ü\n".encode(byte_order)
+    assert files.read_file(policy, "work/wide.log")["content"] == "first line\r\nzweite Zeile ü\n"
+
+
+def test_append_to_utf8_bom_and_empty_files_writes_utf8(policy, workspace):
+    with_bom = workspace / "work" / "bom.txt"
+    with_bom.write_bytes(b"\xef\xbb\xbfone\n")
+    files.write_file(policy, "work/bom.txt", "zwei ü\n", mode="append")
+    assert with_bom.read_bytes() == b"\xef\xbb\xbfone\n" + "zwei ü\n".encode()
+    empty = workspace / "work" / "empty.txt"
+    empty.write_bytes(b"")
+    files.write_file(policy, "work/empty.txt", "ü\n", mode="append")
+    assert empty.read_bytes() == "ü\n".encode()
+
+
 def test_utf8_bom_is_preserved_on_edit(policy, workspace):
     target = workspace / "work" / "bom.txt"
     target.write_bytes(b"\xef\xbb\xbfhello\r\n")

@@ -248,6 +248,18 @@ def test_get_file_info(dirs: dict[str, Path]) -> None:
 # -- writing ----------------------------------------------------------------------
 
 
+def test_append_to_utf16_file_is_refused(dirs: dict[str, Path]) -> None:
+    """This route is UTF-8 only: UTF-8 appended to a UTF-16 file would garble it."""
+    fs = _fs(dirs)
+    target = dirs["rw"] / "wide.log"
+    original = "first line\r\n".encode("utf-16")
+    target.write_bytes(original)
+    with pytest.raises(FsError) as refused:
+        fs.write_file(str(target), "second\n", mode="append")
+    assert refused.value.code == "binary"
+    assert target.read_bytes() == original
+
+
 def test_write_file_creates_with_umask_and_appends(dirs: dict[str, Path]) -> None:
     fs = _fs(dirs)
     target = dirs["rw"] / "new.txt"
