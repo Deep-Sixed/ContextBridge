@@ -92,6 +92,19 @@ def test_read_only_policy_exposes_only_read_tools(workspace, audit):
     assert run(server, listed) == readable | {"list_devices"}
 
 
+def test_empty_device_runs_on_the_device_it_was_authorized_and_audited_for(policy, audit, audit_path):
+    # The middleware treats an empty device as "local" when it authorizes and audits the call;
+    # the call has to be routed to that same device, not to a remote device named "".
+    server = create_computer_server(policy, audit=audit, authorize=allow_scopes(*ALL_SCOPES))
+
+    async def read(client):
+        return (await client.call_tool("read_file", {"path": "docs/notes.md", "device": ""})).structured_content
+
+    assert run(server, read)["content"] == "alpha\nbeta\ngamma\n"
+    assert by_request(audit_path) == [["requested", "started", "completed"]]
+    assert {e["device"] for e in events(audit_path)} == {"local"}
+
+
 def test_full_policy_surface(make_policy, audit):
     policy = make_policy(processes={"allow_kill": True})
     expected = (
