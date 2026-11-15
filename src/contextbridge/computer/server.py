@@ -855,7 +855,8 @@ def create_computer_server(
         device: str = LOCAL_DEVICE,
     ) -> dict[str, Any]:
         """Start a long-running or interactive command in the background and return its session_id
-        with the first output. stdout and stderr are combined."""
+        with the first output. stdout and stderr are combined. Returns as soon as the program waits
+        at a prompt (waiting_for_input, detected_prompt) or its output goes quiet, within wait_seconds."""
         args = {"command": command, "cwd": cwd, "timeout_seconds": timeout_seconds, "wait_seconds": wait_seconds}
         return await run(device, "start_process", args)
 
@@ -863,7 +864,8 @@ def create_computer_server(
     async def read_process_output(
         session_id: str, wait_seconds: float = 0.0, device: str = LOCAL_DEVICE
     ) -> dict[str, Any]:
-        """Return output a session produced since the last read, waiting up to wait_seconds for more."""
+        """Return output a session produced since the last read, waiting up to wait_seconds for more.
+        waiting_for_input says whether the program now waits at a prompt."""
         return await run(device, "read_process_output", {"session_id": session_id, "wait_seconds": wait_seconds})
 
     @server.tool(annotations=_EXECUTE)
@@ -874,7 +876,8 @@ def create_computer_server(
         wait_seconds: float = 1.0,
         device: str = LOCAL_DEVICE,
     ) -> dict[str, Any]:
-        """Send input to a running session's stdin and return the output that follows."""
+        """Send input to a running session's stdin and return the output that follows. Returns as soon
+        as the program waits at its next prompt or its output goes quiet, within wait_seconds."""
         args = {
             "session_id": session_id,
             "input": input,
