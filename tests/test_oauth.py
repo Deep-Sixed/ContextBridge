@@ -594,6 +594,28 @@ def test_a_stranger_cannot_lock_the_owner_out_behind_a_proxy(remote_behind_proxy
     assert theirs.status_code == 429  # the address that failed stays locked, even with the right credentials
 
 
+def test_forged_entries_in_a_forwarded_list_do_not_dodge_the_lockout(remote_behind_proxy):
+    # A proxy that appends to a list (X-Forwarded-For style) leaves what the client sent in front.
+    # Only the last entry is the proxy's own, so inventing earlier ones must not reset the count.
+    remote = remote_behind_proxy
+
+    async def scenario():
+        async with await remote.client() as http:
+            client_id = (await register(http)).json()["client_id"]
+            _, page = await start_authorization(http, client_id)
+            return [
+                (
+                    await approve(
+                        http, page, remote.store, passphrase="guess " * 3, code="123456",
+                        headers={"CF-Connecting-IP": f"198.51.100.{n}, 203.0.113.9"},
+                    )
+                ).status_code
+                for n in range(6)
+            ]
+
+    assert anyio.run(scenario) == [401, 401, 401, 401, 429, 429]
+
+
 def test_client_address_header_is_ignored_unless_configured(remote):
     # Without remote.client_ip_header anyone could dodge the lockout by inventing addresses.
     async def scenario():

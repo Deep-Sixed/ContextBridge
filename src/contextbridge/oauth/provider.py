@@ -152,8 +152,10 @@ class ContextBridgeOAuthProvider(OAuthProvider):
         value = request.headers.get(self.settings.client_ip_header)
         if not value:
             return None
+        # In a forwarded list only the last entry was added by the proxy; earlier ones are whatever
+        # the client sent, and trusting them would let it dodge the lockout by inventing addresses.
         try:
-            return str(ipaddress.ip_address(value.split(",")[0].strip()))
+            return str(ipaddress.ip_address(value.split(",")[-1].strip()))
         except ValueError:
             return None
 
