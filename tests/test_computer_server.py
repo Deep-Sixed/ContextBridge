@@ -11,6 +11,7 @@ import pytest
 import yaml
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
+from helpers import assert_no_injection_text
 
 from contextbridge.computer.audit import AuditError, ComputerAuditLog
 from contextbridge.computer.policy import PolicyError, load_policy
@@ -123,6 +124,19 @@ def test_full_policy_surface(make_policy, audit):
         return {t.name for t in await client.list_tools()}
 
     assert run(server, listed) == expected | {"list_devices"}
+
+
+def test_every_tool_has_a_plain_description(make_policy, audit):
+    policy = make_policy(processes={"allow_kill": True})
+
+    async def described(client):
+        return {t.name: t.description or "" for t in await client.list_tools()}
+
+    descriptions = run(create_computer_server(policy, audit=audit, authorize=allow_scopes(*ALL_SCOPES)), described)
+    assert descriptions
+    for name, text in descriptions.items():
+        assert len(text) >= 40, f"{name} has no useful description"
+        assert_no_injection_text(f"{name} description", text)
 
 
 def test_tool_annotations(policy, audit):

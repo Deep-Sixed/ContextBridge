@@ -631,33 +631,45 @@ def create_computer_server(
 
     @server.tool(annotations=_READ_ONLY)
     async def list_devices() -> dict[str, Any]:
-        """List the computers this gateway can reach, whether each is online, and what it allows."""
+        """List the computers this gateway can reach: each device's name, whether it is online, and
+        its policy (readable and writable roots, command mode, limits). Call it before using a
+        device other than 'local', or to see what a device allows before a call it might refuse."""
         mark_started()
         return {"devices": router.describe(devices())}
 
     @server.tool(annotations=_READ_ONLY)
     async def list_directory(path: str, depth: int = 1, device: str = LOCAL_DEVICE) -> dict[str, Any]:
-        """List a directory's entries (type, size, modified time). depth 1-5 recurses into subdirectories."""
+        """List a directory's entries with their type, size, and modified time. depth (1-5, default
+        1) also lists the contents of subdirectories. A relative path starts at the device's first
+        readable root. Entries the policy hides, such as .env files and .ssh folders, are left out.
+        truncated means the entry limit was reached; list a subdirectory to see the rest."""
         return await run(device, "list_directory", {"path": path, "depth": depth})
 
     @server.tool(annotations=_READ_ONLY)
     async def read_file(
         path: str, offset: int = 0, length: int | None = None, device: str = LOCAL_DEVICE
     ) -> dict[str, Any]:
-        """Read a text file. offset is the 0-based first line; a negative offset reads the last N lines.
-        length limits the number of lines returned. Large files are truncated at the read limit."""
+        """Read a text file by lines. offset is the 0-based first line; a negative offset reads the
+        last lines (offset=-50 reads the last 50). length caps the lines returned. The result gives
+        start_line, lines_returned, and total_lines; when truncated is true the read hit its size
+        limit, so read on from start_line + lines_returned. For PDF, Word, and Excel files use
+        read_document."""
         return await run(device, "read_file", {"path": path, "offset": offset, "length": length})
 
     @server.tool(annotations=_READ_ONLY)
     async def get_file_info(path: str, device: str = LOCAL_DEVICE) -> dict[str, Any]:
-        """Show size, timestamps, permissions, line count, and whether the policy allows writing."""
+        """Show a file's or directory's size, timestamps, permissions, and line count, and whether
+        the policy allows writing to it. Use it to size up a large file before reading it."""
         return await run(device, "get_file_info", {"path": path})
 
     @server.tool(annotations=_READ_ONLY)
     async def search_files(
         path: str, pattern: str, max_results: int | None = None, device: str = LOCAL_DEVICE
     ) -> dict[str, Any]:
-        """Find files and directories under path whose name matches a glob (*.py) or contains a substring."""
+        """Find files and directories under path by name: a glob such as *.py, or else a case-
+        insensitive substring. To search inside files use search_code. The search stops at
+        max_results or its time limit; truncated or timed_out then says the list is incomplete, so
+        narrow path or pattern."""
         return await run(device, "search_files", {"path": path, "pattern": pattern, "max_results": max_results})
 
     @server.tool(annotations=_READ_ONLY)
@@ -671,8 +683,11 @@ def create_computer_server(
         max_results: int | None = None,
         device: str = LOCAL_DEVICE,
     ) -> dict[str, Any]:
-        """Search text file contents under path. Literal match unless regex is true.
-        file_pattern filters file names by glob (e.g. *.py). context_lines adds up to 5 surrounding lines."""
+        """Search the contents of text files under path. pattern is literal text unless regex is
+        true, and case-insensitive unless case_sensitive is true. file_pattern limits which files
+        are searched by name (*.py). context_lines (up to 5) adds the lines around each match.
+        Binary and oversized files are skipped. truncated or timed_out means more matches may exist:
+        narrow path or file_pattern."""
         args = {
             "path": path,
             "pattern": pattern,
@@ -686,7 +701,8 @@ def create_computer_server(
 
     @server.tool(annotations=_READ_ONLY)
     async def get_system_info(device: str = LOCAL_DEVICE) -> dict[str, Any]:
-        """Describe a computer (OS, CPU, memory, disks) and the access policy in force."""
+        """Describe a computer (OS, CPU, memory, disks) and the access policy in force there: its
+        roots, command mode, and limits."""
         return await run(device, "get_system_info", {})
 
     @server.tool(annotations=_READ_ONLY)
@@ -703,17 +719,21 @@ def create_computer_server(
 
     @server.tool(annotations=_WRITE)
     async def write_file(path: str, content: str, mode: str = "rewrite", device: str = LOCAL_DEVICE) -> dict[str, Any]:
-        """Write a text file. mode 'rewrite' replaces it atomically; 'append' adds to the end.
-        The parent directory must already exist."""
+        """Create or replace a text file (mode 'rewrite', atomic, keeping the file's permissions) or
+        add to its end (mode 'append'). The parent directory must already exist; create it with
+        create_directory. Each call is limited in size: write a large file as a first part and then
+        appends. To change part of an existing file, edit_block is safer than rewriting it."""
         return await run(device, "write_file", {"path": path, "content": content, "mode": mode})
 
     @server.tool(annotations=_WRITE)
     async def edit_block(
         path: str, old_string: str, new_string: str, expected_replacements: int = 1, device: str = LOCAL_DEVICE
     ) -> dict[str, Any]:
-        """Replace exact text in a file. Fails unless old_string occurs exactly expected_replacements times,
-        so include enough surrounding context to make the match unique. When old_string is not found,
-        the error shows the closest text in the file and how it differs."""
+        """Replace exact text in a file: the preferred way to change part of a file. old_string must
+        match the file exactly, whitespace and line endings included, so read the lines first. The
+        call fails unless old_string occurs exactly expected_replacements times (default 1); add
+        surrounding lines to make one match unique. When old_string is not found, the error shows
+        the closest text in the file and how it differs. The file's encoding is kept."""
         args = {
             "path": path,
             "old_string": old_string,
@@ -842,9 +862,12 @@ def create_computer_server(
     async def run_command(
         command: str, cwd: str | None = None, timeout_seconds: float | None = None, device: str = LOCAL_DEVICE
     ) -> dict[str, Any]:
-        """Run a command to completion and return exit code, stdout, and stderr.
-        Killed with its child processes if it exceeds timeout_seconds. Use start_process for
-        long-running or interactive programs."""
+        """Run a command to completion and return its exit code, stdout, and stderr. Use it for
+        commands that finish on their own; use start_process for servers, watchers, and interactive
+        programs, because run_command gives the command no input. It is killed with its child
+        processes after timeout_seconds (the device's default if omitted). In allowlist mode only
+        listed programs run, without a shell, so pipes, redirects, ; and && are refused. Credentials
+        are removed from its environment. Long output keeps its start and end."""
         return await run(device, "run_command", {"command": command, "cwd": cwd, "timeout_seconds": timeout_seconds})
 
     @server.tool(annotations=_EXECUTE)
@@ -855,9 +878,12 @@ def create_computer_server(
         wait_seconds: float = 1.0,
         device: str = LOCAL_DEVICE,
     ) -> dict[str, Any]:
-        """Start a long-running or interactive command in the background and return its session_id
-        with its first output. stdout and stderr are combined. Returns once the program waits for
-        input (waiting_for_input, prompt) or its output pauses, within wait_seconds."""
+        """Start a long-running or interactive program (a server, a REPL, a watcher) in the
+        background and return its session_id with its first output; stdout and stderr are combined.
+        Returns once the program waits for input (waiting_for_input, prompt) or its output pauses,
+        within wait_seconds. Then use interact_with_process to send input, read_process_output for
+        more output, and force_terminate when done. Running sessions per device are limited, and
+        each ends at its lifetime limit."""
         args = {"command": command, "cwd": cwd, "timeout_seconds": timeout_seconds, "wait_seconds": wait_seconds}
         return await run(device, "start_process", args)
 
@@ -865,8 +891,9 @@ def create_computer_server(
     async def read_process_output(
         session_id: str, wait_seconds: float = 0.0, device: str = LOCAL_DEVICE
     ) -> dict[str, Any]:
-        """Return output a session produced since the last read, waiting up to wait_seconds for more.
-        waiting_for_input tells whether the program is now waiting for input."""
+        """Return the output a session produced since the last read, waiting up to wait_seconds for
+        some. running and exit_code show whether the program has ended; waiting_for_input shows
+        whether it is waiting for input now."""
         return await run(device, "read_process_output", {"session_id": session_id, "wait_seconds": wait_seconds})
 
     @server.tool(annotations=_EXECUTE)
@@ -877,8 +904,9 @@ def create_computer_server(
         wait_seconds: float = 1.0,
         device: str = LOCAL_DEVICE,
     ) -> dict[str, Any]:
-        """Send input to a running session's stdin and return the output that follows. Returns once
-        the program waits for input again or its output pauses, within wait_seconds."""
+        """Send input to a running session's stdin and return the output that follows; a newline is
+        added unless append_newline is false. Returns once the program waits for input again or its
+        output pauses, within wait_seconds. If the answer is still coming, call read_process_output."""
         args = {
             "session_id": session_id,
             "input": input,
@@ -889,12 +917,13 @@ def create_computer_server(
 
     @server.tool(annotations=_WRITE)
     async def force_terminate(session_id: str, device: str = LOCAL_DEVICE) -> dict[str, Any]:
-        """Kill a session and its child processes, returning any remaining output."""
+        """End a session's program and its child processes, returning any output not read yet."""
         return await run(device, "force_terminate", {"session_id": session_id})
 
     @server.tool(annotations=_READ_ONLY)
     async def list_sessions(device: str = LOCAL_DEVICE) -> dict[str, Any]:
-        """List sessions started through ContextBridge on a device, with their status."""
+        """List the sessions started through ContextBridge on a device, with whether each is running
+        or waiting for input."""
         return await run(device, "list_sessions", {})
 
     # ------------------------------------------------------- process tools
@@ -903,12 +932,15 @@ def create_computer_server(
     async def list_processes(
         name_filter: str | None = None, limit: int = 200, device: str = LOCAL_DEVICE
     ) -> dict[str, Any]:
-        """List running processes, optionally filtered by a substring of the name or command line."""
+        """List running processes with PID, parent, name, user, memory, and command line, optionally
+        filtered by a substring of the name or command line. Use it to find a PID for kill_process."""
         return await run(device, "list_processes", {"name_filter": name_filter, "limit": limit})
 
     @server.tool(annotations=_WRITE)
     async def kill_process(pid: int, force: bool = False, device: str = LOCAL_DEVICE) -> dict[str, Any]:
-        """Terminate a process by PID (force sends SIGKILL / TerminateProcess)."""
+        """Terminate a process by PID: force=false asks it to exit, force=true kills it (SIGKILL, or
+        TerminateProcess on Windows). For a program started with start_process, use force_terminate
+        instead. System processes and the gateway itself are protected."""
         return await run(device, "kill_process", {"pid": pid, "force": force})
 
     server.add_middleware(ComputerPolicyMiddleware(router, audit, authorize, devices, listener))
