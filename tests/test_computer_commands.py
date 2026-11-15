@@ -123,6 +123,11 @@ def test_list_processes_includes_self():
     assert any(row["pid"] == os.getpid() for row in result["processes"])
 
 
+def test_kill_process_rejects_negative_pids():
+    with pytest.raises(commands.PolicyViolation, match="non-negative"):
+        commands.kill_process(-1)
+
+
 def test_kill_process_refuses_protected_pids():
     for pid in (1, os.getpid(), os.getppid()):
         with pytest.raises(PolicyViolation, match="protected"):
