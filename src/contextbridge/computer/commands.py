@@ -413,6 +413,8 @@ def list_processes(*, name_filter: str | None = None, limit: int = 200) -> dict[
 
 
 def kill_process(pid: int, *, force: bool = False) -> dict[str, Any]:
+    if pid < 0:  # never a process: on POSIX a negative pid names a process group
+        raise CommandError(f"No such process: {pid}")
     protected = {0, 1, 4, os.getpid(), os.getppid()}
     if pid in protected:
         raise PolicyViolation(f"Process {pid} is protected and cannot be signalled.")
