@@ -439,6 +439,7 @@ class ComputerPolicyMiddleware(Middleware):
         device = arguments.get("device") if isinstance(arguments.get("device"), str) else None
         if name != LIST_DEVICES_TOOL:
             device = device or LOCAL_DEVICE
+            arguments["device"] = device
         fields = summarize_args(arguments)
         fields.pop("device", None)
         try:
