@@ -57,6 +57,8 @@ remote:
   # add 127.0.0.1 and "::1" to let desktop MCP clients (local agents) sign in; see README "Local agents and desktop apps"
   access_token_minutes: 60
   refresh_token_days: 30   # a client unused this long must be approved again
+  # client_ip_header: CF-Connecting-IP   # the real client address the tunnel passes on: failed approvals
+  #                                      # then lock out that address only, not everyone (you included)
 
 # The sections below configure the "local" device: this machine.
 # Remove filesystem/commands/processes entirely to run a gateway with no local device.
