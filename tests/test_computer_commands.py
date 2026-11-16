@@ -343,5 +343,47 @@ def test_session_lifetime_kills_grandchildren(policy):
     assert _wait_gone(grandchild), "the grandchild survived the session lifetime"
 
 
+_LEAVE_GRANDCHILD = (
+    "import subprocess, sys; "
+    "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)']); "
+    "print(p.pid, flush=True)"
+)
+
+
+def test_a_finished_command_leaves_no_background_program(policy):
+    """A program started in the background ends with the command, and can't hold up its result."""
+    started = time.monotonic()
+    result = commands.run_command(policy, python_cmd(_LEAVE_GRANDCHILD), timeout_seconds=30)
+    elapsed = time.monotonic() - started
+    grandchild = int(result["stdout"].split()[0])
+    try:
+        assert result["exit_code"] == 0 and result["timed_out"] is False
+        # Its open output pipe used to make run_command wait out the 5 s drain timeout.
+        assert elapsed < 4, f"run_command took {elapsed:.1f} s"
+        assert _wait_gone(grandchild), "the background program outlived the command"
+    finally:
+        try:
+            psutil.Process(grandchild).kill()
+        except psutil.NoSuchProcess:
+            pass
+
+
+def test_a_finished_session_leaves_no_background_program(policy):
+    sessions = SessionManager(policy)
+    started = sessions.start(python_cmd(_LEAVE_GRANDCHILD), wait_seconds=10)
+    output = started["output"] or sessions.read(started["session_id"], wait_seconds=10)["output"]
+    grandchild = int(output.split()[0])
+    try:
+        deadline = time.monotonic() + 10
+        while sessions.read(started["session_id"])["running"] and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert _wait_gone(grandchild), "the background program outlived the session"
+    finally:
+        try:
+            psutil.Process(grandchild).kill()
+        except psutil.NoSuchProcess:
+            pass
+
+
 def test_allowlist_names_this_interpreter(policy):
     assert PY in policy.command_allow

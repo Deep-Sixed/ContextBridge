@@ -251,12 +251,6 @@ def test_force_terminate_ends_the_programs_children(policy, workspace):
         _kill(child)
 
 
-@pytest.mark.xfail(
-    not IS_WINDOWS,
-    strict=True,
-    reason="Finding F-2: on POSIX a finished command's background children keep running, "
-    "and run_command waits its 5 s drain timeout for the pipe they hold.",
-)
 def test_a_finished_command_leaves_nothing_running(policy, workspace):
     """CWE-404. A command that starts a background program and exits leaves an orphan that
     holds the output pipe: servers either hang on the pipe or return and leak the process.
