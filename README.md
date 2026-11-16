@@ -215,7 +215,7 @@ How it works:
 - Servers get the same credential-stripped environment as commands. They run with the agent's own account and privileges, so a server is as powerful as what it can do there: grant `computer:execute` (or the scope you chose) only to devices and clients that should drive it.
 - Text, images, and structured results are passed through, up to 12 MB per result.
 
-Desktop servers need a desktop: on Windows run the agent with the at-logon task (`install-agent.ps1`), not a boot-time task with no interactive session. Clients see new tools when they next list tools; this phase does not yet push change notifications, MCP resources, or prompts.
+Desktop servers need a desktop: on Windows run the agent with the at-logon task (`install-agent.ps1`), not a boot-time task with no interactive session. When the tools on offer change (a device connects or disconnects, or one of its MCP servers starts or stops offering tools), the gateway sends `notifications/tools/list_changed` to every client that has listed tools, and each lists again to see what it may use. Over HTTP a client receives it only while it keeps its event stream (GET) open; one that does not sees the change when it next lists tools. MCP resources and prompts are not federated.
 
 ### Audit trail
 
