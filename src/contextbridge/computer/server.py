@@ -713,7 +713,8 @@ def create_computer_server(
         """Read a text file by lines. offset is the 0-based first line; a negative offset reads the
         last lines (offset=-50 reads the last 50). length caps the lines returned. The result gives
         start_line, lines_returned, and total_lines; when truncated is true the read hit its size
-        limit, so read on from start_line + lines_returned. For PDF, Word, and Excel files use
+        limit, so read on from start_line + lines_returned. A line longer than the limit cannot be read:
+        note then names it and the offset to continue from. For PDF, Word, and Excel files use
         read_document."""
         return await run(device, "read_file", {"path": path, "offset": offset, "length": length})
 
@@ -1337,6 +1338,13 @@ def main(argv: list[str] | None = None) -> None:
             max_failed_attempts=listener.max_failed_attempts,
             failure_window_seconds=listener.failure_window_seconds,
         )
+        if listener.public_url and is_loopback(listener.host) and not listener.client_ip_header:
+            print(
+                "[computer] agents.public_url is set without agents.client_ip_header: every agent arrives "
+                "from the tunnel's address, so failed enrollments and sign-ins are not rate limited.",
+                file=sys.stderr,
+                flush=True,
+            )
         if listener.admission == ADMISSION_DEVICE_KEY and not is_loopback(listener.host):
             print(
                 f"[computer] agents listener on {listener.host} admits any network (admission: device-key); "

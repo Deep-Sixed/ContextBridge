@@ -315,13 +315,36 @@ class AgentHub:
             request = getattr(ws, "request", None)
             value = request.headers.get(self.client_ip_header) if request is not None else None
             if isinstance(value, str):
+                # In a forwarded list only the last entry was added by the proxy; earlier ones are
+                # whatever the client sent, and trusting them would let it dodge the limit by
+                # inventing addresses.
                 with contextlib.suppress(ValueError):
-                    return str(ipaddress.ip_address(value.split(",")[0].strip()))
+                    return str(ipaddress.ip_address(value.split(",")[-1].strip()))
         return peer
+
+    @staticmethod
+    def _limit_key(client: str | None) -> str | None:
+        """The limiter's key for ``client``, or None when its address cannot tell clients apart.
+
+        A loopback address is the tunnel or proxy on this host, shared by every agent behind it
+        (no ``client_ip_header``, or a request without a usable one). Counting failures against
+        it would let one stranger lock every agent out, so such connections are not limited.
+        """
+        if client is None:
+            return "unknown"
+        with contextlib.suppress(ValueError):
+            if ipaddress.ip_address(client).is_loopback:
+                return None
+        return client
+
+    def _blocked(self, client: str | None) -> bool:
+        key = self._limit_key(client)
+        return key is not None and self.limiter.blocked(key)
 
     def _failed(self, client: str | None) -> None:
         """Count a failed handshake against ``client``; log once when it becomes rate limited."""
-        if self.limiter.record(client or "unknown"):
+        key = self._limit_key(client)
+        if key is not None and self.limiter.record(key):
             self._log(
                 "agent_rate_limited",
                 peer=client,
@@ -332,7 +355,7 @@ class AgentHub:
     async def _handle(self, ws: ServerConnection) -> None:
         peer = str(ws.remote_address[0]) if ws.remote_address else None
         client = self._client_address(ws)
-        if self.limiter.blocked(client or "unknown"):
+        if self._blocked(client):
             await self._refuse(ws, "rate_limited", "too many failed attempts; try again later")
             return
         if self.allowed_tailnet_node_ids is not None:
@@ -574,22 +597,38 @@ class AgentHub:
     # ------------------------------------------------------------- monitor
 
     async def _monitor(self) -> None:
+        problem: str | None = None
         while True:
             await asyncio.sleep(MONITOR_INTERVAL_SECONDS)
             try:
-                self.registry.refresh()
-            except RegistryError as exc:
-                print(f"[computer] device registry unreadable: {exc}", file=sys.stderr, flush=True)
-                continue
-            now = time.monotonic()
-            for conn in list(self._connections.values()):
-                record = self.registry.get(conn.device.device_id)
-                if record is None or not record.active:
-                    self._log("device_revoked", device=conn.device.name, device_id=conn.device.device_id)
-                    self._disconnect(conn, "revoked", "device has been revoked")
-                elif now - conn.last_seen > self.heartbeat_seconds * 3:
-                    self._log("device_heartbeat_lost", device=conn.device.name, device_id=conn.device.device_id)
-                    self._disconnect(conn, "heartbeat", "no heartbeat received")
+                self._check_connections()
+            except Exception as exc:  # noqa: BLE001 -- the monitor must outlive any one bad pass
+                if str(exc) != problem:  # once per problem, not twice a second
+                    problem = str(exc)
+                    print(f"[computer] device monitor: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+            else:
+                problem = None
+
+    def _check_connections(self) -> None:
+        """Drop connections whose device was revoked or stopped sending heartbeats."""
+        try:
+            self.registry.refresh()
+            readable = True
+        except (RegistryError, OSError) as exc:
+            # Revocations cannot be seen right now; lost heartbeats still can.
+            readable = False
+            unreadable = exc
+        now = time.monotonic()
+        for conn in list(self._connections.values()):
+            record = self.registry.get(conn.device.device_id) if readable else conn.device
+            if record is None or not record.active:
+                self._log("device_revoked", device=conn.device.name, device_id=conn.device.device_id)
+                self._disconnect(conn, "revoked", "device has been revoked")
+            elif now - conn.last_seen > self.heartbeat_seconds * 3:
+                self._log("device_heartbeat_lost", device=conn.device.name, device_id=conn.device.device_id)
+                self._disconnect(conn, "heartbeat", "no heartbeat received")
+        if not readable:
+            raise RegistryError(f"device registry unreadable: {unreadable}")
 
     def _log(self, event: str, **fields: Any) -> None:
         try:

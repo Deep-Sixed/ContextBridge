@@ -89,7 +89,7 @@ remote:
 
 Do not set `agents.tls_cert`/`tls_key`: on loopback without them the listener speaks plain WebSocket to `cloudflared`, and Cloudflare provides the public TLS.
 
-`client_ip_header` matters: every connection reaches the gateway from `cloudflared` on `127.0.0.1`, so without it the failed-attempt limit would treat all agents as one client, and one attacker could lock everyone out for the window. Cloudflare sets `CF-Connecting-IP` itself, and the header is trusted only because the listener is reachable from this host alone.
+`client_ip_header` matters: every connection reaches the gateway from `cloudflared` on `127.0.0.1`, and a loopback address is never rate limited (one attacker could otherwise lock every agent out), so without it failed attempts are not limited at all. Cloudflare sets `CF-Connecting-IP` itself, and the header is trusted only because the listener is reachable from this host alone.
 
 Create the static token for the local listener (only reachable from the VPS itself):
 

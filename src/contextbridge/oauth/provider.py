@@ -61,6 +61,7 @@ from .store import OAuthStateError, OAuthStore, new_token
 CODE_SECONDS = 300
 PENDING_SECONDS = 600
 MAX_PENDING = 100
+MAX_PENDING_PER_CLIENT = 3
 SCOPE_DESCRIPTIONS = {
     SCOPE_READ: "Read files and documents, search, see system info, processes, and devices",
     SCOPE_DESKTOP_OBSERVE: "Observe window titles and IDs on authorized desktops",
@@ -204,8 +205,7 @@ class ContextBridgeOAuthProvider(OAuthProvider):
             raise AuthorizeError("invalid_request", "this server only issues tokens for its own MCP endpoint")
         now = time.time()
         self._pending = {k: v for k, v in self._pending.items() if v.expires_at > now}
-        while len(self._pending) >= MAX_PENDING:
-            self._pending.pop(next(iter(self._pending)))
+        self._make_room(client.client_id or "")
         request_id = secrets.token_urlsafe(24)
         redirect = urlsplit(str(params.redirect_uri))
         self._pending[request_id] = _Pending(
@@ -220,6 +220,23 @@ class ContextBridgeOAuthProvider(OAuthProvider):
         )
         self._log("oauth_authorization_requested", client=client.client_id, scopes=params.scopes)
         return f"{self.settings.public_url.rstrip('/')}/consent?request={request_id}"
+
+    def _make_room(self, client_id: str) -> None:
+        """Keep the pending requests bounded without letting one client push out everyone else's.
+
+        A client keeps only its newest few requests, and when the table is full the client holding
+        the most gives up its oldest. Dicts keep insertion order, so the first match is the oldest.
+        """
+        def oldest_of(owner: str) -> str:
+            return next(k for k, v in self._pending.items() if v.client_id == owner)
+
+        while sum(1 for v in self._pending.values() if v.client_id == client_id) >= MAX_PENDING_PER_CLIENT:
+            del self._pending[oldest_of(client_id)]
+        while len(self._pending) >= MAX_PENDING:
+            counts: dict[str, int] = {}
+            for pending in self._pending.values():
+                counts[pending.client_id] = counts.get(pending.client_id, 0) + 1
+            del self._pending[oldest_of(max(counts, key=counts.__getitem__))]
 
     def get_routes(self, mcp_path: str | None = None) -> list[Route]:
         routes = super().get_routes(mcp_path)
@@ -436,7 +453,7 @@ Only approve a request you started yourself.</p>
         return AccessToken(
             token=token,
             client_id=grant["client_id"],
-            scopes=grant["scopes"],
+            scopes=self.store.access_scopes(grant, token),
             expires_at=int(expires_at),
             resource=grant.get("resource"),
             claims={"devices": grant["devices"], "grant": grant_id},

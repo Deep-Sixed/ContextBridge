@@ -521,7 +521,7 @@ No route depends on Authentik.
 - **Agent listener:** accepts only enrolled devices, and `agents.admission` decides who may even try:
   - **`tailnet`** (the default off loopback): a private address, TLS only, and only the Tailscale nodes listed in `agents.tailnet_node_ids`.
   - **`device-key`** (always on loopback): any network. One-time pairing codes and enrolled Ed25519 keys are the only protection. On loopback a tunnel such as Cloudflare's publishes it and provides TLS (see [docs/vps-gateway.md](docs/vps-gateway.md)); off loopback it may bind a public address, still TLS only.
-  - **Either way**, a client address that fails `max_failed_attempts` enrollments or sign-ins (default 10) within `failure_window_seconds` (default 600) is refused until the oldest failure ages out, and the audit log records `agent_rate_limited`. Behind a tunnel, set `agents.client_ip_header` (for Cloudflare, `CF-Connecting-IP`) so the limit applies per real client rather than to everyone at once.
+  - **Either way**, a client address that fails `max_failed_attempts` enrollments or sign-ins (default 10) within `failure_window_seconds` (default 600) is refused until the oldest failure ages out, and the audit log records `agent_rate_limited`. Behind a tunnel, set `agents.client_ip_header` (for Cloudflare, `CF-Connecting-IP`) so the limit sees each real client: without it every agent arrives from the tunnel's loopback address, which is never limited, because one stranger's failures would otherwise lock every agent out. From a forwarded list (`X-Forwarded-For`) only the last entry, the one the proxy added, is used.
 
 Do not forward ports 8791, 8792, or 8794 to the internet. Publish 8793 only through a TLS tunnel, and only once `owner-init` is done.
 

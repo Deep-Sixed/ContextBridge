@@ -189,28 +189,65 @@ def test_failed_enrollments_are_rate_limited_per_client(tmp_path, monkeypatch):
     assert {e["peer"] for e in rejected} == {"203.0.113.9"}
 
 
-def test_failed_sign_ins_count_and_a_bad_header_falls_back_to_the_socket_address(tmp_path):
+def _sign_in_replies(tmp_path, headers_for, *, client_ip_header="CF-Connecting-IP"):
     registry = DeviceRegistry(tmp_path / "devices.json")
 
     async def scenario():
         hub = AgentHub(
             registry,
             ComputerAuditLog(tmp_path / "audit.jsonl", echo=False),
-            client_ip_header="CF-Connecting-IP",
+            client_ip_header=client_ip_header,
             max_failed_attempts=2,
         )
         port = await hub.start("127.0.0.1", 0)
         url = f"ws://127.0.0.1:{port}"
-        replies = []
+        hello = {"type": "hello", "version": PROTOCOL_VERSION, "device_id": "dev_unknown"}
         try:
-            hello = {"type": "hello", "version": PROTOCOL_VERSION, "device_id": "dev_unknown"}
-            for _ in range(3):
-                reply = await _exchange(url, hello, {"CF-Connecting-IP": "not-an-ip"})
-                replies.append(reply["code"])
+            return [(await _exchange(url, hello, headers_for(n)))["code"] for n in range(3)]
         finally:
             await hub.close()
-        return replies, hub.limiter.blocked("127.0.0.1")
 
-    replies, blocked = asyncio.run(scenario())
+    return asyncio.run(scenario())
+
+
+def test_failed_sign_ins_are_rate_limited_per_client(tmp_path):
+    replies = _sign_in_replies(tmp_path, lambda n: {"CF-Connecting-IP": "203.0.113.9"})
     assert replies == ["unknown_device", "unknown_device", "rate_limited"]
-    assert blocked
+
+
+def test_only_the_proxys_own_entry_of_a_forwarded_list_is_trusted(tmp_path):
+    """Earlier entries are whatever the client sent; inventing them must not dodge the limit."""
+    replies = _sign_in_replies(
+        tmp_path, lambda n: {"X-Forwarded-For": f"198.51.100.{n}, 203.0.113.9"}, client_ip_header="X-Forwarded-For"
+    )
+    assert replies == ["unknown_device", "unknown_device", "rate_limited"]
+
+
+@pytest.mark.parametrize("header", [None, "CF-Connecting-IP"], ids=["no header configured", "unusable header"])
+def test_the_shared_loopback_address_is_never_rate_limited(tmp_path, header):
+    """Behind a tunnel every agent is 127.0.0.1: one stranger's failures must not lock them all out."""
+    replies = _sign_in_replies(tmp_path, lambda n: {"CF-Connecting-IP": "not-an-ip"}, client_ip_header=header)
+    assert replies == ["unknown_device"] * 3
+
+
+def test_the_monitor_survives_a_pass_that_fails(tmp_path, monkeypatch):
+    """One unexpected error used to end the task, and with it heartbeat and revocation checks."""
+    monkeypatch.setattr(hub_module, "MONITOR_INTERVAL_SECONDS", 0.01)
+    passes = []
+
+    def check():
+        passes.append(1)
+        if len(passes) == 1:
+            raise TypeError("unexpected field in a device record")
+
+    async def scenario():
+        hub = AgentHub(DeviceRegistry(tmp_path / "devices.json"), ComputerAuditLog(tmp_path / "audit.jsonl", echo=False))
+        monkeypatch.setattr(hub, "_check_connections", check)
+        await hub.start("127.0.0.1", 0)
+        try:
+            await asyncio.sleep(0.2)
+        finally:
+            await hub.close()
+
+    asyncio.run(scenario())
+    assert len(passes) > 1

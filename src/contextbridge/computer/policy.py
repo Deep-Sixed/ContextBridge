@@ -12,7 +12,7 @@ import os
 import shlex
 import stat
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from .oscompat import (
@@ -494,6 +494,13 @@ def load_policy(
     allow = _str_list(cmds, "allow")
     if mode == "allowlist" and not allow:
         raise PolicyError("commands.allow must list at least one program in allowlist mode")
+    for entry in allow:
+        # A relative path would name whatever file sits there under the caller's working directory.
+        absolute = PureWindowsPath(entry).is_absolute() if windows else PurePosixPath(entry).is_absolute()
+        if has_path_part(entry, windows=windows) and not absolute:
+            raise PolicyError(
+                f"commands.allow: {entry!r} is a relative path; use a program name or an absolute path"
+            )
     shell_cfg = cmds.get("shell", "")
     if isinstance(shell_cfg, str):
         if shell_cfg and shell_cfg not in SHELL_PRESETS:

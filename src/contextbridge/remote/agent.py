@@ -503,7 +503,10 @@ class Agent:
             await self._reply(request_id, ok=False, kind="failed", message="agent audit log unavailable", started=False)
             return
         if not isinstance(tool, str) or not isinstance(args, dict):
-            self.audit.record("denied", request_id=request_id, tool=tool_name, client=client, reason="malformed call")
+            with contextlib.suppress(AuditError):  # nothing runs either way; the gateway still gets its answer
+                self.audit.record(
+                    "denied", request_id=request_id, tool=tool_name, client=client, reason="malformed call"
+                )
             await self._reply(request_id, ok=False, kind="denied", message="malformed call", started=False)
             return
 

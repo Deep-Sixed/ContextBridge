@@ -172,6 +172,8 @@ class OAuthStore:
         state["codes"] = {k: v for k, v in state["codes"].items() if v["expires_at"] > now}
         for grant in state["grants"].values():
             grant["access"] = {k: exp for k, exp in grant["access"].items() if exp > now}
+            if "access_scopes" in grant:
+                grant["access_scopes"] = {k: v for k, v in grant["access_scopes"].items() if k in grant["access"]}
         state["grants"] = {
             gid: g
             for gid, g in state["grants"].items()
@@ -343,6 +345,11 @@ class OAuthStore:
                 return grant_id, grant, expires
         return None
 
+    @staticmethod
+    def access_scopes(grant: dict[str, Any], token: str) -> list[str]:
+        """The scopes ``token`` carries: the grant's, or fewer if its refresh asked for fewer."""
+        return grant.get("access_scopes", {}).get(token_hash(token), grant["scopes"])
+
     def find_refresh(self, token: str) -> tuple[str, dict[str, Any], bool] | None:
         """Return (grant_id, grant, reused). ``reused`` means an already-rotated token was presented."""
         digest = token_hash(token)
@@ -359,7 +366,11 @@ class OAuthStore:
     def rotate(
         self, grant_id: str, old_refresh: str, *, scopes: list[str], access_seconds: int, refresh_seconds: int
     ) -> tuple[str, str]:
-        """Swap a refresh token for a new access + refresh pair; the old refresh token stops working."""
+        """Swap a refresh token for a new access + refresh pair; the old refresh token stops working.
+
+        ``scopes`` limits the new access token only. The grant keeps what the owner approved, so
+        a later refresh can ask for all of it again and tokens already issued are unchanged.
+        """
         access, refresh = new_token(), new_token()
         now = time.time()
         with self.update() as state:
@@ -372,7 +383,9 @@ class OAuthStore:
             grant["refresh_hash"] = token_hash(refresh)
             grant["refresh_expires_at"] = now + refresh_seconds
             grant["access"][token_hash(access)] = now + access_seconds
-            grant["scopes"] = scopes
+            narrowed = [s for s in grant["scopes"] if s in scopes]
+            if narrowed != grant["scopes"]:
+                grant.setdefault("access_scopes", {})[token_hash(access)] = narrowed
         return access, refresh
 
     def revoke_grant(self, grant_id: str) -> None:
