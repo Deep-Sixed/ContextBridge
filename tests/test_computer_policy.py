@@ -263,13 +263,39 @@ def test_allowlist_warns_about_programs_that_print_other_processes_environments(
         cfg = {"filesystem": {"roots": [str(workspace)]}, "commands": {"mode": mode, "allow": allow}}
         return load_policy(cfg, windows=windows).allowlist_warnings()
 
-    assert make_policy().allowlist_warnings() == []
+    assert not [w for w in make_policy().allowlist_warnings() if "environment" in w]
     for entry in ("ps", "/bin/ps"):
         found = warnings(["ls", entry], windows=False)
         assert len(found) == 1 and "'ps'" in found[0] and "environment" in found[0]
     assert warnings(["PS.EXE"], windows=False) == []  # POSIX program names are exact
     assert len(warnings(["PS.EXE"], windows=True)) == 1  # Windows names ignore case and .exe
     assert warnings(["ps"], windows=False, mode="unrestricted") == []
+
+
+@pytest.mark.parametrize(
+    ("allow", "windows", "flagged"),
+    [
+        (["ls", "bash", "python3", "/usr/bin/env", "git", "date"], False, {"bash": "runs other programs",
+                                                                           "python3": "runs other programs",
+                                                                           "env": "runs other programs",
+                                                                           "git": "runs other programs"}),
+        (["sudo", "doas", "whoami"], False, {"sudo": "another user", "doas": "another user"}),
+        (["mkfs.ext4", "dd", "crontab", "df"], False, {"mkfs.ext4": "changes the machine", "dd": "changes the machine",
+                                                       "crontab": "changes the machine"}),
+        (["PowerShell.exe", "RUNAS", "reg.exe", "schtasks", "ipconfig"], True, {"powershell": "runs other programs",
+                                                                                 "runas": "another user",
+                                                                                 "reg": "changes the machine",
+                                                                                 "schtasks": "changes the machine"}),
+    ],
+    ids=["programs that run others", "another user", "machine changes", "windows names"],
+)
+def test_allowlist_warns_about_programs_that_reach_past_it(workspace, allow, windows, flagged):
+    """Allowlist mode limits which programs start, not what they do: these reach past it."""
+    cfg = {"filesystem": {"roots": [str(workspace)]}, "commands": {"mode": "allowlist", "allow": allow}}
+    warnings = load_policy(cfg, windows=windows).allowlist_warnings()
+    assert len(warnings) == len(flagged), warnings
+    for name, reason in flagged.items():
+        assert any(f"'{name}'" in w and reason in w for w in warnings), (name, warnings)
 
 
 @pytest.mark.parametrize("name", ["computer.yaml", "agent.yaml", "agent.windows.yaml"])

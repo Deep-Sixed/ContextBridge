@@ -96,6 +96,31 @@ DEFAULT_ENV_STRIP: tuple[str, ...] = (
 # has its own, so allowlisting one of these hands them out.
 ENVIRONMENT_READERS: frozenset[str] = frozenset({"ps"})
 
+# Allowlist mode limits which programs start, not what they do. Allowlisting one of these
+# reaches past that, so the servers warn at startup. Names compare as program_name() gives
+# them (on Windows without case or .exe).
+PROGRAM_RUNNERS: frozenset[str] = frozenset({
+    # shells
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh", "cmd", "powershell", "pwsh",
+    # interpreters, each of which runs any code given to it (named here only to warn about;
+    # ContextBridge itself never starts them)
+    *"python python3 py node deno bun perl ruby php lua osascript".split(),
+    # programs that start a program named in their arguments or settings
+    "env", "xargs", "nohup", "timeout", "nice", "watch", "find", "awk", "gawk", "git", "make", "ssh",
+})
+OTHER_USER_RUNNERS: frozenset[str] = frozenset({"sudo", "su", "doas", "pkexec", "runas", "gsudo"})
+MACHINE_CHANGERS: frozenset[str] = frozenset({
+    # disks and filesystems
+    "dd", "fdisk", "sfdisk", "parted", "wipefs", "mount", "umount", "diskpart", "format",
+    # power and services
+    "shutdown", "reboot", "halt", "poweroff", "systemctl", "sc",
+    # users and passwords
+    "useradd", "userdel", "usermod", "passwd", "chpasswd", "net",
+    # firewall, boot, registry, kernel modules and scheduled tasks
+    "iptables", "nft", "ufw", "netsh", "bcdedit", "reg", "modprobe", "insmod", "crontab", "schtasks",
+})
+_MACHINE_CHANGER_PREFIXES = ("mkfs",)  # mkfs, mkfs.ext4, mkfs.vfat, ...
+
 # Route credentials are never passed to child processes, whatever env_strip says.
 # MCP_AUTH_TOKEN belonged to the retired knowledge route; a host that still sets it
 # keeps it out of commands too.
@@ -339,15 +364,24 @@ class ComputerPolicy:
         return [executable, *argv[1:]]
 
     def allowlist_warnings(self) -> list[str]:
-        """Allowlisted programs that defeat the credential stripping, worth telling the operator about."""
+        """Allowlisted programs that reach past what allowlist mode limits, worth telling the operator about."""
         if self.command_mode != "allowlist":
             return []
         names = {program_name(os.path.basename(p.replace("\\", "/")), windows=self.windows) for p in self.command_allow}
-        return [
-            f"commands.allow includes '{name}', which can print the environment (tokens, API keys) of every "
-            "process this user runs; remove it unless you accept that."
-            for name in sorted(names & ENVIRONMENT_READERS)
-        ]
+        warnings = []
+        for name in sorted(names):
+            if name in ENVIRONMENT_READERS:
+                why = "can print the environment (tokens, API keys) of every process this user runs"
+            elif name in PROGRAM_RUNNERS:
+                why = "runs other programs, so the allowlist no longer limits what runs"
+            elif name in OTHER_USER_RUNNERS:
+                why = "runs programs as another user, such as an administrator"
+            elif name in MACHINE_CHANGERS or name.startswith(_MACHINE_CHANGER_PREFIXES):
+                why = "changes the machine itself (disks, power, services, users, firewall, boot or scheduled tasks)"
+            else:
+                continue
+            warnings.append(f"commands.allow includes '{name}', which {why}; remove it unless you accept that.")
+        return warnings
 
     def child_env(self) -> dict[str, str]:
         """Environment for child processes with credentials removed."""
