@@ -1337,6 +1337,13 @@ def main(argv: list[str] | None = None) -> None:
             max_failed_attempts=listener.max_failed_attempts,
             failure_window_seconds=listener.failure_window_seconds,
         )
+        if listener.public_url and is_loopback(listener.host) and not listener.client_ip_header:
+            print(
+                "[computer] agents.public_url is set without agents.client_ip_header: every agent arrives "
+                "from the tunnel's address, so failed enrollments and sign-ins are not rate limited.",
+                file=sys.stderr,
+                flush=True,
+            )
         if listener.admission == ADMISSION_DEVICE_KEY and not is_loopback(listener.host):
             print(
                 f"[computer] agents listener on {listener.host} admits any network (admission: device-key); "

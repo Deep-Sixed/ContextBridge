@@ -303,3 +303,21 @@ def test_example_configs_allow_nothing_that_prints_environments(name):
     cfg = yaml.safe_load((REPO / "configs" / name).read_text(encoding="utf-8"))
     assert "ps" not in cfg["commands"]["allow"]
     assert load_policy(cfg).allowlist_warnings() == []
+
+
+@pytest.mark.parametrize(
+    ("entry", "windows"),
+    [("./run.sh", False), ("bin/tool", False), ("../tool", False), (r"tools\run.exe", True), (r"C:run.exe", True),
+     (r"\Tools\run.exe", True)],
+)
+def test_allowlist_refuses_relative_paths(workspace, entry, windows):
+    """A relative path would run whatever file sits there under the caller's working directory."""
+    cfg = {"filesystem": {"roots": [str(workspace)]}, "commands": {"mode": "allowlist", "allow": ["ls", entry]}}
+    with pytest.raises(PolicyError, match="relative path"):
+        load_policy(cfg, windows=windows)
+
+
+def test_allowlist_accepts_names_and_absolute_paths(workspace):
+    for allow, windows in ((["ls", "/usr/bin/env"], False), (["git", r"C:\Tools\tool.exe"], True)):
+        cfg = {"filesystem": {"roots": [str(workspace)]}, "commands": {"mode": "allowlist", "allow": allow}}
+        assert load_policy(cfg, windows=windows).command_allow == frozenset(allow)
