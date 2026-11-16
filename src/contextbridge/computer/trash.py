@@ -32,13 +32,14 @@ from typing import Any
 
 from .audit import mark_started
 from .files import FileOperationError
-from .policy import TRASH_DIRNAME, ComputerPolicy, PolicyViolation
+from .policy import TRASH_DIRNAME, ComputerPolicy, PolicyViolation, _is_plain_entry
 
 _TRASH_ID = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{8}$")
 
 
 def _kind(path: Path) -> str:
-    if path.is_symlink():
+    # A Windows junction is a link too: deleting it must remove the link, never walk its target.
+    if path.is_symlink() or (os.path.lexists(path) and not _is_plain_entry(path)):
         return "symlink"
     if path.is_dir():
         return "directory"
@@ -73,6 +74,10 @@ def _inventory(policy: ComputerPolicy, target: Path, raw: str) -> tuple[str, int
 
 def _force_remove(func, path, _exc) -> None:
     """Retry once after clearing a read-only bit (Windows refuses to delete read-only files)."""
+    if func not in (os.unlink, os.rmdir):
+        # Not a removal that failed (rmtree refusing a link, a folder that cannot be listed):
+        # "retrying" would pass silently and report a deletion that never happened.
+        raise _exc if isinstance(_exc, BaseException) else _exc[1]
     os.chmod(path, stat.S_IWRITE)
     func(path)
 

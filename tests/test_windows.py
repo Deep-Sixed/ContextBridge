@@ -206,3 +206,18 @@ def test_agent_task_relaunches_an_agent_that_exits(trigger):
         capture_output=True, text=True, timeout=120, check=True,
     ).stdout
     assert re.search(r"^Repeat\s*:\s*PT1M\s*$", plan, re.MULTILINE), plan
+
+
+def test_permanently_deleting_a_junction_removes_the_link_not_its_target(make_policy, workspace):
+    from contextbridge.computer.trash import delete_file
+
+    policy = make_policy(filesystem={"delete": "permanent"})
+    target = workspace / "work" / "target"
+    target.mkdir()
+    (target / "f.txt").write_text("x", encoding="utf-8")
+    junction = workspace / "work" / "junction"
+    subprocess.run(["cmd", "/c", "mklink", "/J", str(junction), str(target)], check=True, capture_output=True)
+    result = delete_file(policy, "work/junction")
+    assert result["type"] == "symlink" and result["entries"] == 0
+    assert not os.path.lexists(junction)
+    assert (target / "f.txt").read_text(encoding="utf-8") == "x"

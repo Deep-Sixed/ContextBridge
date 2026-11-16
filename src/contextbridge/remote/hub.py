@@ -597,22 +597,38 @@ class AgentHub:
     # ------------------------------------------------------------- monitor
 
     async def _monitor(self) -> None:
+        problem: str | None = None
         while True:
             await asyncio.sleep(MONITOR_INTERVAL_SECONDS)
             try:
-                self.registry.refresh()
-            except RegistryError as exc:
-                print(f"[computer] device registry unreadable: {exc}", file=sys.stderr, flush=True)
-                continue
-            now = time.monotonic()
-            for conn in list(self._connections.values()):
-                record = self.registry.get(conn.device.device_id)
-                if record is None or not record.active:
-                    self._log("device_revoked", device=conn.device.name, device_id=conn.device.device_id)
-                    self._disconnect(conn, "revoked", "device has been revoked")
-                elif now - conn.last_seen > self.heartbeat_seconds * 3:
-                    self._log("device_heartbeat_lost", device=conn.device.name, device_id=conn.device.device_id)
-                    self._disconnect(conn, "heartbeat", "no heartbeat received")
+                self._check_connections()
+            except Exception as exc:  # noqa: BLE001 -- the monitor must outlive any one bad pass
+                if str(exc) != problem:  # once per problem, not twice a second
+                    problem = str(exc)
+                    print(f"[computer] device monitor: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+            else:
+                problem = None
+
+    def _check_connections(self) -> None:
+        """Drop connections whose device was revoked or stopped sending heartbeats."""
+        try:
+            self.registry.refresh()
+            readable = True
+        except (RegistryError, OSError) as exc:
+            # Revocations cannot be seen right now; lost heartbeats still can.
+            readable = False
+            unreadable = exc
+        now = time.monotonic()
+        for conn in list(self._connections.values()):
+            record = self.registry.get(conn.device.device_id) if readable else conn.device
+            if record is None or not record.active:
+                self._log("device_revoked", device=conn.device.name, device_id=conn.device.device_id)
+                self._disconnect(conn, "revoked", "device has been revoked")
+            elif now - conn.last_seen > self.heartbeat_seconds * 3:
+                self._log("device_heartbeat_lost", device=conn.device.name, device_id=conn.device.device_id)
+                self._disconnect(conn, "heartbeat", "no heartbeat received")
+        if not readable:
+            raise RegistryError(f"device registry unreadable: {unreadable}")
 
     def _log(self, event: str, **fields: Any) -> None:
         try:

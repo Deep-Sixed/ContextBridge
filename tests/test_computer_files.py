@@ -446,7 +446,9 @@ def test_read_file_huge_line_is_never_held_whole(make_policy, workspace):
     policy = make_policy(filesystem={"max_read_bytes": 4096})
     result, peak = _peak_bytes(lambda: files.read_file(policy, "docs/blob.json"))
     assert result["truncated"] and result["content"] == "" and result["total_lines"] == 2
+    assert "Line 0 is longer than the 4096-byte read limit" in result["note"] and "offset 1" in result["note"]
     assert peak < 1_000_000
+    assert "note" not in files.read_file(policy, "docs/blob.json", offset=1)
     tail = files.read_file(policy, "docs/blob.json", offset=-1)
     assert tail["content"] == "after\n" and tail["start_line"] == 1
 
@@ -457,3 +459,10 @@ def test_read_file_tail_keeps_crlf_and_utf16(make_policy, workspace):
     policy = make_policy()
     assert files.read_file(policy, "docs/crlf.txt", offset=-2)["content"] == "b\r\nc\r\n"
     assert files.read_file(policy, "docs/wide.txt", offset=-1)["content"] == "three\n"
+
+
+def test_searches_refuse_a_negative_result_limit(policy):
+    """It used to return nothing and call that truncated, as if matches had been cut off."""
+    for search in (files.search_files, files.search_code):
+        with pytest.raises(FileOperationError, match="max_results"):
+            search(policy, ".", "a", max_results=-1)

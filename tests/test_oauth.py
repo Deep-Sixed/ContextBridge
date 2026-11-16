@@ -195,6 +195,23 @@ def test_grant_lifecycle_rotation_and_reuse(store):
     assert store.find_refresh(refresh2) is None
 
 
+def test_a_narrower_refresh_limits_only_the_token_it_issues(store):
+    store.save_client({"client_id": "c1", "redirect_uris": [REDIRECT]})
+    store.save_code("code-1", {"client_id": "c1", "expires_at": time.time() + 60})
+    both = [SCOPE_READ, SCOPE_WRITE]
+    grant_id, access, refresh = store.create_grant(
+        client_id="c1", scopes=both, devices=["local"], resource=PUBLIC + "/mcp", code="code-1",
+        access_seconds=60, refresh_seconds=600,
+    )
+    narrow, refresh2 = store.rotate(grant_id, refresh, scopes=[SCOPE_READ], access_seconds=60, refresh_seconds=600)
+    grant = store.find_access(narrow)[1]
+    assert grant["scopes"] == both  # what the owner approved is kept
+    assert store.access_scopes(grant, narrow) == [SCOPE_READ]
+    assert store.access_scopes(grant, access) == both  # a token already issued is unchanged
+    full, _ = store.rotate(grant_id, refresh2, scopes=both, access_seconds=60, refresh_seconds=600)
+    assert store.access_scopes(store.find_access(full)[1], full) == both
+
+
 def test_codes_are_single_use(store):
     store.save_client({"client_id": "c1", "redirect_uris": [REDIRECT]})
     store.save_code("abc", {"client_id": "c1", "expires_at": time.time() + 60})
@@ -669,6 +686,20 @@ def test_client_address_header_is_ignored_unless_configured(remote):
     statuses, locked = anyio.run(scenario)
     assert statuses == [401, 401, 401, 401, 429]
     assert locked.status_code == 429
+
+
+def test_a_flood_of_requests_from_one_client_does_not_expire_another_clients_consent(remote):
+    async def scenario():
+        async with await remote.client() as http:
+            owner_client = (await register(http)).json()["client_id"]
+            _, page = await start_authorization(http, owner_client)
+            flooder = (await register(http, name="Flood")).json()["client_id"]
+            for n in range(150):
+                await start_authorization(http, flooder, state=f"s{n}")
+            return await approve(http, page, remote.store)
+
+    response = anyio.run(scenario)
+    assert response.status_code == 302 and "code=" in response.headers["location"]
 
 
 def test_refresh_rotates_and_reuse_revokes_the_grant(remote):

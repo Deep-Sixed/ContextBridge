@@ -713,7 +713,8 @@ def create_computer_server(
         """Read a text file by lines. offset is the 0-based first line; a negative offset reads the
         last lines (offset=-50 reads the last 50). length caps the lines returned. The result gives
         start_line, lines_returned, and total_lines; when truncated is true the read hit its size
-        limit, so read on from start_line + lines_returned. For PDF, Word, and Excel files use
+        limit, so read on from start_line + lines_returned. A line longer than the limit cannot be read:
+        note then names it and the offset to continue from. For PDF, Word, and Excel files use
         read_document."""
         return await run(device, "read_file", {"path": path, "offset": offset, "length": length})
 

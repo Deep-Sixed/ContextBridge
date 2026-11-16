@@ -163,6 +163,7 @@ def read_file(
     used = 0
     truncated = False
     total_lines = 0
+    too_long: int | None = None
     with resolved.open("r", encoding=encoding, errors="replace", newline="") as fh:
         if offset < 0:
             # Count first, then read forward: holding the last N lines would cost N lines of memory.
@@ -181,9 +182,11 @@ def read_file(
             used += len(line.encode("utf-8"))
             if used > budget:
                 truncated = True
+                if not lines:
+                    too_long = index  # this line alone is over the limit; no later read can return it
                 continue
             lines.append(line)
-    return {
+    result: dict[str, Any] = {
         "path": str(resolved),
         "encoding": encoding,
         "content": "".join(lines),
@@ -193,6 +196,12 @@ def read_file(
         "size": size,
         "truncated": truncated,
     }
+    if too_long is not None:
+        result["note"] = (
+            f"Line {too_long} is longer than the {budget}-byte read limit (filesystem.max_read_bytes) and "
+            f"cannot be read; continue from offset {too_long + 1}."
+        )
+    return result
 
 
 def get_file_info(policy: ComputerPolicy, path: str) -> dict[str, Any]:
@@ -231,6 +240,12 @@ def _writable(policy: ComputerPolicy, path: Path) -> bool:
     return True
 
 
+def _result_limit(policy: ComputerPolicy, max_results: int | None) -> int:
+    if max_results is not None and max_results < 0:
+        raise FileOperationError("max_results must be at least 1.")
+    return min(max_results or policy.max_results, policy.max_results)
+
+
 def _walk_files(policy: ComputerPolicy, root: Path, deadline: float):
     """Yield visible files and directories under ``root``; stops at ``deadline``."""
     for dirpath, dirnames, filenames in os.walk(root):
@@ -255,7 +270,7 @@ def search_files(
         raise FileOperationError(f"Not a directory: {path}")
     if not pattern:
         raise FileOperationError("A search pattern is required.")
-    limit = min(max_results or policy.max_results, policy.max_results)
+    limit = _result_limit(policy, max_results)
     needle = pattern.casefold()
     is_glob = any(ch in pattern for ch in "*?[")
     deadline = time.monotonic() + policy.max_search_seconds
@@ -298,7 +313,7 @@ def search_code(
         matcher = re.compile(pattern if regex else re.escape(pattern), flags)
     except re.error as exc:
         raise FileOperationError(f"Invalid regular expression: {exc}") from None
-    limit = min(max_results or policy.max_results, policy.max_results)
+    limit = _result_limit(policy, max_results)
     context_lines = max(0, min(int(context_lines), 5))
     deadline = time.monotonic() + policy.max_search_seconds
     file_glob = file_pattern.casefold() if file_pattern else None

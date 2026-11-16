@@ -228,3 +228,26 @@ def test_the_shared_loopback_address_is_never_rate_limited(tmp_path, header):
     """Behind a tunnel every agent is 127.0.0.1: one stranger's failures must not lock them all out."""
     replies = _sign_in_replies(tmp_path, lambda n: {"CF-Connecting-IP": "not-an-ip"}, client_ip_header=header)
     assert replies == ["unknown_device"] * 3
+
+
+def test_the_monitor_survives_a_pass_that_fails(tmp_path, monkeypatch):
+    """One unexpected error used to end the task, and with it heartbeat and revocation checks."""
+    monkeypatch.setattr(hub_module, "MONITOR_INTERVAL_SECONDS", 0.01)
+    passes = []
+
+    def check():
+        passes.append(1)
+        if len(passes) == 1:
+            raise TypeError("unexpected field in a device record")
+
+    async def scenario():
+        hub = AgentHub(DeviceRegistry(tmp_path / "devices.json"), ComputerAuditLog(tmp_path / "audit.jsonl", echo=False))
+        monkeypatch.setattr(hub, "_check_connections", check)
+        await hub.start("127.0.0.1", 0)
+        try:
+            await asyncio.sleep(0.2)
+        finally:
+            await hub.close()
+
+    asyncio.run(scenario())
+    assert len(passes) > 1
