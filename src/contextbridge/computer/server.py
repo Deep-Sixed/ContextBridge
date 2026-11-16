@@ -23,6 +23,7 @@ each limited to the scopes and devices the owner approved.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextlib
 import copy
 import functools
@@ -32,6 +33,7 @@ import socket
 import sys
 import time
 import uuid
+import weakref
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
@@ -179,12 +181,68 @@ def token_authorizer(tool: str, scope: str | None = None) -> str:
 # --------------------------------------------------------------------- devices
 
 
+class ToolListNotifier:
+    """Sends tools/list_changed to every client session that has listed tools.
+
+    The servers advertise ``tools.listChanged``, so clients may cache the list. Which tools a
+    caller sees depends on its scopes and devices, so every watched session is told and each
+    lists again for its own view. Changes arrive from the hub (event loop) and from a
+    federation thread; :meth:`changed` may be called from either, and a burst of changes
+    sends one notification.
+    """
+
+    def __init__(self) -> None:
+        self._sessions: weakref.WeakSet[Any] = weakref.WeakSet()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._pending = False
+        self._tasks: set[asyncio.Task[None]] = set()
+
+    def watch(self, session: Any) -> None:
+        """Remember ``session`` (called from a request, on the servers' event loop)."""
+        self._loop = asyncio.get_running_loop()
+        self._sessions.add(session)
+
+    def changed(self) -> None:
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return  # no client has listed tools yet
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            self._schedule()
+        else:
+            loop.call_soon_threadsafe(self._schedule)
+
+    def _schedule(self) -> None:
+        if self._pending:
+            return
+        self._pending = True
+        task = asyncio.get_running_loop().create_task(self._broadcast())
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _broadcast(self) -> None:
+        self._pending = False  # a change from here on gets a notification of its own
+        for session in list(self._sessions):
+            try:
+                await session.send_tool_list_changed()
+            except Exception:  # noqa: BLE001 -- the client has gone; forget it
+                self._sessions.discard(session)
+
+
 class DeviceRouter:
     """Sends each tool call to the local engine or to a remote agent."""
 
     def __init__(self, local: Engine | None, hub: Any | None) -> None:
         self.local = local
         self.hub = hub
+        self.notifier = ToolListNotifier()
+        if hub is not None:
+            hub.add_tools_listener(self.notifier.changed)
+        if local is not None and local.federation is not None:
+            local.federation.on_change = self.notifier.changed
 
     def available_tools(self, devices: frozenset[str] | None = None) -> frozenset[str]:
         """Tools offered by online devices (only those in ``devices``, unless None)."""
@@ -416,6 +474,9 @@ class ComputerPolicyMiddleware(Middleware):
         return client, tool
 
     async def on_list_tools(self, context: MiddlewareContext[Any], call_next: Any) -> Sequence[Tool]:
+        if context.fastmcp_context is not None:
+            with contextlib.suppress(RuntimeError):  # no session (direct, in-process listing)
+                self._router.notifier.watch(context.fastmcp_context.session)
         tools = await call_next(context)
         offered = self._router.available_tools(self._devices()) | {LIST_DEVICES_TOOL}
         visible = []

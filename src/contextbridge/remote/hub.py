@@ -194,6 +194,8 @@ class AgentHub:
         self._server: Server | None = None
         self._monitor_task: asyncio.Task[None] | None = None
         self._background: set[asyncio.Task[None]] = set()
+        # Called when the tools a device offers change: it connects, disconnects, or reports new MCP tools.
+        self._tools_listeners: list[Callable[[], None]] = []
         self.port: int | None = None
 
     # ------------------------------------------------------------ lifecycle
@@ -472,6 +474,7 @@ class AgentHub:
             mcp_tools=sorted(conn.federated) or None,
             info=conn.info,
         )
+        self._tools_changed()
         return conn
 
     # ------------------------------------------------------------- traffic
@@ -496,7 +499,11 @@ class AgentHub:
                     pending.future.set_result(msg)
             elif kind == "tools":
                 # The agent's MCP tools changed mid-session; validated exactly as at the handshake.
-                conn.federated = tools_from_wire(msg.get("federated"), reserved=RESERVED_TOOL_NAMES)
+                federated = tools_from_wire(msg.get("federated"), reserved=RESERVED_TOOL_NAMES)
+                changed = federated != conn.federated
+                conn.federated = federated
+                if changed:
+                    self._tools_changed()
                 self._log(
                     "device_tools_changed",
                     device=conn.device.name,
@@ -540,10 +547,22 @@ class AgentHub:
         conn.dropped = True
         if self._connections.get(conn.device.device_id) is conn:
             del self._connections[conn.device.device_id]
+            self._tools_changed()
         for pending in conn.pending.values():
             if not pending.future.done():
                 pending.future.set_exception(DeviceUnavailable(f"Device '{conn.device.name}' disconnected."))
         self._log("device_disconnected", device=conn.device.name, device_id=conn.device.device_id, reason=reason)
+
+    def add_tools_listener(self, listener: Callable[[], None]) -> None:
+        """Call ``listener`` whenever the set of tools offered by connected devices changes."""
+        self._tools_listeners.append(listener)
+
+    def _tools_changed(self) -> None:
+        for listener in self._tools_listeners:
+            try:
+                listener()
+            except Exception as exc:  # noqa: BLE001 -- a listener must never break the hub
+                print(f"[computer] tool change listener failed: {exc}", file=sys.stderr, flush=True)
 
     def _disconnect(self, conn: AgentConnection, code: str, message: str) -> None:
         """Make the device unusable now; finish the close handshake in the background."""
