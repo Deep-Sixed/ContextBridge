@@ -208,6 +208,37 @@ def test_agent_task_relaunches_an_agent_that_exits(trigger):
     assert re.search(r"^Repeat\s*:\s*PT1M\s*$", plan, re.MULTILINE), plan
 
 
+@pytest.mark.parametrize("preset", ["ReadOnly", "Full"])
+def test_bootstrap_writes_a_config_the_agent_loads(tmp_path, preset):
+    # The one-step installer generates agent.yaml itself; both presets must load and keep their promised limits.
+    from contextbridge.remote.agent import load_agent_config
+
+    script = REPO / "scripts" / "bootstrap-agent.ps1"
+    plan = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-File", str(script),
+         "-GatewayUrl", "wss://agents.example.com", "-Name", "p70", "-Policy", preset,
+         "-InstallDir", str(tmp_path / "cb"), "-DryRun"],
+        capture_output=True, text=True, timeout=120, check=True,
+    ).stdout
+    assert "--- agent.yaml ---" in plan, plan
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    config_file = configs / "agent.yaml"
+    config_file.write_text(plan.split("--- agent.yaml ---", 1)[1].lstrip(), encoding="utf-8")
+    config = load_agent_config(config_file)
+    assert config.name == "p70"
+    assert config.gateway_url == "wss://agents.example.com"
+    assert config.identity_path.resolve() == (tmp_path / "state" / "agent-identity.json").resolve()
+    summary = config.policy.summary()
+    if preset == "ReadOnly":
+        assert summary["writable_roots"] == []
+        assert summary["command_mode"] == "allowlist"
+        assert summary["allow_kill"] is False
+    else:
+        assert summary["command_mode"] == "unrestricted"
+        assert summary["allow_kill"] is True
+
+
 def test_permanently_deleting_a_junction_removes_the_link_not_its_target(make_policy, workspace):
     from contextbridge.computer.trash import delete_file
 

@@ -51,3 +51,5 @@ jobs:
           ./scripts/install-agent.ps1 -Config configs/agent.windows.yaml -AtLogOn -DryRun
           ./scripts/install-agent.ps1 -Config configs/agent.windows.yaml -Elevated -DryRun
           ./scripts/install-agent.ps1 -Uninstall -DryRun
+          ./scripts/bootstrap-agent.ps1 -GatewayUrl wss://agents.example.com -Code TEST -Name ci -InstallDir $env:RUNNER_TEMP/cb-bootstrap -DryRun
+          ./scripts/bootstrap-agent.ps1 -Policy Full -AtLogOn -Elevated -InstallDir $env:RUNNER_TEMP/cb-bootstrap -DryRun
