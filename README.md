@@ -317,6 +317,14 @@ copy configs\agent.windows.yaml configs\agent.yaml     # then set name, gateway.
 .\scripts\install-agent.ps1                                # elevated PowerShell; or -AtLogOn without elevation
 ```
 
+**One-step install.** `scripts/bootstrap-agent.ps1` does all of the above on a new machine: it installs Python and Git with winget if they are missing, clones the repository, creates the virtual environment, writes `configs\agent.yaml` from a policy preset (`-Policy ReadOnly`, the default, or `-Policy Full`), enrolls with the pairing code, registers the scheduled task, and waits until the agent reports that it connected. Create the code on the gateway host first (`contextbridge-admin pair <name>`; the name defaults to the computer's name in lower case), then in an elevated PowerShell:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Deep-Sixed/ContextBridge/main/scripts/bootstrap-agent.ps1))) -GatewayUrl wss://agents.example.com -Code ABCD-EFGH-IJKL-MNOP
+```
+
+`-AtLogOn` and `-Elevated` pass through to `install-agent.ps1`. Running it again on an enrolled machine upgrades it in place to `-Revision` (default `main`), keeping its config and identity. `-DryRun` shows the plan and the config it would write.
+
 **Running as a scheduled task.** `install-agent.ps1` registers a scheduled task that runs the agent as *your* account, never SYSTEM, so commands have exactly your permissions within the agent's policy.
 - **Default:** starts at boot whether or not you are signed in. It uses S4U, so no password is stored, but registering it needs an elevated shell.
 - **`-AtLogOn`:** starts at sign-in instead, and needs no elevation.

@@ -189,7 +189,7 @@ Copying the old gateway's state keeps every enrolled device (same `gateway_id`, 
 cb-admin pair laptop --scopes computer:read     # prints a one-time code (default 15 minutes)
 ```
 
-On the new machine, copy `configs/agent.yaml`, set `name: laptop`, `gateway.url: wss://agents.example.com`, no fingerprint, and its own policy, then run `contextbridge-agent enroll --config <file> --code <code>` and start the agent. The machine needs nothing but outbound HTTPS.
+On a Windows machine, `scripts/bootstrap-agent.ps1 -GatewayUrl wss://agents.example.com -Code <code> -Name laptop` does the rest in one step (see [Windows devices](../README.md#windows-devices-thanatos)). Otherwise, on the new machine, copy `configs/agent.yaml`, set `name: laptop`, `gateway.url: wss://agents.example.com`, no fingerprint, and its own policy, then run `contextbridge-agent enroll --config <file> --code <code>` and start the agent. The machine needs nothing but outbound HTTPS.
 
 Existing ChatGPT and Claude approvals name their devices, so they can't see the new machine yet. Revoke and reconnect each client that should use it, ticking the new device on the consent page.
 
