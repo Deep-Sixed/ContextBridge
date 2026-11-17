@@ -269,6 +269,21 @@ def test_a_finished_command_leaves_nothing_running(policy, workspace):
         _kill(child)
 
 
+@windows_only
+def test_every_finished_command_has_ended_its_children_by_the_time_it_returns(policy, workspace):
+    """Windows ends a job's processes asynchronously: closing a kill-on-close job, or
+    TerminateJobObject, returns while they may still be running. run_command must not return
+    until they are gone. The race is narrow, so it is checked several times."""
+    for attempt in range(8):
+        pid_file = workspace / "work" / f"child{attempt}.pid"
+        run_command(policy, python_cmd(_spawner(pid_file, then="")), timeout_seconds=30)
+        child = _wait_for_pid(pid_file)
+        try:
+            assert not _alive(child), f"attempt {attempt}: the command's child outlived it"
+        finally:
+            _kill(child)
+
+
 # ------------------------------------------------------------------ Windows names
 
 

@@ -19,6 +19,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from typing import IO, Any
 
 import psutil
@@ -55,6 +56,18 @@ if IS_WINDOWS:  # pragma: no cover - exercised on Windows CI
             ("SchedulingClass", wintypes.DWORD),
         ]
 
+    class _BasicAccounting(ctypes.Structure):
+        _fields_ = [
+            ("TotalUserTime", ctypes.c_int64),
+            ("TotalKernelTime", ctypes.c_int64),
+            ("ThisPeriodTotalUserTime", ctypes.c_int64),
+            ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+            ("TotalPageFaultCount", wintypes.DWORD),
+            ("TotalProcesses", wintypes.DWORD),
+            ("ActiveProcesses", wintypes.DWORD),
+            ("TotalTerminatedProcesses", wintypes.DWORD),
+        ]
+
     class _ExtendedLimits(ctypes.Structure):
         _fields_ = [
             ("BasicLimitInformation", _BasicLimits),
@@ -71,6 +84,10 @@ if IS_WINDOWS:  # pragma: no cover - exercised on Windows CI
     _kernel32.SetInformationJobObject.restype = wintypes.BOOL
     _kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
     _kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    _kernel32.QueryInformationJobObject.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p
+    ]
+    _kernel32.QueryInformationJobObject.restype = wintypes.BOOL
     _kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
     _kernel32.TerminateJobObject.restype = wintypes.BOOL
     _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
@@ -78,6 +95,7 @@ if IS_WINDOWS:  # pragma: no cover - exercised on Windows CI
     _ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
     _ntdll.NtResumeProcess.restype = ctypes.c_long
 
+    _JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION = 1
     _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
     _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
     _CREATE_SUSPENDED = 0x00000004
@@ -101,6 +119,18 @@ if IS_WINDOWS:  # pragma: no cover - exercised on Windows CI
             _kernel32.CloseHandle(job)
             raise error
         return job
+
+    def _active_processes(job: int) -> int | None:
+        info = _BasicAccounting()
+        if not _kernel32.QueryInformationJobObject(
+            job, _JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION, ctypes.byref(info), ctypes.sizeof(info), None
+        ):
+            return None
+        return int(info.ActiveProcesses)
+
+
+# How long release() waits on Windows for a terminated job's processes to be gone.
+_JOB_EXIT_SECONDS = 5.0
 
 
 class ProcessTree:
@@ -185,7 +215,7 @@ class ProcessTree:
         its process group is killed, once. Called while the process still runs, it only
         drops the handle; the caller kills the tree first when it means to end it.
         """
-        self._close_job()
+        self._end_job()
         if IS_WINDOWS or self._group_ended or self.proc.poll() is None:
             return
         self._group_ended = True
@@ -196,6 +226,24 @@ class ProcessTree:
             os.killpg(self.proc.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
+
+    def _end_job(self) -> None:
+        """Windows: end everything in the job and wait until it has actually exited, then close it.
+
+        Closing a kill-on-close job, like TerminateJobObject, only starts the termination: a
+        process can still be running for a moment after the call returns. Callers release a
+        tree to promise that nothing the command started is left, so wait for that to be true.
+        """
+        job = self._job
+        if job is not None:  # pragma: no cover - Windows
+            _kernel32.TerminateJobObject(job, 1)
+            deadline = time.monotonic() + _JOB_EXIT_SECONDS
+            while time.monotonic() < deadline:
+                active = _active_processes(job)
+                if not active:  # 0, or None if the job cannot be queried
+                    break
+                time.sleep(0.01)
+        self._close_job()
 
     def _close_job(self) -> None:
         job, self._job = self._job, None
