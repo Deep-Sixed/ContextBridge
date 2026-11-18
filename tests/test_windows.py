@@ -428,12 +428,14 @@ def test_served_windows_installers_parse(tmp_path):
     broker.public_url, broker.agents_url = "https://mcp.example.com", "wss://agents.example.com"
     script = tmp_path / "remote-windows.ps1"
     script.write_text(broker.installer_text("remote-windows.ps1"), encoding="utf-8")
+    # -Command does not pass trailing arguments in $args, so the path goes into the command itself.
+    quoted = "'" + str(script).replace("'", "''") + "'"
     check = (
-        "$e = $null; [void][Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$null, [ref]$e); "
+        f"$e = $null; [void][Management.Automation.Language.Parser]::ParseFile({quoted}, [ref]$null, [ref]$e); "
         "if ($e) { $e | ForEach-Object { $_.Message }; exit 1 }"
     )
     parsed = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", check, str(script)],
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", check],
         capture_output=True, text=True, timeout=120,
     )
     assert parsed.returncode == 0, parsed.stdout + parsed.stderr
