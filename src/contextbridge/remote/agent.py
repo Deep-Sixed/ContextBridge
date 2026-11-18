@@ -25,7 +25,9 @@ import socket
 import ssl
 import subprocess
 import sys
+import time
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -299,6 +301,82 @@ async def enroll(config: AgentConfig, code: str) -> Identity:
     identity = Identity(str(reply["device_id"]), config.name, str(reply["gateway_id"]), key)
     identity.save(config.identity_path)
     return identity
+
+
+async def activate(
+    config: AgentConfig,
+    server_url: str,
+    *,
+    notify: Callable[[str], None] = print,
+    transport: Any = None,
+) -> Identity:
+    """Register this machine by browser approval instead of a one-time code (see oauth/activation.py).
+
+    Generates the device key, asks the gateway at ``server_url`` (its public HTTPS address) for an
+    activation code, tells the person to approve it in a browser, and waits for the approval.
+    """
+    import httpx
+
+    if config.identity_path.exists():
+        raise FatalAgentError(f"{config.identity_path} already exists; this device is already enrolled")
+    parts = urlsplit(server_url)
+    if parts.scheme != "https" and not (parts.scheme == "http" and is_loopback(parts.hostname or "")):
+        raise FatalAgentError(f"{server_url} must be an https:// address")
+    key = Ed25519PrivateKey.generate()
+    pending = Identity("", config.name, "", key)
+    base = server_url.rstrip("/")
+    async with httpx.AsyncClient(base_url=base, timeout=30, transport=transport) as http:
+        response = await http.post(
+            "/activate/start", json={"name": config.name, "public_key": pending.public_key, "info": _host_info()}
+        )
+        reply = _activation_reply(response)
+        if response.status_code != 200:
+            raise FatalAgentError(f"the gateway refused to start activation: {reply.get('message') or reply}")
+        notify(
+            f"To add {config.name}, open {reply['verification_uri']} and enter the code {reply['user_code']}\n"
+            f"  (or open {reply['verification_uri_complete']})\n"
+            f"Check that the page shows the key fingerprint {reply['fingerprint']}.\n"
+            f"Waiting for approval (the code expires in {int(reply['expires_in']) // 60} minutes)..."
+        )
+        interval = max(1.0, float(reply.get("interval") or 5))
+        deadline = time.monotonic() + float(reply["expires_in"]) + interval
+        while time.monotonic() < deadline:
+            await asyncio.sleep(interval)
+            try:
+                answer = _activation_reply(await http.post("/activate/poll", json={"device_code": reply["device_code"]}))
+            except httpx.TransportError:
+                continue  # a dropped request while waiting is not a refusal; ask again
+            status = answer.get("status")
+            if status == "pending":
+                continue
+            if status == "slow_down":
+                interval += 5
+                continue
+            if status == "denied":
+                raise FatalAgentError("the owner denied this device")
+            if status == "approved":
+                break
+            raise FatalAgentError("the activation code expired before it was approved; run activate again")
+        else:
+            raise FatalAgentError("the activation code expired before it was approved; run activate again")
+    if answer.get("name") != config.name:
+        raise FatalAgentError(f"the gateway approved device {answer.get('name')!r}, not {config.name!r}")
+    identity = Identity(str(answer["device_id"]), config.name, str(answer["gateway_id"]), key)
+    identity.save(config.identity_path)
+    agents_url = answer.get("agents_url")
+    if agents_url and agents_url.rstrip("/") != config.gateway_url.rstrip("/"):
+        notify(f"Note: the gateway says agents connect to {agents_url}, but this config uses {config.gateway_url}.")
+    return identity
+
+
+def _activation_reply(response: Any) -> dict[str, Any]:
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        raise AgentError(f"unexpected reply from the gateway (HTTP {response.status_code})")
+    return body
 
 
 # ---------------------------------------------------------------------- agent
@@ -630,6 +708,13 @@ def main(argv: list[str] | None = None) -> None:
     enroll_cmd = sub.add_parser("enroll", help="register this machine with the gateway")
     enroll_cmd.add_argument("--config", required=True)
     enroll_cmd.add_argument("--code", required=True, help="one-time code from `contextbridge-admin pair`")
+    activate_cmd = sub.add_parser("activate", help="register this machine by approving it in a browser")
+    activate_cmd.add_argument("--config", required=True)
+    activate_cmd.add_argument(
+        "--server",
+        default=os.environ.get("CONTEXTBRIDGE_SERVER"),
+        help="the gateway's public https address, e.g. https://mcp.contextbridge.app (or CONTEXTBRIDGE_SERVER)",
+    )
     run_cmd = sub.add_parser("run", help="connect to the gateway and serve tool calls")
     run_cmd.add_argument("--config", required=True)
     run_cmd.add_argument("--log-file", help="append diagnostics here (for services with no console)")
@@ -653,6 +738,20 @@ def main(argv: list[str] | None = None) -> None:
         except (OSError, InvalidHandshake, InvalidURI, TimeoutError) as exc:
             raise SystemExit(f"could not reach the gateway: {exc}") from None
         print(f"[agent] enrolled as {identity.name} ({identity.device_id}); identity saved to {config.identity_path}")
+        return
+
+    if args.command == "activate":
+        if not args.server:
+            raise SystemExit("activate needs --server (the gateway's https address) or CONTEXTBRIDGE_SERVER")
+        try:
+            identity = asyncio.run(activate(config, args.server, notify=lambda text: print(text, flush=True)))
+        except (FatalAgentError, AgentError) as exc:
+            raise SystemExit(f"activation failed: {exc}") from None
+        except (OSError, TimeoutError) as exc:
+            raise SystemExit(f"could not reach {args.server}: {exc}") from None
+        except KeyboardInterrupt:
+            raise SystemExit("activation cancelled") from None
+        print(f"[agent] activated as {identity.name} ({identity.device_id}); identity saved to {config.identity_path}")
         return
 
     # Commands this agent runs must not be able to read its device key or environment out of /proc.

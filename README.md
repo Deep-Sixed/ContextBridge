@@ -284,6 +284,24 @@ contextbridge-admin --config configs/computer.yaml revoke thanatos   # takes eff
 
 Pairing is deliberately an admin CLI on the gateway host and not an MCP tool, so holding the MCP token never lets anyone enroll a new machine.
 
+### Activating a device from the browser
+
+With the remote endpoint ([Remote MCP clients](#remote-mcp-clients-chatgpt-claude)) and the agent listener both enabled, a new machine can be added without `pair`, SSH to the gateway, or a code to copy into a terminal. Write the device's config as above, then run:
+
+```sh
+contextbridge-agent activate --config configs/agent.local.yaml --server https://mcp.example.com
+```
+
+It prints something like *open https://mcp.example.com/activate and enter WXYZ-BCDF*, plus the new key's fingerprint, and waits. On that page you enter the code, sign in with the passphrase and an authenticator code, check the device name, computer, system, and fingerprint, choose the device's scopes (only `computer:read` starts checked), and approve. The installer then saves the identity file and exits; start the agent as usual.
+
+- **The key stays on the device.** The installer generates it and sends only the public half; approval registers exactly that key, so knowing the code alone lets no one enroll anything.
+- **Short-lived and bounded.** A code expires after 10 minutes and is delivered once; at most 20 activations wait at a time, and with `remote.client_ip_header` set each address may start 5 per 10 minutes.
+- **Same owner check as consent.** Approval needs the passphrase and a fresh TOTP code, and shares the consent page's lockout.
+- **Admission still applies.** An activated device connects through the agent listener like any other, so tailnet admission and the device's own policy are unchanged.
+- **Audit.** `device_activation_started`, `device_activation_denied`, `device_activation_failed`, `device_activation_expired`, and `device_enrolled` with `via: activation`.
+
+If `agents.public_url` is set, the gateway also tells the installer the address agents connect to, and the installer warns when the config points elsewhere.
+
 ### How the channel is secured
 
 - **Tailnet admission.** Unless the listener is on loopback, every connection is checked against the gateway's own `tailscale status --json` before anything else: the peer must be online and its Tailscale IP must belong to exactly one node in `agents.tailnet_node_ids`. A machine reaching the listener over a plain LAN address is refused, as is everything when `tailscale` can't be queried.
@@ -460,7 +478,7 @@ remote:
   - **Lockout.** Five failures lock approvals for 15 minutes, and `oauth-unlock` clears the lock early. Anyone can trigger the lockout, but no one can get past it. By default one lockout covers every caller, so a stranger's failures lock you out too; behind a tunnel, set `remote.client_ip_header` (for Cloudflare, `CF-Connecting-IP`) and each client address is locked out on its own. Name only a header the tunnel sets itself, replacing anything the client sent: a client that can choose the value can dodge the lockout. From a list such as `X-Forwarded-For`, only the last entry is used.
   - **Stored hashed.** The passphrase is kept only as an scrypt hash.
 - **Least privilege.**
-  - **Per-client grants.** Each client gets only the scopes and devices you tick.
+  - **Per-client grants.** Each client gets only the scopes and devices you tick. No device starts ticked, even when only one is offered.
   - **Config caps.** `remote.allow_scopes` and `remote.allow_devices` cap every grant. They are re-applied on every call, so narrowing the config and restarting narrows existing grants too.
   - **Hidden tools.** A tool the client can't use is hidden from its tool list and refused if called.
   - **Device policy still applies.** The device's own policy is enforced on top, exactly as for local calls.

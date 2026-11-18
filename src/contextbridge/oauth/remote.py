@@ -20,7 +20,9 @@ from ..computer.server import (
     create_computer_server,
     token_authorizer,
 )
-from .provider import ContextBridgeOAuthProvider, RemoteSettings
+from ..remote.registry import DeviceRegistry
+from .activation import ActivationBroker
+from .provider import SCOPE_DESCRIPTIONS, ContextBridgeOAuthProvider, RemoteSettings, _page
 from .store import OAuthStore
 
 
@@ -62,6 +64,8 @@ def create_remote_server(
     settings: RemoteSettings,
     store: OAuthStore,
     name: str = "ContextBridge Computer",
+    registry: DeviceRegistry | None = None,
+    agents_url: str | None = None,
 ) -> FastMCP:
     server = create_computer_server(
         None,
@@ -72,10 +76,24 @@ def create_remote_server(
         listener="remote",
         name=name,
     )
-    server.auth = ContextBridgeOAuthProvider(
+    provider = ContextBridgeOAuthProvider(
         settings,
         store,
         audit,
         offered_devices=lambda: [row["device"] for row in router.describe()],
     )
+    if registry is not None:
+        # With an agent listener, new devices can be added from the browser at /activate.
+        broker = ActivationBroker(
+            public_url=settings.public_url,
+            registry=registry,
+            store=store,
+            audit=audit,
+            agents_url=agents_url,
+            client_address=provider._client_address,
+            page=_page,
+            scope_descriptions=SCOPE_DESCRIPTIONS,
+        )
+        provider.extra_routes.extend(broker.routes())
+    server.auth = provider
     return server
