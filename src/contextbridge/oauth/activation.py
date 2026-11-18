@@ -153,7 +153,11 @@ class ActivationBroker:
         """An installer script with this gateway's public and agent addresses filled in, or None."""
         if name not in INSTALLERS:
             return None
-        text = resources.files(__package__).joinpath("installers", name).read_text(encoding="utf-8")
+        raw = resources.files(__package__).joinpath("installers", name).read_bytes().decode("utf-8")
+        # Line endings are set here, not by how the checkout stored them: sh needs LF, cmd.exe wants CRLF.
+        text = raw.replace("\r\n", "\n")
+        if name.endswith(".cmd"):
+            text = text.replace("\n", "\r\n")
         text = text.replace("__CONTEXTBRIDGE_SERVER__", self.public_url)
         if self.agents_url:
             text = text.replace("__CONTEXTBRIDGE_AGENTS_URL__", self.agents_url)

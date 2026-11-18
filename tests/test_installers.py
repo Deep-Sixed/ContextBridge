@@ -35,6 +35,10 @@ def test_gateway_serves_each_installer_with_its_own_addresses(gw):  # noqa: F811
     assert f'AGENTS_URL="${{CONTEXTBRIDGE_AGENTS_URL:-{AGENTS_URL}}}"' in pages["remote-linux.sh"].text
     assert f"GatewayUrl = '{AGENTS_URL}'" in pages["remote-windows.ps1"].text
     assert "attachment" in pages["ContextBridgeSetup.cmd"].headers["content-disposition"]
+    # Whatever line endings the checkout has: CRLF for cmd.exe, LF for sh.
+    cmd = pages["ContextBridgeSetup.cmd"].content
+    assert cmd.count(b"\r\n") == cmd.count(b"\n") > 5
+    assert b"\r" not in pages["remote-linux.sh"].content
     assert missing.status_code == 404 and traversal.status_code == 404
 
 
