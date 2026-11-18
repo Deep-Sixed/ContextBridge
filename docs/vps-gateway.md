@@ -197,6 +197,17 @@ Existing ChatGPT and Claude approvals name their devices, so they can't see the 
 
 Upgrade the gateway first, then each agent, all to the same git revision.
 
+**One command for the whole fleet.** `contextbridge-update-fleet` does the steps below in order on the gateway host, stopping at the first failure. Describe each machine once in a fleet file (start from `configs/fleet.example.yaml`), then as root:
+
+```sh
+/opt/contextbridge/venv/bin/contextbridge-update-fleet --config /opt/contextbridge/config/computer.yaml \
+    --fleet /opt/contextbridge/config/fleet.yaml --env-file /etc/contextbridge/gateway.env --dry-run
+```
+
+Drop `--dry-run` to apply it; `--revision` picks a branch, tag or commit (default `main`), and `--device` limits the remote agents. Each machine's checkout only moves forward. It reinstalls and restarts only when `src/` or `pyproject.toml` changed, waits for each agent to reconnect, and refuses a machine with local edits to tracked files. A `pyproject.toml` change on a Windows agent is left for `scripts/bootstrap-agent.ps1`, because new dependencies cannot be installed under a running agent there. The remote agents are reached through the gateway's local endpoint with its token, so it can do on them whatever their own policies allow and no more.
+
+By hand, the steps are:
+
 1. **Gateway:** the upgrade steps in section 2, then `systemctl restart contextbridge-gateway`.
 2. **Each agent, one at a time:** install the new revision into a new folder or virtual environment next to the old one, point the agent's service or scheduled task at it, and restart it. Keep the agent config and identity file where they are; no re-enrollment is needed.
 3. **Check:** `list_devices` shows each agent online with the new `agent_version`, and a test command runs on it. Move on to the next agent only after that.
