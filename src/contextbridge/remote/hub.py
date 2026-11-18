@@ -485,7 +485,9 @@ class AgentHub:
                 await conn.send(
                     {"type": "welcome", "heartbeat_seconds": self.heartbeat_seconds, "features": list(GATEWAY_FEATURES)}
                 )
-            except ConnectionClosed:
+            except BaseException:
+                # Not only ConnectionClosed: a reset socket (OSError) or cancellation must not leave this
+                # dead connection registered, where it would hold the device's slot until the monitor ran.
                 self._drop(conn, "connection lost")
                 raise
         self._log(

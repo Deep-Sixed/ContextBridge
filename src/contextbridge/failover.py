@@ -288,11 +288,17 @@ async def run_drill(
     try:
         async with Client(url, auth=BearerAuth(token), timeout=CALL_TIMEOUT_SECONDS) as client:
             tools = {t.name for t in await client.list_tools()}
-            unknown = tools - SERVER_TOOLS
-            if LIST_DEVICES_TOOL not in tools or unknown:
+            if LIST_DEVICES_TOOL not in tools:
                 report.gateway.detail = f"not a ContextBridge computer endpoint (tools: {sorted(tools)[:8]})"
                 return report
             listed = (await client.call_tool(LIST_DEVICES_TOOL, {})).structured_content["devices"]
+            # Besides its own tools, a gateway lists the MCP tools its devices federate, and list_devices names
+            # each of those; anything else means this is not a ContextBridge gateway.
+            federated = {str(t) for row in listed for t in row.get("mcp_tools") or []}
+            unknown = tools - SERVER_TOOLS - federated
+            if unknown:
+                report.gateway.detail = f"not a ContextBridge computer endpoint (unexpected tools: {sorted(unknown)[:8]})"
+                return report
             server = getattr(getattr(client, "initialize_result", None), "serverInfo", None)
             name = f"{server.name} {server.version}" if server else "ContextBridge"
             report.gateway = Check("gateway", PASS, f"{name}: {len(tools)} tools, {len(listed)} device(s)")

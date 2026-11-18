@@ -411,7 +411,7 @@ class Agent:
                 async for raw in ws:
                     msg = decode(raw)
                     if msg["type"] == "call":
-                        self._accept_call(msg)
+                        self._accept_call(msg, ws)
                     elif msg["type"] == "error":
                         text = f"gateway closed the session: {msg.get('code')}: {msg.get('message')}"
                         if msg.get("code") in FATAL_ERRORS:
@@ -457,18 +457,25 @@ class Agent:
         with contextlib.suppress(ConnectionClosed, asyncio.CancelledError):
             while True:
                 await asyncio.sleep(interval)
-                await self._send({"type": "heartbeat"})
+                await self._send({"type": "heartbeat"}, session=ws)
 
-    async def _send(self, message: dict[str, Any]) -> None:
+    async def _send(self, message: dict[str, Any], *, session: ClientConnection | None = None) -> None:
+        """Send on the current connection; with ``session``, only if that is still the current one.
+
+        A call's started notice, its result and a session's heartbeats belong to the connection they came
+        from. After a reconnect the gateway has already failed that connection's calls, so they must not
+        reach the new one: a started notice there would let an operation run that the client was told
+        did not start.
+        """
         ws = self._ws
-        if ws is None:
+        if ws is None or (session is not None and ws is not session):
             raise ConnectionClosed(None, None)
         async with self._send_lock:
             await ws.send(encode(message))
 
     # ---------------------------------------------------------------- calls
 
-    def _accept_call(self, msg: dict[str, Any]) -> None:
+    def _accept_call(self, msg: dict[str, Any], session: ClientConnection) -> None:
         request_id = msg.get("request_id")
         seq = msg.get("seq")
         reason = None
@@ -483,31 +490,33 @@ class Agent:
             self._seen[request_id] = None
             if len(self._seen) > SEEN_REQUEST_IDS:
                 self._seen.popitem(last=False)
-            self._spawn(self._run_call(request_id, msg.get("tool"), msg.get("args")))
+            self._spawn(self._run_call(request_id, msg.get("tool"), msg.get("args"), session))
             return
         self._log("denied", request_id=str(request_id)[:64], tool=str(msg.get("tool"))[:64], reason=reason)
         if isinstance(request_id, str):
-            self._spawn(self._reply(request_id, ok=False, kind="denied", message=reason, started=False))
+            self._spawn(self._reply(request_id, session, ok=False, kind="denied", message=reason, started=False))
 
     def _spawn(self, coro: Any) -> None:
         task = asyncio.create_task(coro)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    async def _run_call(self, request_id: str, tool: Any, args: Any) -> None:
+    async def _run_call(self, request_id: str, tool: Any, args: Any, session: ClientConnection) -> None:
         client = f"gateway:{self.identity.gateway_id}"
         tool_name = tool if isinstance(tool, str) else "<invalid>"
         try:
             self.audit.record("requested", request_id=request_id, tool=tool_name, client=client, **summarize_args(args))
         except AuditError:
-            await self._reply(request_id, ok=False, kind="failed", message="agent audit log unavailable", started=False)
+            await self._reply(
+                request_id, session, ok=False, kind="failed", message="agent audit log unavailable", started=False
+            )
             return
         if not isinstance(tool, str) or not isinstance(args, dict):
             with contextlib.suppress(AuditError):  # nothing runs either way; the gateway still gets its answer
                 self.audit.record(
                     "denied", request_id=request_id, tool=tool_name, client=client, reason="malformed call"
                 )
-            await self._reply(request_id, ok=False, kind="denied", message="malformed call", started=False)
+            await self._reply(request_id, session, ok=False, kind="denied", message="malformed call", started=False)
             return
 
         loop = asyncio.get_running_loop()
@@ -515,7 +524,7 @@ class Agent:
         def notify_gateway(fields: dict[str, Any]) -> None:
             # Runs in the worker thread. The operation does not start unless the gateway was told.
             future = asyncio.run_coroutine_threadsafe(
-                self._send({"type": "started", "request_id": request_id, "fields": fields}), loop
+                self._send({"type": "started", "request_id": request_id, "fields": fields}, session=session), loop
             )
             future.result(timeout=STARTED_NOTIFY_TIMEOUT_SECONDS)
 
@@ -539,22 +548,22 @@ class Agent:
                         detail=type(exc).__name__,
                         reason=message,
                     )
-                await self._reply(request_id, ok=False, kind=kind, message=message, started=call.started)
+                await self._reply(request_id, session, ok=False, kind=kind, message=message, started=call.started)
                 return
             finally:
                 unbind_call(binding)
         with contextlib.suppress(AuditError):
             call.emit("completed", success=call_succeeded(tool, result), **outcome_fields(result))
-        await self._reply(request_id, ok=True, result=result, started=True)
+        await self._reply(request_id, session, ok=True, result=result, started=True)
 
-    async def _reply(self, request_id: str, *, ok: bool, started: bool, **body: Any) -> None:
+    async def _reply(self, request_id: str, session: ClientConnection, *, ok: bool, started: bool, **body: Any) -> None:
         message: dict[str, Any] = {"type": "result", "request_id": request_id, "ok": ok, "started": started}
         if ok:
             message["result"] = body["result"]
         else:
             message["error"] = {"kind": body["kind"], "message": body["message"]}
         try:
-            await self._send(message)
+            await self._send(message, session=session)
         except (ConnectionClosed, OSError):
             self._log("result_undelivered", request_id=request_id)
 

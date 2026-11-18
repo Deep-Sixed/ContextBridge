@@ -740,3 +740,61 @@ def test_agent_listener_requires_a_registry_and_numeric_timing(gateway_config):
 def test_agent_listener_requires_tailnet_enrollment(gateway_config):
     with pytest.raises(SystemExit, match="tailnet_node_ids"):
         gateway_config(host="100.91.238.124", tls_cert="c", tls_key="k", tailnet_node_ids=[])
+
+
+def test_a_call_from_a_dropped_connection_neither_runs_nor_reaches_the_new_one(tmp_path, workspace):
+    """The gateway fails a connection's calls when it drops. If such a call could announce `started` on the
+    agent's next connection, it would run although the client was told it did not start."""
+    config = load_agent_config(write_agent_config(tmp_path, workspace, "ws://127.0.0.1:1"))
+    identity = Identity("dev_1", DEVICE, "gw_1", Ed25519PrivateKey.generate())
+    agent = Agent(config, identity, audit=ComputerAuditLog(config.audit_path, route="agent", echo=False))
+
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.sent: list = []
+
+        async def send(self, data) -> None:
+            self.sent.append(data)
+
+    dropped, current = FakeConnection(), FakeConnection()
+    target = workspace / "work" / "late.txt"
+
+    async def scenario():
+        agent._loop = asyncio.get_running_loop()
+        agent._ws = current  # the call's connection is gone and the agent has reconnected
+        await agent._run_call("r1", "write_file", {"path": str(target), "content": "x"}, dropped)
+        with pytest.raises(Exception):  # heartbeats of the old session stop instead of using the new one
+            await agent._send({"type": "heartbeat"}, session=dropped)
+        await agent._send({"type": "heartbeat"}, session=current)
+
+    asyncio.run(scenario())
+    assert not target.exists()
+    assert dropped.sent == [] and len(current.sent) == 1  # only the current session's own heartbeat
+    logged = [e["event"] for e in events(config.audit_path)]
+    assert "result_undelivered" in logged and "completed" not in logged
+
+
+def test_a_failed_welcome_does_not_leave_a_dead_connection_registered(tmp_path, workspace, monkeypatch):
+    from contextbridge.remote import hub as hub_module
+
+    original = hub_module.AgentConnection.send
+    broken: list = []
+
+    async def flaky_send(self, message):
+        if message.get("type") == "welcome" and not broken:
+            broken.append(self)
+            raise ConnectionResetError("connection reset while sending welcome")
+        return await original(self, message)
+
+    monkeypatch.setattr(hub_module.AgentConnection, "send", flaky_send)
+
+    async def scenario():
+        async with gateway(tmp_path) as gw, connected_agent(tmp_path, workspace, gw):
+            assert broken and broken[0].dropped
+            assert gw.hub.connection(DEVICE) is not broken[0]
+
+    asyncio.run(scenario())
+    # Dropped at once as lost, not left registered until the agent's retry had to take over a dead connection.
+    reasons = [e["reason"] for e in events(tmp_path / "gateway-audit.jsonl") if e["event"] == "device_disconnected"]
+    assert reasons[0] == "connection lost", reasons
+    assert "the previous connection stopped answering" not in reasons

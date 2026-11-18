@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any
 
 import anyio
@@ -15,6 +17,7 @@ from contextbridge.fleet import (
     DeviceUpdate,
     FleetError,
     Gateway,
+    LocalAgent,
     dependency_spec,
     device_command,
     load_fleet,
@@ -238,3 +241,68 @@ def test_offline_device_is_refused():
     row = {"device": "friday", "online": False, "info": {"platform": "Linux"}}
     with pytest.raises(FleetError, match="offline"):
         anyio.run(lambda: DeviceUpdate(None, FRIDAY, row, GW, NEW, dry_run=False).run())  # type: ignore[arg-type]
+
+
+FRIDAY_EDITABLE = "/home/j/cb/src/contextbridge/__init__.py"
+
+
+def test_editable_install_stays_editable_when_pyproject_changes(monkeypatch):
+    # A new command in pyproject.toml only exists after a reinstall, and that reinstall must keep it editable.
+    fake = FakeGateway(FRIDAY, windows=False, location=FRIDAY_EDITABLE)
+    run_update(fake, ["pyproject.toml", "src/contextbridge/fleet.py"], monkeypatch, deps=False)
+    (pip,) = [c for c in fake.commands if "pip install" in c]
+    assert pip.endswith("--no-deps -e /home/j/cb")
+
+
+def test_editable_install_stays_editable_when_dependencies_change(monkeypatch):
+    fake = FakeGateway(FRIDAY, windows=False, location=FRIDAY_EDITABLE)
+    run_update(fake, ["pyproject.toml"], monkeypatch, deps=True)
+    (pip,) = [c for c in fake.commands if "pip install" in c]
+    assert pip.endswith("--disable-pip-version-check -e /home/j/cb")  # with dependencies, and still -e
+
+
+def test_editable_install_without_pyproject_change_is_not_reinstalled(monkeypatch):
+    fake = FakeGateway(FRIDAY, windows=False, location=FRIDAY_EDITABLE)
+    run_update(fake, ["src/contextbridge/fleet.py"], monkeypatch)
+    assert not any("pip" in c for c in fake.commands)
+    assert any("systemd-run" in c for c in fake.commands)
+
+
+def test_gateway_reinstalls_local_agents_as_their_venv_owner(monkeypatch, tmp_path):
+    ran: list[tuple[list[str], str | None]] = []
+
+    def fake_run(argv, *, user=None, cwd=None, check=True):
+        ran.append((argv, user))
+        return OLD if "rev-parse" in argv else ""
+
+    monkeypatch.setattr(fleet, "_run", fake_run)
+    monkeypatch.setattr(fleet, "diff_files", lambda gw, old, new: Change(["src/x.py"]))
+    monkeypatch.setattr(fleet.time, "sleep", lambda s: None)
+    monkeypatch.setattr(fleet.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0))
+    gw = Gateway("/opt/app", "/opt/venv", "cb", "cb", [LocalAgent(str(tmp_path), "cb-agent", "cbagent")])
+    assert fleet.update_gateway(gw, NEW, dry_run=False)
+    pips = [(argv[0], user) for argv, user in ran if "install" in argv]
+    assert pips == [("/opt/venv/bin/pip", "cb"), (f"{tmp_path}/bin/pip", "cbagent")]
+
+
+def test_local_agent_user_defaults_to_the_venv_owner(tmp_path):
+    import getpass
+
+    owner = getpass.getuser()
+    # The gateway host is Linux; without pwd (Windows) pip keeps the current account.
+    expected = None if os.name == "nt" or owner == "root" else owner
+    assert LocalAgent(str(tmp_path), "s").install_user() == expected
+    assert LocalAgent(str(tmp_path), "s", "svc").install_user() == "svc"
+    assert LocalAgent(str(tmp_path / "missing"), "s").install_user() is None
+
+
+def test_gateway_restart_counts_a_reconnect_within_the_same_second():
+    # The gateway reports whole seconds; after its own restart any connection it lists is new.
+    restarted = datetime(2026, 1, 1, 12, 0, 5, tzinfo=timezone.utc)
+
+    async def call(tool, args):
+        return {"devices": [{"device": "friday", "online": True, "connected_since": "2026-01-01T12:00:05Z"}]}
+
+    anyio.run(lambda: fleet.wait_for_reconnect(call, "friday", after=restarted, inclusive=True, seconds=1))
+    with pytest.raises(FleetError, match="did not reconnect"):  # a device restart still needs a newer connection
+        anyio.run(lambda: fleet.wait_for_reconnect(call, "friday", after=restarted, seconds=1))
