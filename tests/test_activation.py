@@ -254,3 +254,19 @@ def test_consent_never_preselects_a_device_even_when_only_one_is_offered(gw):
     assert 'name="device" value="local"' in page.text
     assert not re.search(r'name="device" value="[^"]+" checked', page.text)
     assert unticked.status_code == 400 and "at least one permission and one device" in unticked.text
+
+
+def test_activate_cli_reports_an_unreachable_server_without_a_traceback(tmp_path, workspace, monkeypatch, capsys):
+    import httpx
+
+    from contextbridge.remote import agent as agent_module
+
+    config = agent_config(tmp_path, workspace)
+
+    async def unreachable(*args, **kwargs):
+        raise httpx.ProxyError("403 Forbidden")
+
+    monkeypatch.setattr(agent_module, "activate", unreachable)
+    with pytest.raises(SystemExit) as stopped:
+        agent_module.main(["activate", "--config", str(config.path), "--server", "https://mcp.example.test"])
+    assert str(stopped.value) == "could not reach https://mcp.example.test: ProxyError: 403 Forbidden"
