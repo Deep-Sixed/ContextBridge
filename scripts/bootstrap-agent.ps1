@@ -17,7 +17,9 @@
          beside it under a name git ignores, and upgrades never collide with it. An older install's
          configs\agent.yaml, written before this change, is moved there and the example restored;
       5. enrolls the device with -Code, unless it is already enrolled;
-      6. registers and starts the scheduled task with install-agent.ps1 (-AtLogOn and -Elevated pass through);
+      6. registers and starts the scheduled task with install-agent.ps1 (-AtLogOn and -Elevated pass through). On a
+         machine that already has the task, its start trigger and run level are kept unless you pass them:
+         -AtLogOn:$false switches to starting at boot, -Elevated:$false back to a standard token;
       7. waits for the agent to report that it connected to the gateway.
 
     Running it again on an enrolled machine upgrades it in place: the task is stopped, the code moves to -Revision,
@@ -261,6 +263,18 @@ if (-not $enrolled -and -not $Code -and -not $DryRun) {
     throw "A pairing code is needed to enroll. On the gateway host run: cb-admin pair $Name"
 }
 
+# A re-run keeps how the existing task starts and with which token, unless the caller says otherwise. Dropping
+# -AtLogOn silently would move an at-sign-in agent to a boot task with no desktop session.
+$existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+if ($existingTask) {
+    if (-not $PSBoundParameters.ContainsKey('AtLogOn')) {
+        $AtLogOn = [bool]($existingTask.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' })
+    }
+    if (-not $PSBoundParameters.ContainsKey('Elevated')) {
+        $Elevated = ($existingTask.Principal.RunLevel -eq 'Highest')
+    }
+}
+
 $installArgs = @{ Config = $configPath; Python = $venvPython; TaskName = $TaskName }
 if ($AtLogOn) { $installArgs.AtLogOn = $true }
 if ($Elevated) { $installArgs.Elevated = $true }
@@ -274,8 +288,8 @@ if ($DryRun) {
         Config        = if ($writeConfig) { "write $configPath ($Policy preset)" } else { "keep $configPath" }
         Enroll        = if ($enrolled) { "already enrolled ($identityPath)" } else { "enroll as '$Name'" }
         TaskName      = $TaskName
-        Trigger       = if ($AtLogOn) { 'AtLogOn' } else { 'AtStartup' }
-        RunLevel      = if ($Elevated) { 'Highest' } else { 'Limited' }
+        Trigger       = $(if ($AtLogOn) { 'AtLogOn' } else { 'AtStartup' }) + $(if ($existingTask -and -not $PSBoundParameters.ContainsKey('AtLogOn')) { ' (kept from the existing task)' } else { '' })
+        RunLevel      = $(if ($Elevated) { 'Highest' } else { 'Limited' }) + $(if ($existingTask -and -not $PSBoundParameters.ContainsKey('Elevated')) { ' (kept from the existing task)' } else { '' })
         Prerequisites = if ($SkipPrerequisites) { 'skip' } else { 'install Python and Git with winget if missing' }
     } | Format-List | Out-String -Width 4096 | Write-Output  # wide, so long paths stay on one line
     if ($writeConfig) {
@@ -312,7 +326,6 @@ Write-Host "    Python: $python"
 
 # An upgrade replaces files the running agent holds open, so stop it first. Disabling the task keeps its every-minute
 # trigger from relaunching it meanwhile; install-agent.ps1 registers it enabled again.
-$existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($existingTask) {
     Write-Step "Stopping the existing '$TaskName' task for the upgrade"
     Disable-ScheduledTask -TaskName $TaskName | Out-Null

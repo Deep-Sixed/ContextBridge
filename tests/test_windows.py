@@ -311,6 +311,40 @@ def test_bootstrap_moves_an_older_install_config_off_the_tracked_example(tmp_pat
     assert example.exists(), "a dry run must not move anything"
 
 
+@pytest.fixture
+def logon_task():
+    # A throwaway scheduled task that starts at sign-in, as install-agent.ps1 -AtLogOn registers one.
+    name = f"ContextBridge test {os.getpid()}"
+    subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+         "$u = [Security.Principal.WindowsIdentity]::GetCurrent().Name; "
+         "Register-ScheduledTask -TaskName $env:CB_TASK -Force "
+         "-Action (New-ScheduledTaskAction -Execute cmd.exe -Argument '/c exit 0') "
+         "-Trigger (New-ScheduledTaskTrigger -AtLogOn -User $u) "
+         "-Principal (New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive) | Out-Null"],
+        env={**os.environ, "CB_TASK": name}, check=True, capture_output=True, timeout=120,
+    )
+    yield name
+    subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+         "Unregister-ScheduledTask -TaskName $env:CB_TASK -Confirm:$false"],
+        env={**os.environ, "CB_TASK": name}, capture_output=True, timeout=120,
+    )
+
+
+def test_bootstrap_rerun_keeps_the_existing_task_trigger(tmp_path, logon_task):
+    # Re-running without -AtLogOn must not move an at-sign-in agent to a boot task, which has no desktop session.
+    install = tmp_path / "cb"
+    _write_existing_install(install, enrolled=True)
+    kept = _bootstrap_dry_run(install, "-TaskName", logon_task)
+    assert kept.returncode == 0, kept.stderr
+    assert re.search(r"^Trigger\s*:\s*AtLogOn \(kept from the existing task\)", kept.stdout, re.MULTILINE), kept.stdout
+    assert re.search(r"^RunLevel\s*:\s*Limited \(kept from the existing task\)", kept.stdout, re.MULTILINE), kept.stdout
+    switched = _bootstrap_dry_run(install, "-TaskName", logon_task, "-AtLogOn:$false")
+    assert switched.returncode == 0, switched.stderr
+    assert re.search(r"^Trigger\s*:\s*AtStartup\s*$", switched.stdout, re.MULTILINE), switched.stdout
+
+
 def test_bootstrap_prefers_an_existing_local_config(tmp_path):
     install = tmp_path / "cb"
     _write_existing_install(install, enrolled=True)
