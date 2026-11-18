@@ -302,6 +302,28 @@ It prints something like *open https://mcp.example.com/activate and enter WXYZ-B
 
 If `agents.public_url` is set, the gateway also tells the installer the address agents connect to, and the installer warns when the config points elsewhere.
 
+### One-command install (Linux and Windows)
+
+The gateway serves installers at `/install/...` with its own addresses (`remote.public_url` and `agents.public_url`) filled in, so a new machine needs no config by hand and no code from the gateway host. Each installs the agent, writes a config from a policy preset, runs the browser activation above, starts the agent, and waits until it reports connected. Run again, each upgrades the installed agent in place and keeps its config and identity.
+
+**Linux:** as the user the agent should run as (not root):
+
+```bash
+curl -fsSL https://mcp.example.com/install/remote-linux.sh | sh
+```
+
+Options go after `sh -s --`, for example `| sh -s -- --name laptop --policy full`. It installs into `~/.local/share/contextbridge` and runs the agent as a systemd user service, `contextbridge-agent.service`. It asks for sudo only to install missing packages (Python 3.11+ with venv, Git) and to enable lingering, so the agent keeps running while that user is signed out (`--no-linger` skips that). Presets: `readonly` (the default: read the home folder, run a few diagnostic programs) and `full` (read and write the home folder, run any command, end processes).
+
+**Windows:** in PowerShell as Administrator:
+
+```powershell
+irm -ErrorAction Stop 'https://mcp.example.com/install/remote-windows.ps1' | iex
+```
+
+or download `https://mcp.example.com/install/ContextBridgeSetup.cmd` and double-click it; it asks for administrator approval (UAC) and runs the same thing. Either runs `scripts/bootstrap-agent.ps1` with `-Server` and `-GatewayUrl` set; pass its options with `& ([scriptblock]::Create((irm '<url>'))) -Policy Full -AtLogOn`. Installing needs administrator rights; the agent itself runs with a standard token unless you pass `-Elevated`. The `.cmd` file is not signed, so SmartScreen may warn about it and Smart App Control may block it; the PowerShell command works either way.
+
+macOS is not supported by the installers yet.
+
 ### How the channel is secured
 
 - **Tailnet admission.** Unless the listener is on loopback, every connection is checked against the gateway's own `tailscale status --json` before anything else: the peer must be online and its Tailscale IP must belong to exactly one node in `agents.tailnet_node_ids`. A machine reaching the listener over a plain LAN address is refused, as is everything when `tailscale` can't be queried.

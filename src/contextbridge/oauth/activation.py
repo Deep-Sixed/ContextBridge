@@ -27,10 +27,11 @@ import secrets
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from importlib import resources
 from typing import Any
 
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 
 from ..computer.audit import AuditError, ComputerAuditLog
@@ -46,6 +47,12 @@ START_WINDOW_SECONDS = 600
 # RFC 8628 section 6.1: consonants only, so a code cannot spell words and is easy to read aloud.
 USER_CODE_ALPHABET = "BCDFGHJKLMNPQRSTVWXZ"
 _INFO_KEYS = ("hostname", "platform", "agent_version", "python")
+# Installers served at /install/<name>, with this gateway's addresses filled in (see installers/).
+INSTALLERS = {
+    "remote-linux.sh": "text/x-shellscript",
+    "remote-windows.ps1": "text/plain",
+    "ContextBridgeSetup.cmd": "application/octet-stream",
+}
 _MAX_INFO_CHARS = 120
 
 
@@ -137,7 +144,30 @@ class ActivationBroker:
             Route("/activate/start", self._start, methods=["POST"]),
             Route("/activate/poll", self._poll, methods=["POST"]),
             Route("/activate", self._activate_page, methods=["GET", "POST"]),
+            Route("/install/{name}", self._installer, methods=["GET"]),
         ]
+
+    # ------------------------------------------------------------ installers
+
+    def installer_text(self, name: str) -> str | None:
+        """An installer script with this gateway's public and agent addresses filled in, or None."""
+        if name not in INSTALLERS:
+            return None
+        text = resources.files(__package__).joinpath("installers", name).read_text(encoding="utf-8")
+        text = text.replace("__CONTEXTBRIDGE_SERVER__", self.public_url)
+        if self.agents_url:
+            text = text.replace("__CONTEXTBRIDGE_AGENTS_URL__", self.agents_url)
+        return text
+
+    async def _installer(self, request: Request) -> Response:
+        name = request.path_params["name"]
+        text = self.installer_text(name)
+        if text is None:
+            return PlainTextResponse("Not found\n", status_code=404)
+        headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
+        if name.endswith(".cmd"):
+            headers["Content-Disposition"] = f'attachment; filename="{name}"'
+        return PlainTextResponse(text, media_type=INSTALLERS[name], headers=headers)
 
     # ------------------------------------------------- installer endpoints
 

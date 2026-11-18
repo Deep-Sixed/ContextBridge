@@ -403,3 +403,39 @@ def test_doctor_finds_and_reads_a_real_agent_task(tmp_path):
     finally:
         subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
                         "Unregister-ScheduledTask -TaskName $env:CB_TASK -Confirm:$false"], env=env, capture_output=True, timeout=120)
+
+
+def test_bootstrap_activates_in_the_browser_when_given_a_server_and_no_code(tmp_path):
+    result = _bootstrap_dry_run(
+        tmp_path / "cb", "-GatewayUrl", "wss://agents.example.com", "-Server", "https://mcp.example.com/", "-Name", "p70"
+    )
+    assert result.returncode == 0, result.stderr
+    assert "activate 'p70' by browser approval at https://mcp.example.com/activate" in result.stdout
+    coded = _bootstrap_dry_run(
+        tmp_path / "cb2", "-GatewayUrl", "wss://agents.example.com", "-Server", "https://mcp.example.com",
+        "-Code", "ABCD-EFGH-IJKL-MNOP", "-Name", "p70",
+    )
+    assert "enroll as 'p70'" in coded.stdout  # a pairing code, when given, still wins
+    plain = _bootstrap_dry_run(tmp_path / "cb3", "-GatewayUrl", "wss://agents.example.com", "-Server", "http://x", "-Name", "p70")
+    assert plain.returncode != 0 and "https" in plain.stderr
+
+
+def test_served_windows_installers_parse(tmp_path):
+    # The gateway serves these with its addresses filled in; both must at least be valid PowerShell / batch.
+    from contextbridge.oauth.activation import ActivationBroker
+
+    broker = ActivationBroker.__new__(ActivationBroker)
+    broker.public_url, broker.agents_url = "https://mcp.example.com", "wss://agents.example.com"
+    script = tmp_path / "remote-windows.ps1"
+    script.write_text(broker.installer_text("remote-windows.ps1"), encoding="utf-8")
+    check = (
+        "$e = $null; [void][Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$null, [ref]$e); "
+        "if ($e) { $e | ForEach-Object { $_.Message }; exit 1 }"
+    )
+    parsed = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", check, str(script)],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert parsed.returncode == 0, parsed.stdout + parsed.stderr
+    cmd = broker.installer_text("ContextBridgeSetup.cmd")
+    assert "\r\n" in cmd and "https://mcp.example.com/install/remote-windows.ps1" in cmd

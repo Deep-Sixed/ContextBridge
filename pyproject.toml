@@ -44,6 +44,9 @@ version = { attr = "contextbridge.__version__" }
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"contextbridge.oauth" = ["installers/*"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
