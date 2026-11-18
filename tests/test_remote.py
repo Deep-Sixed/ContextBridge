@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import json
 import time
 from contextlib import asynccontextmanager
@@ -530,6 +531,39 @@ def test_agent_reconnects_after_gateway_restart(tmp_path, workspace):
                 await restarted.close()
 
     asyncio.run(scenario())
+
+
+def test_last_seen_survives_gateway_restart(tmp_path, workspace):
+    async def scenario():
+        async with gateway(tmp_path) as gw:
+            async with connected_agent(tmp_path, workspace, gw):
+                pass
+            await wait_for(lambda: gw.hub.connection(DEVICE) is None)
+            before = next(r for r in gw.hub.describe() if r["device"] == DEVICE)
+            assert before["online"] is False and before["last_seen"]
+            await gw.hub.close()
+            assert gw.hub.last_seen_path.exists()
+            assert oct(gw.hub.last_seen_path.stat().st_mode & 0o777) == "0o600" or os.name == "nt"
+            restarted = AgentHub(gw.registry, ComputerAuditLog(gw.audit_path, echo=False))
+            after = next(r for r in restarted.describe() if r["device"] == DEVICE)
+            assert after["online"] is False
+            assert after["last_seen"] == before["last_seen"]
+
+    asyncio.run(scenario())
+
+
+def test_unreadable_last_seen_file_is_ignored(tmp_path):
+    registry = DeviceRegistry(tmp_path / "state" / "devices.json")
+    path = tmp_path / "state" / "devices.last_seen.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{not json", encoding="utf-8")
+    hub = AgentHub(registry, ComputerAuditLog(tmp_path / "audit.jsonl", echo=False))
+    assert hub.last_seen_path == path
+    assert hub._last_seen_wall == {}
+    path.write_text('{"dev_a": 1700000000, "dev_b": "x", "dev_c": true, "dev_d": -5}', encoding="utf-8")
+    assert AgentHub(registry, ComputerAuditLog(tmp_path / "audit.jsonl", echo=False))._last_seen_wall == {
+        "dev_a": 1700000000.0
+    }
 
 
 def duplicate_of(remote, tmp_path: Path) -> Agent:

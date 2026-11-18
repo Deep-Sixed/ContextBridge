@@ -15,6 +15,8 @@ import asyncio
 import contextlib
 import ipaddress
 import itertools
+import json
+import os
 import secrets
 import ssl
 import sys
@@ -52,6 +54,8 @@ MONITOR_INTERVAL_SECONDS = 0.5
 FAILED_ENROLL_DELAY_SECONDS = 1.0
 # Well inside the agent's wait for "welcome" (HANDSHAKE_TIMEOUT_SECONDS).
 TAKEOVER_PROBE_SECONDS = 5.0
+# How often last-seen times of connected devices are saved, so a gateway crash loses at most this much.
+LAST_SEEN_SAVE_SECONDS = 60.0
 _MAX_ERROR_TEXT = 2000
 _INFO_KEYS = ("hostname", "platform", "agent_version", "python")
 _RESERVED_AUDIT_KEYS = frozenset({"request_id", "tool", "device", "client", "event", "ts", "route"})
@@ -190,7 +194,11 @@ class AgentHub:
         self.takeover_probe_seconds = takeover_probe_seconds
         self._connections: dict[str, AgentConnection] = {}
         self._admitting: dict[str, asyncio.Lock] = {}
-        self._last_seen_wall: dict[str, float] = {}
+        # When each device last sent anything (a heartbeat at least every heartbeat_seconds). Kept in a file
+        # next to the registry so an offline device's last contact survives a gateway restart.
+        self.last_seen_path = registry.path.with_name(registry.path.stem + ".last_seen.json")
+        self._last_seen_wall: dict[str, float] = self._load_last_seen()
+        self._last_seen_saved = time.monotonic()
         self._server: Server | None = None
         self._monitor_task: asyncio.Task[None] | None = None
         self._background: set[asyncio.Task[None]] = set()
@@ -221,6 +229,7 @@ class AgentHub:
             self._monitor_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._monitor_task
+        self._save_last_seen()
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -577,6 +586,7 @@ class AgentHub:
             if not pending.future.done():
                 pending.future.set_exception(DeviceUnavailable(f"Device '{conn.device.name}' disconnected."))
         self._log("device_disconnected", device=conn.device.name, device_id=conn.device.device_id, reason=reason)
+        self._save_last_seen()
 
     def add_tools_listener(self, listener: Callable[[], None]) -> None:
         """Call ``listener`` whenever the set of tools offered by connected devices changes."""
@@ -610,6 +620,39 @@ class AgentHub:
                     print(f"[computer] device monitor: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
             else:
                 problem = None
+            if self._connections and time.monotonic() - self._last_seen_saved >= LAST_SEEN_SAVE_SECONDS:
+                self._save_last_seen()
+
+    # ------------------------------------------------------- last seen
+
+    def _load_last_seen(self) -> dict[str, float]:
+        try:
+            data = json.loads(self.last_seen_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as exc:
+            print(f"[computer] ignoring unreadable {self.last_seen_path}: {exc}", file=sys.stderr, flush=True)
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {
+            str(k): float(v)
+            for k, v in data.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0
+        }
+
+    def _save_last_seen(self) -> None:
+        """Best effort: a full disk or read-only state directory must never break the hub."""
+        self._last_seen_saved = time.monotonic()
+        tmp = self.last_seen_path.with_name(f".{self.last_seen_path.name}.{os.getpid()}.tmp")
+        try:
+            tmp.write_text(json.dumps(self._last_seen_wall, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.last_seen_path)
+        except OSError as exc:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+            print(f"[computer] could not save {self.last_seen_path}: {exc}", file=sys.stderr, flush=True)
 
     def _check_connections(self) -> None:
         """Drop connections whose device was revoked or stopped sending heartbeats."""
