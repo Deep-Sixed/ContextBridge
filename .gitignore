@@ -11,3 +11,6 @@ data/
 *.key
 *.pem
 state/
+# Machine-specific agent config written by scripts/bootstrap-agent.ps1, beside the shipped example.
+configs/*.local.yaml
+configs/*.local.yaml.bak
