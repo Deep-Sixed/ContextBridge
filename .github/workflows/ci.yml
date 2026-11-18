@@ -17,10 +17,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python: ["3.11", "3.13"]
+        # 3.14 and 3.15 are what the deployed agents run (friday and thanatos on 3.14, the P70 on 3.15).
+        python: ["3.11", "3.13", "3.14", "3.15"]
         include:
           # Oldest supported Python with the lower bound of the fastmcp pin;
-          # 3.13 gets whatever fastmcp 3.x the pin resolves to.
+          # the newer versions get whatever fastmcp 3.x the pin resolves to.
           - python: "3.11"
             fastmcp: "3.0.0"
     steps:
