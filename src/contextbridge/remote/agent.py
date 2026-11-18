@@ -743,12 +743,14 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "activate":
         if not args.server:
             raise SystemExit("activate needs --server (the gateway's https address) or CONTEXTBRIDGE_SERVER")
+        import httpx
+
         try:
             identity = asyncio.run(activate(config, args.server, notify=lambda text: print(text, flush=True)))
         except (FatalAgentError, AgentError) as exc:
             raise SystemExit(f"activation failed: {exc}") from None
-        except (OSError, TimeoutError) as exc:
-            raise SystemExit(f"could not reach {args.server}: {exc}") from None
+        except (OSError, TimeoutError, httpx.HTTPError) as exc:
+            raise SystemExit(f"could not reach {args.server}: {type(exc).__name__}: {exc}") from None
         except KeyboardInterrupt:
             raise SystemExit("activation cancelled") from None
         print(f"[agent] activated as {identity.name} ({identity.device_id}); identity saved to {config.identity_path}")

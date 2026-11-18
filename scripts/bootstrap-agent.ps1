@@ -4,9 +4,15 @@
     the scheduled task.
 
 .DESCRIPTION
-    Run it in an elevated PowerShell on the new machine after creating a pairing code on the gateway host:
+    Run it in an elevated PowerShell on the new machine. Either pass -Server, the gateway's public https address,
+    and approve the device in a browser when it shows a code (activation, no pairing code needed), or create a
+    pairing code on the gateway host first and pass it with -Code:
 
         cb-admin pair <name>          # on the gateway; prints a one-time code (15 minutes by default)
+
+    The gateway serves a wrapper that runs this script with its own addresses filled in:
+
+        irm '<server>/install/remote-windows.ps1' | iex
 
     The script then:
       1. installs Python 3.11+ and Git with winget if they are missing (skip with -SkipPrerequisites);
@@ -16,7 +22,7 @@
          -ForceConfig). The repository ships configs\agent.yaml as an example, so the machine's own config lives
          beside it under a name git ignores, and upgrades never collide with it. An older install's
          configs\agent.yaml, written before this change, is moved there and the example restored;
-      5. enrolls the device with -Code, unless it is already enrolled;
+      5. enrolls the device with -Code, or by browser approval at -Server/activate, unless it is already enrolled;
       6. registers and starts the scheduled task with install-agent.ps1 (-AtLogOn and -Elevated pass through). On a
          machine that already has the task, its start trigger and run level are kept unless you pass one of
          -AtLogOn / -AtStartup (start at sign-in / at boot) or -Elevated / -NoElevation (administrator /
@@ -39,6 +45,8 @@
         & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Deep-Sixed/ContextBridge/main/scripts/bootstrap-agent.ps1))) -GatewayUrl wss://agents.example.com -Code ABCD-EFGH-IJKL-MNOP
 
 .EXAMPLE
+    .\scripts\bootstrap-agent.ps1 -GatewayUrl wss://agents.example.com -Server https://mcp.example.com
+.EXAMPLE
     .\scripts\bootstrap-agent.ps1 -GatewayUrl wss://agents.example.com -Code ABCD-EFGH-IJKL-MNOP
 .EXAMPLE
     .\scripts\bootstrap-agent.ps1 -GatewayUrl wss://agents.example.com -Code ABCD-EFGH-IJKL-MNOP -Name p70 -Policy Full -AtLogOn
@@ -53,6 +61,7 @@
 param(
     [string]$GatewayUrl = '',
     [string]$Code = '',
+    [string]$Server = '',
     [string]$Name = '',
     [ValidateSet('ReadOnly', 'Full')]
     [string]$Policy = 'ReadOnly',
@@ -259,11 +268,15 @@ if ($writeConfig) {
 } else {
     $Name = $existing.Name
 }
-if (-not $enrolled -and -not $Code -and -not $DryRun) {
+if ($Server -and $Server -notmatch '^https://[^/\s]+/?$') {
+    throw "Pass -Server as the gateway's https address (https://host), not '$Server'."
+}
+$Server = $Server.TrimEnd('/')
+if (-not $enrolled -and -not $Code -and -not $Server -and -not $DryRun) {
     $Code = (Read-Host "One-time code from 'cb-admin pair $Name'").Trim()
 }
-if (-not $enrolled -and -not $Code -and -not $DryRun) {
-    throw "A pairing code is needed to enroll. On the gateway host run: cb-admin pair $Name"
+if (-not $enrolled -and -not $Code -and -not $Server -and -not $DryRun) {
+    throw "A pairing code is needed to enroll. On the gateway host run: cb-admin pair $Name (or pass -Server to approve this device in a browser)"
 }
 
 # A re-run keeps how the existing task starts and with which token, unless the caller says otherwise. Dropping
@@ -294,7 +307,7 @@ if ($DryRun) {
         RepoUrl       = $RepoUrl
         Migrate       = if ($migrateConfig) { "move $legacyConfigPath to $configPath and restore the example" } else { 'none' }
         Config        = if ($writeConfig) { "write $configPath ($Policy preset)" } else { "keep $configPath" }
-        Enroll        = if ($enrolled) { "already enrolled ($identityPath)" } else { "enroll as '$Name'" }
+        Enroll        = if ($enrolled) { "already enrolled ($identityPath)" } elseif ($Code -or -not $Server) { "enroll as '$Name'" } else { "activate '$Name' by browser approval at $Server/activate" }
         TaskName      = $TaskName
         Trigger       = $(if ($AtLogOn) { 'AtLogOn' } else { 'AtStartup' }) + $(if ($triggerKept) { ' (kept from the existing task)' } else { '' })
         RunLevel      = $(if ($Elevated) { 'Highest' } else { 'Limited' }) + $(if ($runLevelKept) { ' (kept from the existing task)' } else { '' })
@@ -401,9 +414,12 @@ try {
     # 5. Enrollment
     if ($enrolled) {
         Write-Step 'Already enrolled; keeping the device identity'
-    } else {
+    } elseif ($Code) {
         Write-Step 'Enrolling with the gateway'
         Invoke-Native 'enroll' { & $venvPython -m contextbridge.remote.agent enroll --config $configPath --code $Code }
+    } else {
+        Write-Step 'Activating this device: approve it in a browser'
+        Invoke-Native 'activate' { & $venvPython -m contextbridge.remote.agent activate --config $configPath --server $Server }
     }
 
     # 6. Scheduled task
