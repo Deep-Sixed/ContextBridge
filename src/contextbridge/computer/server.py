@@ -1376,7 +1376,15 @@ def main(argv: list[str] | None = None) -> None:
                 f"{config_path}: remote is enabled but no owner credentials exist (fail closed). Run:\n"
                 f"  contextbridge-admin --config {config_path} owner-init"
             )
-        remote_server = create_remote_server(router, audit=audit, settings=remote.settings(), store=store, name=name)
+        remote_server = create_remote_server(
+            router,
+            audit=audit,
+            settings=remote.settings(),
+            store=store,
+            name=name,
+            registry=hub.registry if hub is not None else None,
+            agents_url=listener.public_url if listener is not None else None,
+        )
     for srv in (server, remote_server):
         advertised = advertised_tool_names(srv) if srv is not None else SERVER_TOOLS
         if advertised != SERVER_TOOLS:

@@ -238,16 +238,49 @@ class DeviceRegistry:
             pending = state["enrollments"].pop(match)
             if any(d["public_key"] == public_key for d in state["devices"].values()):
                 raise EnrollmentRejected("this device key is already enrolled")
-            record = DeviceRecord(
-                device_id="dev_" + secrets.token_hex(8),
-                name=pending["name"],
-                public_key=public_key,
-                scopes=pending["scopes"],
-                created_at=_iso(_now()),
-                info=dict(info or {}),
-            )
-            state["devices"][record.device_id] = asdict(record)
+            return self._add_device(state, pending["name"], public_key, pending["scopes"], info)
+
+    def register(
+        self, name: str, public_key: str, scopes: list[str], info: dict[str, Any] | None = None
+    ) -> DeviceRecord:
+        """Enroll a device the owner approved in the browser (activation), without a one-time code."""
+        validate_name(name)
+        load_public_key(public_key)
+        if not scopes:
+            raise RegistryError("a device needs at least one scope")
+        with self._locked() as state:
+            self._prune(state)
+            if any(d["name"] == name and d["revoked_at"] is None for d in state["devices"].values()):
+                raise RegistryError(f"a device named {name!r} is already enrolled; revoke it first")
+            if any(e["name"] == name for e in state["enrollments"].values()):
+                raise RegistryError(f"an enrollment for {name!r} is already pending")
+            if any(d["public_key"] == public_key for d in state["devices"].values()):
+                raise RegistryError("this device key is already enrolled")
+            return self._add_device(state, name, public_key, list(scopes), info)
+
+    @staticmethod
+    def _add_device(
+        state: dict[str, Any], name: str, public_key: str, scopes: list[str], info: dict[str, Any] | None
+    ) -> DeviceRecord:
+        record = DeviceRecord(
+            device_id="dev_" + secrets.token_hex(8),
+            name=name,
+            public_key=public_key,
+            scopes=scopes,
+            created_at=_iso(_now()),
+            info=dict(info or {}),
+        )
+        state["devices"][record.device_id] = asdict(record)
         return record
+
+    def name_taken(self, name: str) -> bool:
+        """Whether an active device or a pending enrollment already uses ``name``."""
+        self.refresh()
+        state = self.state
+        now = _now()
+        return any(d["name"] == name and d["revoked_at"] is None for d in state["devices"].values()) or any(
+            e["name"] == name and e["expires_at"] > now for e in state["enrollments"].values()
+        )
 
     def revoke(self, name_or_id: str) -> str:
         """Revoke an active device, or cancel a pending enrollment. Returns what was revoked."""

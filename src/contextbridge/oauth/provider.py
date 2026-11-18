@@ -136,6 +136,8 @@ class ContextBridgeOAuthProvider(OAuthProvider):
         self.audit = audit
         self._offered_devices = offered_devices
         self._pending: dict[str, _Pending] = {}
+        # More pages served beside consent (device activation), added by create_remote_server.
+        self.extra_routes: list[Route] = []
 
     # ------------------------------------------------------------ helpers
 
@@ -241,6 +243,7 @@ class ContextBridgeOAuthProvider(OAuthProvider):
     def get_routes(self, mcp_path: str | None = None) -> list[Route]:
         routes = super().get_routes(mcp_path)
         routes.append(Route("/consent", self._consent, methods=["GET", "POST"]))
+        routes.extend(self.extra_routes)
         return routes
 
     async def _consent(self, request: Request) -> Response:
@@ -322,11 +325,11 @@ class ContextBridgeOAuthProvider(OAuthProvider):
             f"{html.escape(SCOPE_DESCRIPTIONS[s])}</label>"
             for s in self._grantable(pending)
         ) or "<p>None of the permissions this client registered for are allowed remotely.</p>"
-        offered = self.offered_devices()
+        # No device starts checked, not even when only one is offered: each device is a deliberate tick,
+        # so a grant never reaches a computer the owner did not choose for this client.
         device_rows = "".join(
-            f'<label><input type="checkbox" name="device" value="{html.escape(d)}"'
-            f'{" checked" if len(offered) == 1 else ""}> {html.escape(d)}</label>'
-            for d in offered
+            f'<label><input type="checkbox" name="device" value="{html.escape(d)}"> {html.escape(d)}</label>'
+            for d in self.offered_devices()
         ) or "<p>No devices are available to remote clients.</p>"
         redirect_host = urlsplit(str(pending.params.redirect_uri)).netloc
         body = f"""
@@ -476,6 +479,8 @@ label{display:block;margin:.4rem 0}
 input[type=password],input[name=totp]{display:block;width:100%;padding:.4rem;font-size:1rem}
 button{font-size:1rem;padding:.5rem 1.2rem;margin-right:.5rem}
 .error{color:#b00020;font-weight:600}.small{color:#666;font-size:.85rem}
+table{border-collapse:collapse;margin:1rem 0}th,td{text-align:left;padding:.2rem .8rem .2rem 0;vertical-align:top}
+input[name=user_code]{display:block;width:100%;padding:.4rem;font-size:1.4rem;letter-spacing:.15em;text-transform:uppercase}
 """
 
 
