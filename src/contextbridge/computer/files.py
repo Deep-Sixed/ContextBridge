@@ -565,6 +565,16 @@ def create_directory(policy: ComputerPolicy, path: str) -> dict[str, Any]:
     return {"path": str(resolved), "created": created}
 
 
+def _refuse_untouchable_inside(policy: ComputerPolicy, folder: Path, raw: str) -> None:
+    """Refuse to move a folder holding anything the file tools may not touch, as delete_file does."""
+    for dirpath, dirnames, filenames in os.walk(folder, followlinks=False):
+        for name in (*dirnames, *filenames):
+            child = Path(dirpath) / name
+            if policy.is_untouchable(child):
+                rel = child.relative_to(folder)
+                raise PolicyViolation(f"{raw} contains {rel}, which ContextBridge may not touch; nothing was moved.")
+
+
 def move_file(policy: ComputerPolicy, source: str, destination: str) -> dict[str, Any]:
     src = policy.resolve(source, write=True, follow_symlinks=False)
     dst = policy.resolve(destination, write=True, follow_symlinks=False)
@@ -576,6 +586,8 @@ def move_file(policy: ComputerPolicy, source: str, destination: str) -> dict[str
     _require_parent(dst, destination)
     if src.is_dir() and not src.is_symlink() and dst.is_relative_to(src):
         raise FileOperationError("Cannot move a directory into itself.")
+    if src.is_dir() and not src.is_symlink():
+        _refuse_untouchable_inside(policy, src, source)
     mark_started(source=str(src), destination=str(dst))
     shutil.move(str(src), str(dst))
     return {"source": str(src), "destination": str(dst)}

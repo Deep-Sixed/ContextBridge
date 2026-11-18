@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -387,3 +388,69 @@ def test_a_finished_session_leaves_no_background_program(policy):
 
 def test_allowlist_names_this_interpreter(policy):
     assert PY in policy.command_allow
+
+
+def test_list_processes_hides_arguments_unless_the_policy_allows_them():
+    # A secret passed as an argument (an enrollment code, a token) must not be readable, or probeable through
+    # the name filter, by a client that only has read access.
+    secret = "cb-secret-" + os.urandom(6).hex()
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", secret])
+    try:
+        hidden = commands.list_processes(limit=1000)
+        mine = next(p for p in hidden["processes"] if p["pid"] == child.pid)
+        assert secret not in mine["cmdline"] and mine["cmdline"]  # the program is still shown
+        assert "note" in hidden
+        assert commands.list_processes(name_filter=secret)["matched"] == 0
+        shown = commands.list_processes(name_filter=secret, command_lines=True)
+        assert [p["pid"] for p in shown["processes"]] == [child.pid]
+        assert secret in shown["processes"][0]["cmdline"]
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_process_command_lines_are_off_by_default_and_opt_in(make_policy):
+    assert make_policy().process_command_lines is False
+    assert make_policy(processes={"list": True, "command_lines": True}).process_command_lines is True
+
+
+def test_input_to_a_program_that_never_reads_it_times_out_instead_of_blocking(policy, monkeypatch):
+    # More input than a pipe holds, to a program that never reads stdin: the write would otherwise hold
+    # this worker thread until the session's lifetime ran out.
+    monkeypatch.setattr(commands, "_INPUT_WRITE_SECONDS", 1.0)
+    sessions = SessionManager(policy)
+    sid = sessions.start(python_cmd("import time; time.sleep(30)"), wait_seconds=0)["session_id"]
+    try:
+        started = time.monotonic()
+        with pytest.raises(CommandError, match="not reading its input"):
+            sessions.send(sid, "x" * (512 * 1024), newline=False)
+        assert time.monotonic() - started < 10
+        with pytest.raises(CommandError, match="has not read the input sent earlier"):
+            sessions.send(sid, "more")
+    finally:
+        sessions.shutdown()
+
+
+def test_input_larger_than_the_write_limit_is_refused(make_policy):
+    policy = make_policy(filesystem={"max_write_bytes": 1024})
+    sessions = SessionManager(policy)
+    sid = sessions.start(python_cmd("import sys; sys.stdin.read()"), wait_seconds=0)["session_id"]
+    try:
+        with pytest.raises(CommandError, match="at most 1024"):
+            sessions.send(sid, "y" * 2048)
+    finally:
+        sessions.shutdown()
+
+
+def test_a_finished_session_closes_its_input_pipe(policy):
+    sessions = SessionManager(policy)
+    sid = sessions.start(python_cmd("print('bye')"), wait_seconds=0)["session_id"]
+    try:
+        session = sessions._get(sid)
+        session.proc.wait(timeout=10)
+        deadline = time.monotonic() + 5
+        while not session.proc.stdin.closed and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert session.proc.stdin.closed
+    finally:
+        sessions.shutdown()

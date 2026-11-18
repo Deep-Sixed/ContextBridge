@@ -466,3 +466,18 @@ def test_searches_refuse_a_negative_result_limit(policy):
     for search in (files.search_files, files.search_code):
         with pytest.raises(FileOperationError, match="max_results"):
             search(policy, ".", "a", max_results=-1)
+
+
+def test_move_refuses_a_folder_holding_a_denied_file(make_policy, workspace):
+    # delete_file already refuses such a folder; move_file must not relocate what it may not touch either.
+    project = workspace / "work" / "project"
+    (project / "keys").mkdir(parents=True)
+    (project / "keys" / ".env").write_text("SECRET=1\n", encoding="utf-8")
+    (project / "app.py").write_text("print(1)\n", encoding="utf-8")
+    policy = make_policy()
+    with pytest.raises(PolicyViolation, match=r"contains keys[/\\]\.env"):
+        files.move_file(policy, "work/project", "work/elsewhere")
+    assert (project / "keys" / ".env").exists() and not (workspace / "work" / "elsewhere").exists()
+    (project / "keys" / ".env").unlink()
+    files.move_file(policy, "work/project", "work/elsewhere")  # without it the move goes through
+    assert (workspace / "work" / "elsewhere" / "app.py").exists()

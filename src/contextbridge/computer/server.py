@@ -994,8 +994,9 @@ def create_computer_server(
     async def list_processes(
         name_filter: str | None = None, limit: int = 200, device: str = LOCAL_DEVICE
     ) -> dict[str, Any]:
-        """List running processes with PID, parent, name, user, memory, and command line, optionally
-        filtered by a substring of the name or command line. Use it to find a PID for kill_process."""
+        """List running processes with PID, parent, name, user, memory, and program, optionally
+        filtered by a substring of the name or program. Arguments appear only where the device's
+        policy allows them. Use it to find a PID for kill_process."""
         return await run(device, "list_processes", {"name_filter": name_filter, "limit": limit})
 
     @server.tool(annotations=_WRITE)
@@ -1461,6 +1462,10 @@ def main(argv: list[str] | None = None) -> None:
             if hub is not None:
                 with contextlib.suppress(Exception):
                     await hub.close()
+            # End the local device's background programs with the gateway, as an agent does on exit.
+            if router.local is not None and router.local.sessions is not None:
+                with contextlib.suppress(Exception):
+                    router.local.sessions.shutdown()
             if federation is not None:
                 federation.close()
 

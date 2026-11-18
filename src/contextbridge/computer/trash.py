@@ -161,8 +161,13 @@ def _manifests(policy: ComputerPolicy) -> list[tuple[Path, dict[str, Any]]]:
             if not isinstance(record, dict) or not isinstance(record.get("original_path"), str):
                 continue
             # The filesystem route's manifests carry less: derive what they leave out.
-            record = {"trash_id": manifest.stem, "name": Path(record["original_path"]).name, **record}
-            if os.path.lexists(trash / manifest.stem / record["name"]):
+            # The item's name always comes from its original path, never from the manifest's own fields:
+            # a manifest edited outside ContextBridge must not point restore at a file elsewhere.
+            name = Path(record["original_path"]).name
+            if name in ("", ".", ".."):
+                continue
+            record = {**record, "trash_id": manifest.stem, "name": name}
+            if os.path.lexists(trash / manifest.stem / name):
                 found.append((trash, record))
     return found
 
@@ -199,6 +204,8 @@ def restore_deleted(policy: ComputerPolicy, trash_id: str) -> dict[str, Any]:
     if not destination.parent.is_dir():
         raise FileOperationError(f"The folder {destination.parent} no longer exists; create or restore it first.")
     item = trash / trash_id / str(record["name"])
+    if item.parent != trash / trash_id:  # one component inside this trash entry, nothing else
+        raise FileOperationError(f"Trash entry {trash_id} is damaged; it cannot be restored.")
     mark_started(path=str(destination), trash_id=trash_id)
     shutil.move(str(item), str(destination))
     (trash / f"{trash_id}.json").unlink(missing_ok=True)

@@ -175,3 +175,19 @@ def test_bad_delete_mode_is_a_config_error():
 
     with pytest.raises(PolicyError, match="filesystem.delete"):
         load_policy({"filesystem": {"roots": ["."], "delete": "shred"}})
+
+
+def test_restore_ignores_a_name_planted_in_the_manifest(make_policy, work):
+    # A manifest edited outside ContextBridge must not turn restore into a way to move a denied file out.
+    (work / ".env").write_bytes(b"SECRET=1\n")
+    policy = make_policy()
+    result = delete_file(policy, "work/notes.txt")
+    manifest = work / TRASH_DIRNAME / f"{result['trash_id']}.json"
+    record = json.loads(manifest.read_text(encoding="utf-8"))
+    record["name"] = "../../.env"
+    manifest.write_text(json.dumps(record), encoding="utf-8")
+
+    assert [i["trash_id"] for i in list_deleted(policy)["items"]] == [result["trash_id"]]
+    restore_deleted(policy, result["trash_id"])
+    assert (work / "notes.txt").read_bytes() == b"keep me\n"  # the trashed file came back, not .env
+    assert (work / ".env").read_bytes() == b"SECRET=1\n"

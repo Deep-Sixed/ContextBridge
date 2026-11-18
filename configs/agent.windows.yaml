@@ -37,6 +37,7 @@ commands:
 
 processes:
   list: true
+  command_lines: false    # true shows each process's arguments, which often hold tokens or passwords
   allow_kill: false        # critical Windows processes (lsass, csrss, winlogon, ...) are refused regardless
 
 # Phase 2: window titles can reveal sensitive information. Disabled unless opted in.

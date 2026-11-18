@@ -108,7 +108,7 @@ The computer route serves files, search, commands, processes, and documents on t
 | `read_document` | always (read-only) |
 | `write_document`, `edit_document`, `write_spreadsheet`, `edit_pdf` | `filesystem.writable_roots` is non-empty |
 | `run_command`, `start_process`, `read_process_output`, `interact_with_process`, `force_terminate`, `list_sessions` | `commands.mode` is not `disabled` |
-| `list_processes` | `processes.list: true` |
+| `list_processes` | `processes.list: true`. It shows each process's program, not its arguments, unless `processes.command_lines: true`: arguments often carry tokens or passwords, and this tool needs only read access |
 | `kill_process` | `processes.allow_kill: true` |
 | `list_windows` | `desktop.observe: true` (see [Desktop and media inventory](#desktop-and-media-inventory)) |
 | `media_inventory` | `media.discover: true` |
@@ -364,6 +364,8 @@ Run it on the device itself, as the user the agent runs as. It needs no gateway 
 contextbridge-doctor            # finds the agent's scheduled task or systemd unit, and the config it uses
 contextbridge-doctor --json     # the same findings, machine-readable
 ```
+
+On Windows with Smart App Control (or another application control policy), the `contextbridge-doctor.exe` launcher pip creates is unsigned and may be blocked. Run it through the venv's Python instead, which is signed: `.venv\Scripts\python.exe -m contextbridge.doctor`.
 
 Each finding is `ok`, `info`, `WARN` or `FAIL`, and every problem comes with the command or step that fixes it. It checks:
 

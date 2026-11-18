@@ -10,6 +10,7 @@ POSIX everything that stayed in its process group.
 
 from __future__ import annotations
 
+import contextlib
 import itertools
 import os
 import subprocess
@@ -32,6 +33,9 @@ _READ_CHUNK = 65536
 _MAX_WAIT_SECONDS = 30.0
 _JOIN_SECONDS = 5.0
 _SESSION_DRAIN_SECONDS = 0.5
+# How long send_input waits for a program to take its input. A program that does not read stdin
+# fills the pipe, and the write would otherwise hold a worker thread until the session expires.
+_INPUT_WRITE_SECONDS = 10.0
 # Output that has stopped arriving for this long is settled: start_process and
 # interact_with_process return it, and a question at its end counts as a prompt.
 _SETTLE_SECONDS = 0.3
@@ -199,6 +203,8 @@ class _Session:
         # The lifetime timer, set by SessionManager.start; cancelled once the process exits.
         self.watchdog: threading.Timer | None = None
         self.changed = threading.Condition()
+        self.writer: threading.Thread | None = None  # an input write still waiting for the program to read
+        self.input_lock = threading.Lock()
         self.reader = threading.Thread(target=_pump, args=(proc.stdout, self._append), daemon=True)
         self.reader.start()
         self._on_exit = on_exit
@@ -206,6 +212,9 @@ class _Session:
 
     def _wait_for_exit(self) -> None:
         self.proc.wait()
+        if self.proc.stdin is not None:  # the program is gone; keep no pipe open for a finished session
+            with contextlib.suppress(OSError, ValueError):
+                self.proc.stdin.close()
         if self.watchdog is not None:
             self.watchdog.cancel()
         # Before draining: a background child left running would hold the output pipe open.
@@ -390,13 +399,37 @@ class SessionManager:
             raise CommandError(f"Session {session_id} is no longer running.")
         line_end = "\r\n" if IS_WINDOWS else "\n"
         payload = (text + (line_end if newline else "")).encode("utf-8")
-        mark_started(session_id=session_id, pid=session.proc.pid, input_bytes=len(payload))
-        answer_from = session.before_input()
-        try:
-            session.proc.stdin.write(payload)
-            session.proc.stdin.flush()
-        except (BrokenPipeError, OSError, ValueError):
-            raise CommandError(f"Session {session_id} is not accepting input.") from None
+        if len(payload) > self._policy.max_write_bytes:
+            raise CommandError(
+                f"Input is {len(payload)} bytes; at most {self._policy.max_write_bytes} can be sent at once."
+            )
+        stdin = session.proc.stdin
+        failed: list[BaseException] = []
+
+        def deliver() -> None:
+            try:
+                stdin.write(payload)
+                stdin.flush()
+            except (BrokenPipeError, OSError, ValueError) as exc:
+                failed.append(exc)
+
+        with session.input_lock:  # one write in flight per session, so input never interleaves
+            if session.writer is not None and session.writer.is_alive():
+                raise CommandError(
+                    f"Session {session_id} has not read the input sent earlier; send more once it does."
+                )
+            mark_started(session_id=session_id, pid=session.proc.pid, input_bytes=len(payload))
+            answer_from = session.before_input()
+            writer = session.writer = threading.Thread(target=deliver, daemon=True, name=f"session-{session_id}-input")
+            writer.start()
+        writer.join(_INPUT_WRITE_SECONDS)
+        if writer.is_alive():
+            raise CommandError(
+                f"Session {session_id} is not reading its input: it was not taken within "
+                f"{_INPUT_WRITE_SECONDS:.0f} seconds. It is delivered if the program reads it later."
+            )
+        if failed:
+            raise CommandError(f"Session {session_id} is not accepting input.")
         return session.read(wait_seconds, answer_from=answer_from, lines_sent=payload.count(b"\n"))
 
     def terminate(self, session_id: str) -> dict[str, Any]:
@@ -427,7 +460,11 @@ class SessionManager:
 # ---------------------------------------------------------------- processes
 
 
-def list_processes(*, name_filter: str | None = None, limit: int = 200) -> dict[str, Any]:
+def list_processes(*, name_filter: str | None = None, limit: int = 200, command_lines: bool = False) -> dict[str, Any]:
+    """List processes. Without ``command_lines`` only each program is shown, never its arguments.
+
+    The filter then matches the name and program only, so arguments cannot be probed by filtering on guesses.
+    """
     needle = (name_filter or "").casefold()
     mark_started(name_filter=name_filter)
     rows: list[dict[str, Any]] = []
@@ -435,7 +472,8 @@ def list_processes(*, name_filter: str | None = None, limit: int = 200) -> dict[
     total = 0
     for proc in psutil.process_iter(attrs):
         info = proc.info
-        cmdline = " ".join(info.get("cmdline") or [])
+        argv = info.get("cmdline") or []
+        cmdline = " ".join(argv) if command_lines else (argv[0] if argv else "")
         name = info.get("name") or ""
         if needle and needle not in name.casefold() and needle not in cmdline.casefold():
             continue
@@ -455,7 +493,10 @@ def list_processes(*, name_filter: str | None = None, limit: int = 200) -> dict[
                 "cmdline": cmdline[:300],
             }
         )
-    return {"processes": rows, "matched": total, "truncated": total > len(rows)}
+    result: dict[str, Any] = {"processes": rows, "matched": total, "truncated": total > len(rows)}
+    if not command_lines:
+        result["note"] = "Arguments are hidden; cmdline shows each program only (processes.command_lines enables them)."
+    return result
 
 
 def kill_process(pid: int, *, force: bool = False) -> dict[str, Any]:
