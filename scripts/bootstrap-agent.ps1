@@ -19,6 +19,8 @@
 
     Running it again on an enrolled machine upgrades it in place: the task is stopped, the code moves to -Revision,
     the package is reinstalled, and the task is registered and started again. The config and identity are kept.
+    With -ForceConfig it rewrites the config from -Policy, keeping the existing device name and gateway URL unless
+    -GatewayUrl is passed; -Name must then match the enrolled name, or be left out.
 
     The device name defaults to this computer's name in lower case. It must match the name given to `pair`.
 
@@ -36,6 +38,8 @@
     .\scripts\bootstrap-agent.ps1 -GatewayUrl wss://agents.example.com -Code ABCD-EFGH-IJKL-MNOP -Name p70 -Policy Full -AtLogOn
 .EXAMPLE
     .\scripts\bootstrap-agent.ps1 -Revision 15db8a1      # upgrade an enrolled machine to that revision
+.EXAMPLE
+    .\scripts\bootstrap-agent.ps1 -Policy Full -ForceConfig   # switch an enrolled machine's policy, same name and gateway
 .EXAMPLE
     .\scripts\bootstrap-agent.ps1 -GatewayUrl wss://agents.example.com -DryRun
 #>
@@ -109,6 +113,21 @@ function Install-WithWinget([string]$Id, [string]$Label) {
         winget.exe install --exact --id $Id --silent --accept-package-agreements --accept-source-agreements
     }
     Update-PathFromRegistry
+}
+
+function Read-ExistingConfig([string]$Path) {
+    # The device name and gateway URL of an existing agent.yaml, read line by line (no YAML parser is at hand
+    # before the package is installed). Missing values come back empty.
+    $result = @{ Name = ''; GatewayUrl = '' }
+    if (-not (Test-Path -LiteralPath $Path)) { return $result }
+    $inGateway = $false
+    foreach ($line in (Get-Content -LiteralPath $Path)) {
+        if ($line -match '^\s*(#|$)') { continue }
+        if ($line -match '^name:\s*(\S+)') { $result.Name = $Matches[1].Trim('"', "'") }
+        if ($line -match '^\S') { $inGateway = $line -match '^gateway:\s*(#.*)?$' ; continue }
+        if ($inGateway -and $line -match '^\s+url:\s*(\S+)') { $result.GatewayUrl = $Matches[1].Trim('"', "'") }
+    }
+    return $result
 }
 
 function ConvertTo-DeviceName([string]$Raw) {
@@ -191,12 +210,19 @@ $configExists = Test-Path -LiteralPath $configPath
 $enrolled = Test-Path -LiteralPath $identityPath
 $writeConfig = $ForceConfig -or -not $configExists
 
-# Only a new config needs a name and a gateway URL; an existing one already has both.
+$existing = Read-ExistingConfig $configPath
+
+# Only a new config needs a name and a gateway URL; an existing one already has both, and a rewrite keeps them.
 if ($writeConfig) {
+    if ($enrolled -and $existing.Name -and $Name -and $Name -ne $existing.Name) {
+        throw "This machine is enrolled as '$($existing.Name)', so the config must keep that name; leave out -Name. To rename it, revoke '$($existing.Name)' on the gateway, delete $identityPath, and enroll again."
+    }
+    if (-not $Name) { $Name = $existing.Name }
     if (-not $Name) { $Name = ConvertTo-DeviceName $env:COMPUTERNAME }
     if ($Name -notmatch '^[a-z0-9][a-z0-9-]{0,62}$' -or @('local', 'all', 'gateway') -contains $Name) {
         throw "Device name '$Name' is not valid: use 1-63 lowercase letters, digits or '-', not local, all or gateway. Pass -Name."
     }
+    if (-not $GatewayUrl) { $GatewayUrl = $existing.GatewayUrl }
     if (-not $GatewayUrl) {
         if ($DryRun) { $GatewayUrl = 'wss://agents.example.com' }
         else { $GatewayUrl = (Read-Host 'Gateway agent URL (the wss:// address `cb-admin pair` printed)').Trim() }
@@ -205,8 +231,7 @@ if ($writeConfig) {
         throw "Pass -GatewayUrl as wss://host (the address `cb-admin pair` printed), not '$GatewayUrl'."
     }
 } else {
-    $match = Select-String -LiteralPath $configPath -Pattern '^name:\s*(\S+)' | Select-Object -First 1
-    if ($match) { $Name = $match.Matches[0].Groups[1].Value.Trim('"', "'") }
+    $Name = $existing.Name
 }
 if (-not $enrolled -and -not $Code -and -not $DryRun) {
     $Code = (Read-Host "One-time code from 'cb-admin pair $Name'").Trim()
