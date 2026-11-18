@@ -18,8 +18,9 @@
          configs\agent.yaml, written before this change, is moved there and the example restored;
       5. enrolls the device with -Code, unless it is already enrolled;
       6. registers and starts the scheduled task with install-agent.ps1 (-AtLogOn and -Elevated pass through). On a
-         machine that already has the task, its start trigger and run level are kept unless you pass them:
-         -AtLogOn:$false switches to starting at boot, -Elevated:$false back to a standard token;
+         machine that already has the task, its start trigger and run level are kept unless you pass one of
+         -AtLogOn / -AtStartup (start at sign-in / at boot) or -Elevated / -NoElevation (administrator /
+         standard token);
       7. waits for the agent to report that it connected to the gateway.
 
     Running it again on an enrolled machine upgrades it in place: the task is stopped, the code moves to -Revision,
@@ -60,7 +61,9 @@ param(
     [string]$RepoUrl = 'https://github.com/Deep-Sixed/ContextBridge',
     [string]$TaskName = 'ContextBridge Agent',
     [switch]$AtLogOn,
+    [switch]$AtStartup,
     [switch]$Elevated,
+    [switch]$NoElevation,
     [switch]$ForceConfig,
     [switch]$SkipPrerequisites,
     [switch]$DryRun
@@ -265,15 +268,20 @@ if (-not $enrolled -and -not $Code -and -not $DryRun) {
 
 # A re-run keeps how the existing task starts and with which token, unless the caller says otherwise. Dropping
 # -AtLogOn silently would move an at-sign-in agent to a boot task with no desktop session.
+# Explicit switches, not -AtLogOn:$false: `powershell -File` passes "$false" as text, which a switch rejects.
+if ($AtLogOn -and $AtStartup) { throw 'Pass -AtLogOn or -AtStartup, not both.' }
+if ($Elevated -and $NoElevation) { throw 'Pass -Elevated or -NoElevation, not both.' }
 $existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-if ($existingTask) {
-    if (-not $PSBoundParameters.ContainsKey('AtLogOn')) {
-        $AtLogOn = [bool]($existingTask.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' })
-    }
-    if (-not $PSBoundParameters.ContainsKey('Elevated')) {
-        $Elevated = ($existingTask.Principal.RunLevel -eq 'Highest')
-    }
+$triggerKept = $existingTask -and -not ($PSBoundParameters.ContainsKey('AtLogOn') -or $AtStartup)
+$runLevelKept = $existingTask -and -not ($PSBoundParameters.ContainsKey('Elevated') -or $NoElevation)
+if ($triggerKept) {
+    $AtLogOn = [bool]($existingTask.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' })
 }
+if ($runLevelKept) {
+    $Elevated = ($existingTask.Principal.RunLevel -eq 'Highest')
+}
+if ($AtStartup) { $AtLogOn = $false }
+if ($NoElevation) { $Elevated = $false }
 
 $installArgs = @{ Config = $configPath; Python = $venvPython; TaskName = $TaskName }
 if ($AtLogOn) { $installArgs.AtLogOn = $true }
@@ -288,8 +296,8 @@ if ($DryRun) {
         Config        = if ($writeConfig) { "write $configPath ($Policy preset)" } else { "keep $configPath" }
         Enroll        = if ($enrolled) { "already enrolled ($identityPath)" } else { "enroll as '$Name'" }
         TaskName      = $TaskName
-        Trigger       = $(if ($AtLogOn) { 'AtLogOn' } else { 'AtStartup' }) + $(if ($existingTask -and -not $PSBoundParameters.ContainsKey('AtLogOn')) { ' (kept from the existing task)' } else { '' })
-        RunLevel      = $(if ($Elevated) { 'Highest' } else { 'Limited' }) + $(if ($existingTask -and -not $PSBoundParameters.ContainsKey('Elevated')) { ' (kept from the existing task)' } else { '' })
+        Trigger       = $(if ($AtLogOn) { 'AtLogOn' } else { 'AtStartup' }) + $(if ($triggerKept) { ' (kept from the existing task)' } else { '' })
+        RunLevel      = $(if ($Elevated) { 'Highest' } else { 'Limited' }) + $(if ($runLevelKept) { ' (kept from the existing task)' } else { '' })
         Prerequisites = if ($SkipPrerequisites) { 'skip' } else { 'install Python and Git with winget if missing' }
     } | Format-List | Out-String -Width 4096 | Write-Output  # wide, so long paths stay on one line
     if ($writeConfig) {

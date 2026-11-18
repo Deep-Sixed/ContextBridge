@@ -333,16 +333,21 @@ def logon_task():
 
 
 def test_bootstrap_rerun_keeps_the_existing_task_trigger(tmp_path, logon_task):
-    # Re-running without -AtLogOn must not move an at-sign-in agent to a boot task, which has no desktop session.
+    # Re-running without -AtLogOn must not move an at-sign-in agent to a boot task, which has no desktop session;
+    # -AtStartup switches it on purpose.
     install = tmp_path / "cb"
     _write_existing_install(install, enrolled=True)
     kept = _bootstrap_dry_run(install, "-TaskName", logon_task)
     assert kept.returncode == 0, kept.stderr
     assert re.search(r"^Trigger\s*:\s*AtLogOn \(kept from the existing task\)", kept.stdout, re.MULTILINE), kept.stdout
     assert re.search(r"^RunLevel\s*:\s*Limited \(kept from the existing task\)", kept.stdout, re.MULTILINE), kept.stdout
-    switched = _bootstrap_dry_run(install, "-TaskName", logon_task, "-AtLogOn:$false")
+    # Run as people run it, through powershell -File, where -AtLogOn:$false would arrive as the text "$false".
+    switched = _bootstrap_dry_run(install, "-TaskName", logon_task, "-AtStartup")
     assert switched.returncode == 0, switched.stderr
     assert re.search(r"^Trigger\s*:\s*AtStartup\s*$", switched.stdout, re.MULTILINE), switched.stdout
+    assert re.search(r"^RunLevel\s*:\s*Limited \(kept from the existing task\)", switched.stdout, re.MULTILINE)
+    both = _bootstrap_dry_run(install, "-TaskName", logon_task, "-AtStartup", "-AtLogOn")
+    assert both.returncode != 0 and "not both" in both.stdout + both.stderr
 
 
 def test_bootstrap_prefers_an_existing_local_config(tmp_path):
