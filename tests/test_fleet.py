@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -288,7 +289,9 @@ def test_local_agent_user_defaults_to_the_venv_owner(tmp_path):
     import getpass
 
     owner = getpass.getuser()
-    assert LocalAgent(str(tmp_path), "s").install_user() == (None if owner == "root" else owner)
+    # The gateway host is Linux; without pwd (Windows) pip keeps the current account.
+    expected = None if os.name == "nt" or owner == "root" else owner
+    assert LocalAgent(str(tmp_path), "s").install_user() == expected
     assert LocalAgent(str(tmp_path), "s", "svc").install_user() == "svc"
     assert LocalAgent(str(tmp_path / "missing"), "s").install_user() is None
 
