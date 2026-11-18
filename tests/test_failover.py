@@ -28,6 +28,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from types import SimpleNamespace
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -51,7 +52,7 @@ from helpers import (
 )
 from test_oauth import PASSPHRASE, REDIRECT, form_fields, next_code, pkce
 
-from contextbridge.computer.server import SCOPE_READ, SERVER_TOOLS
+from contextbridge.computer.server import LIST_DEVICES_TOOL, SCOPE_READ, SERVER_TOOLS
 from contextbridge.failover import (
     PROBE_COMMANDS,
     _join,
@@ -558,3 +559,44 @@ def test_failover(tmp_path, jail):
     assert sum(1 for e in gateway_events if e["event"] == "device_connected") >= 2  # before and after the restart
     thanatos_ids = {e["request_id"] for e in requested if e.get("device") == THANATOS}
     assert thanatos_ids & {e.get("request_id") for e in agent_events}  # the same calls, audited on both machines
+
+
+class _FakeDrillClient:
+    """Stands in for fastmcp.Client: a gateway that lists `tools` and the `devices` rows."""
+
+    def __init__(self, tools: list[str], devices: list[dict]) -> None:
+        self._tools, self._devices = tools, devices
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def list_tools(self):
+        return [SimpleNamespace(name=n) for n in self._tools]
+
+    async def call_tool(self, name, args):
+        assert name == LIST_DEVICES_TOOL
+        return SimpleNamespace(structured_content={"devices": self._devices})
+
+
+@pytest.mark.parametrize(
+    "extra_tool, advertised, ready",
+    [
+        ("notes__search", ["notes__search"], True),  # a device's federated MCP tool: still a ContextBridge gateway
+        ("notes__search", [], False),  # the same name with nobody advertising it is not ours
+    ],
+)
+def test_drill_accepts_federated_tools_a_device_advertises(monkeypatch, extra_tool, advertised, ready):
+    import fastmcp
+
+    rows = [{"device": "box", "online": False, "mcp_tools": advertised}]
+    monkeypatch.setattr(fastmcp, "Client", _FakeDrillClient([*sorted(SERVER_TOOLS), extra_tool], rows))
+    report = anyio.run(lambda: run_drill("http://127.0.0.1:1/mcp", "x" * 40))
+    assert (report.gateway.status == "pass") is ready, report.gateway.detail
+    if not ready:
+        assert extra_tool in report.gateway.detail

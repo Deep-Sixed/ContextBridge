@@ -8,6 +8,7 @@ gateway:
   local_agents:                             # agents on the gateway host itself, installed from the same checkout
     - venv: /opt/omnilink-agent/venv
       service: contextbridge-agent-omnilink
+      # user: cbagent                       # who runs pip in that venv (default: the venv's owner, never root by accident)
 
 # Remote agents, updated in this order through the gateway's local MCP endpoint. Each needs the gateway's token to
 # reach it with computer:execute, and a policy that lets it run git and its Python (command mode unrestricted).

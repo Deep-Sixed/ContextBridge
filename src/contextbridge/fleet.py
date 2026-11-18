@@ -80,6 +80,19 @@ class FleetError(Exception):
 class LocalAgent:
     venv: str
     service: str
+    user: str | None = None  # who owns the venv and runs pip in it; None: whoever owns the venv directory
+
+    def install_user(self) -> str | None:
+        """The account pip runs as for this agent, so its build hooks never run as root unless the venv is root's."""
+        if self.user:
+            return self.user
+        try:
+            import pwd
+
+            owner = pwd.getpwuid(os.stat(self.venv).st_uid).pw_name
+        except (ImportError, KeyError, OSError):
+            return None
+        return None if owner == "root" else owner
 
 
 @dataclass
@@ -123,7 +136,10 @@ def load_fleet(path: str | Path) -> Fleet:
         where = f"{path}: gateway.local_agents[{i}]"
         if not isinstance(entry, dict):
             raise FleetError(f"{where} must be a mapping")
-        local.append(LocalAgent(_need(entry, "venv", where), _need(entry, "service", where)))
+        user = entry.get("user")
+        if user is not None and not (isinstance(user, str) and user):
+            raise FleetError(f"{where}: 'user' must be an account name")
+        local.append(LocalAgent(_need(entry, "venv", where), _need(entry, "service", where), user))
     gateway = Gateway(
         _need(gw, "checkout", f"{path}: gateway"),
         _need(gw, "venv", f"{path}: gateway"),
@@ -277,7 +293,8 @@ def update_gateway(gw: Gateway, target: str, *, dry_run: bool) -> bool:
     _run([f"{gw.venv}/bin/pip", "install", "--quiet", "--disable-pip-version-check", gw.checkout], user=gw.user)
     for agent in gw.local_agents:
         say(f"    reinstalling {agent.service}")
-        _run([f"{agent.venv}/bin/pip", "install", "--quiet", "--disable-pip-version-check", gw.checkout])
+        _run([f"{agent.venv}/bin/pip", "install", "--quiet", "--disable-pip-version-check", gw.checkout],
+             user=agent.install_user())
     say(f"    restarting {gw.service} (every agent reconnects within a minute)")
     _run(["systemctl", "restart", gw.service])
     for agent in gw.local_agents:
@@ -355,17 +372,21 @@ class DeviceUpdate:
         location = await self.run_command([[d.python, "-c", "import contextbridge; print(contextbridge.__file__)"]])
         # Editable installs import from <checkout>/src; a venv inside the checkout must not count as one.
         editable = (Path(d.checkout).as_posix().rstrip("/") + "/src/").lower() in location.replace("\\", "/").lower()
-        if editable and not change.deps:
+        pip = [d.python, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", *([] if change.deps else ["--no-deps"])]
+        if editable and "pyproject.toml" not in change.files:
             say("    editable install: the checkout is the code, nothing to reinstall")
+        elif editable:
+            # Still editable afterwards; reinstalling refreshes its metadata and creates any new commands.
+            say("    editable install: refreshing it for the pyproject.toml change")
+            await self.run_command([[*pip, "-e", d.checkout]])
         else:
             say("    reinstalling the package")
-            pip = [d.python, "-m", "pip", "install", "--quiet", "--disable-pip-version-check"]
-            await self.run_command([[*pip, *([] if change.deps else ["--no-deps"]), d.checkout]])
+            await self.run_command([[*pip, d.checkout]])
         await self.restart()
 
     async def restart(self) -> None:
         d = self.device
-        before = _connected_since(self.row) or datetime.now(timezone.utc)
+        before = _connected_since(self.row) or datetime.now(timezone.utc).replace(microsecond=0)
         if d.systemd_user_unit:
             say(f"    restarting {d.systemd_user_unit}")
             await self.run_command(
@@ -402,7 +423,13 @@ async def list_devices(call: Call) -> dict[str, dict[str, Any]]:
     return {row["device"]: row for row in (await call(LIST_DEVICES_TOOL, {}))["devices"]}
 
 
-async def wait_for_reconnect(call: Call, name: str, *, after: datetime, seconds: int = RECONNECT_SECONDS) -> None:
+async def wait_for_reconnect(
+    call: Call, name: str, *, after: datetime, inclusive: bool = False, seconds: int = RECONNECT_SECONDS
+) -> None:
+    """Wait until ``name`` is online on a connection newer than ``after`` (or as new, with ``inclusive``).
+
+    The gateway reports connection times to the whole second, so ``after`` must be whole seconds too.
+    """
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         await anyio.sleep(POLL_SECONDS)
@@ -411,7 +438,7 @@ async def wait_for_reconnect(call: Call, name: str, *, after: datetime, seconds:
         except Exception:  # noqa: BLE001 -- the gateway may be mid-restart
             continue
         since = _connected_since(row)
-        if row.get("online") and since and since > after:
+        if row.get("online") and since and (since >= after if inclusive else since > after):
             say(f"    {name} is back (connected {since.strftime('%H:%M:%S')} UTC)")
             return
     raise FleetError(f"{name}: did not reconnect within {seconds} seconds")
@@ -455,7 +482,9 @@ async def update_fleet(url: str, token: str, fleet: Fleet, revision: str, *, dry
 
         if restarted:
             for d in devices:
-                await wait_for_reconnect(call, d.name, after=restarted_at)
+                # A restarted gateway only knows connections made to it, so one that began in the very second
+                # it was restarted already counts.
+                await wait_for_reconnect(call, d.name, after=restarted_at.replace(microsecond=0), inclusive=True)
         rows = await list_devices(call)
         for d in devices:
             if d.name not in rows:
