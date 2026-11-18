@@ -278,6 +278,61 @@ def test_bootstrap_refuses_to_rename_an_enrolled_machine(tmp_path):
     assert "enrolled as 'p70'" in result.stdout + result.stderr
 
 
+def test_bootstrap_custom_config_path_keeps_existing_enrollment(tmp_path):
+    # A machine may run an existing config outside the install checkout.
+    install_dir = tmp_path / "cb"
+    external_dir = tmp_path / "agent-state"
+    external_dir.mkdir()
+    (external_dir / "identity.json").write_text("{}", encoding="utf-8")
+    (external_dir / "agent.yaml").write_text(
+        "name: p70\ngateway:\n  url: wss://agents.example.net\n"
+        "identity: identity.json\naudit_log: audit.jsonl\n",
+        encoding="utf-8",
+    )
+    result = _bootstrap_dry_run(
+        install_dir, "-ConfigPath", str(external_dir / "agent.yaml")
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"keep {external_dir / 'agent.yaml'}" in result.stdout
+    assert "already enrolled" in result.stdout
+    assert "enroll as" not in result.stdout
+
+
+def test_bootstrap_custom_config_path_rewrite_keeps_identity_location(tmp_path):
+    install_dir = tmp_path / "cb"
+    external_dir = tmp_path / "agent-state"
+    external_dir.mkdir()
+    (external_dir / "identity.json").write_text("{}", encoding="utf-8")
+    (external_dir / "agent.yaml").write_text(
+        "name: p70\ngateway:\n  url: wss://agents.example.net\n"
+        "identity: identity.json\naudit_log: audit.jsonl\n",
+        encoding="utf-8",
+    )
+    result = _bootstrap_dry_run(
+        install_dir, "-ConfigPath", str(external_dir / "agent.yaml"),
+        "-ForceConfig", "-Policy", "Full",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "already enrolled" in result.stdout
+    config = result.stdout.split("--- agent.yaml ---", 1)[1]
+    assert "name: p70" in config
+    assert "wss://agents.example.net" in config
+    assert (external_dir / "identity.json").as_posix() in config.replace("\\\\", "/")
+
+
+def test_bootstrap_custom_config_path_new_install_keeps_state_in_install_dir(tmp_path):
+    install_dir = tmp_path / "cb"
+    external_dir = tmp_path / "custom"
+    result = _bootstrap_dry_run(
+        install_dir, "-ConfigPath", str(external_dir / "agent.yaml"),
+        "-GatewayUrl", "wss://agents.example.net", "-Name", "p70",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    config = result.stdout.split("--- agent.yaml ---", 1)[1]
+    assert (install_dir / "state" / "agent-identity.json").as_posix() in config.replace("\\\\", "/")
+    assert (install_dir / "audit" / "agent.audit.jsonl").as_posix() in config.replace("\\\\", "/")
+
+
 def test_permanently_deleting_a_junction_removes_the_link_not_its_target(make_policy, workspace):
     from contextbridge.computer.trash import delete_file
 

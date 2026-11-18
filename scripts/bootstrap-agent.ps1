@@ -19,6 +19,8 @@
 
     Running it again on an enrolled machine upgrades it in place: the task is stopped, the code moves to -Revision,
     the package is reinstalled, and the task is registered and started again. The config and identity are kept.
+    Use -ConfigPath for an existing agent.yaml outside the default configs folder (absolute or relative to
+    -InstallDir). The installer reads its identity and audit paths from that config, preserving enrollment.
     With -ForceConfig it rewrites the config from -Policy, keeping the existing device name and gateway URL unless
     -GatewayUrl is passed; -Name must then match the enrolled name, or be left out.
 
@@ -41,6 +43,8 @@
 .EXAMPLE
     .\scripts\bootstrap-agent.ps1 -Policy Full -ForceConfig   # switch an enrolled machine's policy, same name and gateway
 .EXAMPLE
+    .\scripts\bootstrap-agent.ps1 -ConfigPath C:\cb-step2\step2\agent-omnilink.yaml -Revision main
+.EXAMPLE
     .\scripts\bootstrap-agent.ps1 -GatewayUrl wss://agents.example.com -DryRun
 #>
 [CmdletBinding()]
@@ -51,6 +55,7 @@ param(
     [ValidateSet('ReadOnly', 'Full')]
     [string]$Policy = 'ReadOnly',
     [string]$InstallDir = 'C:\ContextBridge',
+    [string]$ConfigPath = '',
     [string]$Revision = 'main',
     [string]$RepoUrl = 'https://github.com/Deep-Sixed/ContextBridge',
     [string]$TaskName = 'ContextBridge Agent',
@@ -118,16 +123,23 @@ function Install-WithWinget([string]$Id, [string]$Label) {
 function Read-ExistingConfig([string]$Path) {
     # The device name and gateway URL of an existing agent.yaml, read line by line (no YAML parser is at hand
     # before the package is installed). Missing values come back empty.
-    $result = @{ Name = ''; GatewayUrl = '' }
+    $result = @{ Name = ''; GatewayUrl = ''; Identity = ''; AuditLog = '' }
     if (-not (Test-Path -LiteralPath $Path)) { return $result }
     $inGateway = $false
     foreach ($line in (Get-Content -LiteralPath $Path)) {
         if ($line -match '^\s*(#|$)') { continue }
         if ($line -match '^name:\s*(\S+)') { $result.Name = $Matches[1].Trim('"', "'") }
+        if ($line -match '^identity:\s*(\S+)') { $result.Identity = $Matches[1].Trim('"', "'") }
+        if ($line -match '^audit_log:\s*(\S+)') { $result.AuditLog = $Matches[1].Trim('"', "'") }
         if ($line -match '^\S') { $inGateway = $line -match '^gateway:\s*(#.*)?$' ; continue }
         if ($inGateway -and $line -match '^\s+url:\s*(\S+)') { $result.GatewayUrl = $Matches[1].Trim('"', "'") }
     }
     return $result
+}
+
+function Resolve-AgentPath([string]$ConfigFile, [string]$Value) {
+    if ([IO.Path]::IsPathRooted($Value)) { return [IO.Path]::GetFullPath($Value) }
+    return [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $ConfigFile) $Value))
 }
 
 function ConvertTo-DeviceName([string]$Raw) {
@@ -136,7 +148,7 @@ function ConvertTo-DeviceName([string]$Raw) {
     return $n
 }
 
-function New-AgentConfig([string]$DeviceName, [string]$Url, [string]$Preset) {
+function New-AgentConfig([string]$DeviceName, [string]$Url, [string]$Preset, [string]$IdentityValue = '../state/agent-identity.json', [string]$AuditValue = '../audit/agent.audit.jsonl') {
     $header = @"
 # ContextBridge agent config written by bootstrap-agent.ps1 ($Preset preset).
 # This file is this machine's own policy: the gateway cannot widen it. See configs/agent.windows.yaml for every option.
@@ -145,8 +157,8 @@ name: $DeviceName
 gateway:
   url: $Url
 
-identity: ../state/agent-identity.json
-audit_log: ../audit/agent.audit.jsonl
+identity: $IdentityValue
+audit_log: $AuditValue
 max_concurrent_calls: 8
 
 "@
@@ -202,15 +214,29 @@ if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
     throw 'bootstrap-agent.ps1 installs the agent on Windows. On Linux and macOS, follow "Remote devices" in the README.'
 }
 
-$configPath = Join-Path $InstallDir 'configs\agent.yaml'
-$identityPath = Join-Path $InstallDir 'state\agent-identity.json'
-$auditPath = Join-Path $InstallDir 'audit\agent.audit.jsonl'
+$configPath = if ($ConfigPath) {
+    if ([IO.Path]::IsPathRooted($ConfigPath)) { [IO.Path]::GetFullPath($ConfigPath) }
+    else { [IO.Path]::GetFullPath((Join-Path $InstallDir $ConfigPath)) }
+} else { Join-Path $InstallDir 'configs\agent.yaml' }
+$defaultIdentity = Join-Path $InstallDir 'state\agent-identity.json'
+$defaultAudit = Join-Path $InstallDir 'audit\agent.audit.jsonl'
 $venvPython = Join-Path $InstallDir '.venv\Scripts\python.exe'
 $configExists = Test-Path -LiteralPath $configPath
-$enrolled = Test-Path -LiteralPath $identityPath
 $writeConfig = $ForceConfig -or -not $configExists
-
 $existing = Read-ExistingConfig $configPath
+if ($configExists -and (-not $existing.Identity -or -not $existing.AuditLog)) {
+    throw "Existing config '$configPath' must contain identity and audit_log paths; refusing to guess enrollment state."
+}
+$identityPath = if ($existing.Identity) { Resolve-AgentPath $configPath $existing.Identity } else { $defaultIdentity }
+$auditPath = if ($existing.AuditLog) { Resolve-AgentPath $configPath $existing.AuditLog } else { $defaultAudit }
+$enrolled = Test-Path -LiteralPath $identityPath
+# For a new non-default config, keep state/audit in InstallDir rather than next to the config.
+$identityValue = if ($ConfigPath -and -not $configExists) { '"' + $defaultIdentity.Replace('\', '/') + '"' } else { '../state/agent-identity.json' }
+$auditValue = if ($ConfigPath -and -not $configExists) { '"' + $defaultAudit.Replace('\', '/') + '"' } else { '../audit/agent.audit.jsonl' }
+if ($ForceConfig -and $configExists) {
+    $identityValue = '"' + $identityPath.Replace('\', '/') + '"'
+    $auditValue = '"' + $auditPath.Replace('\', '/') + '"'
+}
 
 # Only a new config needs a name and a gateway URL; an existing one already has both, and a rewrite keeps them.
 if ($writeConfig) {
@@ -258,7 +284,7 @@ if ($DryRun) {
     } | Format-List | Out-String | Write-Output
     if ($writeConfig) {
         Write-Output '--- agent.yaml ---'
-        Write-Output (New-AgentConfig $Name $GatewayUrl $Policy)
+        Write-Output (New-AgentConfig $Name $GatewayUrl $Policy $identityValue $auditValue)
     }
     return
 }
@@ -331,7 +357,9 @@ try {
         Write-Step "Writing $configPath ($Policy preset)"
         if ($configExists) { Copy-Item -LiteralPath $configPath -Destination "$configPath.bak" -Force }
         # UTF-8 without a byte order mark; Windows PowerShell's -Encoding utf8 would add one.
-        [IO.File]::WriteAllText($configPath, (New-AgentConfig $Name $GatewayUrl $Policy), (New-Object Text.UTF8Encoding $false))
+        $configDir = Split-Path -Parent $configPath
+        if (-not (Test-Path -LiteralPath $configDir)) { New-Item -ItemType Directory -Path $configDir -Force | Out-Null }
+        [IO.File]::WriteAllText($configPath, (New-AgentConfig $Name $GatewayUrl $Policy $identityValue $auditValue), (New-Object Text.UTF8Encoding $false))
     } else {
         Write-Step "Keeping the existing $configPath"
     }
