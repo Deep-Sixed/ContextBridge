@@ -239,6 +239,45 @@ def test_bootstrap_writes_a_config_the_agent_loads(tmp_path, preset):
         assert summary["allow_kill"] is True
 
 
+def _bootstrap_dry_run(install_dir, *args):
+    script = REPO / "scripts" / "bootstrap-agent.ps1"
+    return subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-File", str(script),
+         "-InstallDir", str(install_dir), "-DryRun", *args],
+        capture_output=True, text=True, timeout=120,
+    )
+
+
+def _write_existing_install(install_dir, *, enrolled):
+    (install_dir / "configs").mkdir(parents=True)
+    (install_dir / "configs" / "agent.yaml").write_text(
+        "# hand-written\r\nname: p70\r\n\r\ngateway:   # the VPS\r\n  url: wss://agents.example.net\r\n"
+        "identity: ../state/agent-identity.json\r\naudit_log: ../audit/agent.audit.jsonl\r\n",
+        encoding="utf-8",
+    )
+    if enrolled:
+        (install_dir / "state").mkdir()
+        (install_dir / "state" / "agent-identity.json").write_text("{}", encoding="utf-8")
+
+
+def test_bootstrap_policy_rewrite_keeps_name_and_gateway(tmp_path):
+    # Switching an enrolled machine's preset must not rename it after the computer: the identity is for the old name.
+    _write_existing_install(tmp_path / "cb", enrolled=True)
+    result = _bootstrap_dry_run(tmp_path / "cb", "-Policy", "Full", "-ForceConfig")
+    assert result.returncode == 0, result.stderr
+    config = result.stdout.split("--- agent.yaml ---", 1)[1]
+    assert re.search(r"^name: p70$", config, re.MULTILINE), config
+    assert re.search(r"^  url: wss://agents\.example\.net$", config, re.MULTILINE), config
+    assert "mode: unrestricted" in config
+
+
+def test_bootstrap_refuses_to_rename_an_enrolled_machine(tmp_path):
+    _write_existing_install(tmp_path / "cb", enrolled=True)
+    result = _bootstrap_dry_run(tmp_path / "cb", "-Policy", "Full", "-ForceConfig", "-Name", "laptop")
+    assert result.returncode != 0
+    assert "enrolled as 'p70'" in result.stdout + result.stderr
+
+
 def test_permanently_deleting_a_junction_removes_the_link_not_its_target(make_policy, workspace):
     from contextbridge.computer.trash import delete_file
 
