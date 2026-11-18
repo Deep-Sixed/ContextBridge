@@ -1,0 +1,23 @@
+# Machines that `contextbridge-update-fleet` keeps on one git revision. Copy it next to the gateway's config
+# (for example /opt/contextbridge/config/fleet.yaml) and describe each machine as it was installed.
+gateway:
+  checkout: /opt/contextbridge/app          # git checkout the gateway is installed from
+  venv: /opt/contextbridge/venv
+  service: contextbridge                    # systemd unit
+  user: contextbridge                       # owner of the checkout and venv; git and pip run as this user
+  local_agents:                             # agents on the gateway host itself, installed from the same checkout
+    - venv: /opt/omnilink-agent/venv
+      service: contextbridge-agent-omnilink
+
+# Remote agents, updated in this order through the gateway's local MCP endpoint. Each needs the gateway's token to
+# reach it with computer:execute, and a policy that lets it run git and its Python (command mode unrestricted).
+# Devices not listed are left alone.
+devices:
+  friday:
+    checkout: /home/jarvis/contextbridge-agent
+    python: /home/jarvis/contextbridge-agent/.venv/bin/python
+    systemd_user_unit: contextbridge-agent.service      # restarted through `systemd-run --user`
+  p70:
+    checkout: C:/ContextBridge
+    python: C:/ContextBridge/.venv/Scripts/python.exe
+    windows_task: ContextBridge Agent                   # needs install-agent.ps1's every-minute relaunch trigger
