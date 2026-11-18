@@ -306,7 +306,8 @@ async def exercise_tools(client, device: str, used: dict[str, set[str]]) -> None
     assert ran["exit_code"] == 0 and ran["stdout"].strip() == "failover ok"
     # list_processes / kill_process
     victim = await call("start_process", command=python_cmd("import time; time.sleep(300)"), wait_seconds=0.2)
-    processes = await call("list_processes", name_filter="time.sleep(300)", limit=50)
+    # Arguments are hidden by default (processes.command_lines), so look the victim up by its pid.
+    processes = await call("list_processes", limit=1000)
     assert victim["pid"] in {p["pid"] for p in processes["processes"]}
     await call("kill_process", pid=victim["pid"], force=True)
     for _ in range(40):

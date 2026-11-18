@@ -371,7 +371,9 @@ def _list_windows(engine: Any) -> dict[str, Any]:
 
 @_handler("list_processes")
 def _list_processes(engine: Any, name_filter: str | None = None, limit: int = 200) -> dict[str, Any]:
-    return commands.list_processes(name_filter=name_filter, limit=max(1, min(limit, 1000)))
+    return commands.list_processes(
+        name_filter=name_filter, limit=max(1, min(limit, 1000)), command_lines=engine.policy.process_command_lines
+    )
 
 
 @_handler("kill_process")

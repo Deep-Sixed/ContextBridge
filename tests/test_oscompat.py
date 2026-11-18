@@ -155,7 +155,8 @@ def test_windows_allowlist(workspace, tmp_path, monkeypatch):
         policy.command_argv("deploy now")
     with pytest.raises(PolicyViolation, match=r"\.exe or \.com"):
         policy.command_argv(r"C:\Tools\run.bat")
-    for line in ("git log | more", "git status & del x", "git log > out.txt", "git log 2>&1"):
+    assert policy.command_argv('git log --grep "|"')[1:] == ["log", "--grep", "|"]  # quoted: a literal argument
+    for line in ("git log | more", "git status & del x", "git log > out.txt", "git log 2>&1", "git log ; del x"):
         with pytest.raises(PolicyViolation, match="Shell operators"):
             policy.command_argv(line)
     with pytest.raises(PolicyViolation, match="allowlist"):

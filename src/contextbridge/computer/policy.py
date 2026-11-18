@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import fnmatch
 import os
-import shlex
+import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -179,6 +179,45 @@ def _within(path: Path, roots: tuple[Path, ...]) -> Path | None:
     return None
 
 
+_POSIX_OPERATORS = frozenset("();<>|&")
+
+
+def _posix_unquoted_operator(command: str) -> bool:
+    """POSIX: a shell operator character outside quotes, with or without spaces around it (a|b, a;b).
+
+    Follows shell quoting: nothing is special inside single quotes, a backslash escapes the next
+    character outside them, and a double-quoted part ends only at an unescaped double quote.
+    """
+    quote: str | None = None
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+        elif quote == '"':
+            if ch == "\\":
+                i += 1
+            elif ch == '"':
+                quote = None
+        elif ch == "\\":
+            i += 1
+        elif ch in "'\"":
+            quote = ch
+        elif ch in _POSIX_OPERATORS:
+            return True
+        i += 1
+    return False
+
+
+def _windows_unquoted_operator(command: str) -> bool:
+    """Windows: | & < > outside double quotes, or a bare unquoted token of operator characters (; ( ) ^)."""
+    if _has_unquoted_operator(command):
+        return True
+    tokens = re.findall(r'(?:[^\s"]|"[^"]*"?)+', command)
+    return any(is_shell_operator(token) for token in tokens if '"' not in token)
+
+
 def _has_unquoted_operator(command: str) -> bool:
     """Windows: a pipe, redirect, or & outside double quotes."""
     in_quotes = False
@@ -213,6 +252,9 @@ class ComputerPolicy:
     max_session_seconds: float = 3600.0
     env_strip: tuple[str, ...] = DEFAULT_ENV_STRIP
     list_processes: bool = True
+    # Command lines often carry secrets (tokens, enrollment codes, passwords given as arguments), and
+    # list_processes needs only read access, so arguments are shown only when the config says so.
+    process_command_lines: bool = False
     allow_kill: bool = False
     delete_mode: str = "trash"
     max_delete_entries: int = 10_000
@@ -333,12 +375,11 @@ class ComputerPolicy:
         operators = "Shell operators (pipes, redirects, ;, &&) are not available in allowlist mode. "
         try:
             argv = split_command(command, windows=self.windows)
-            if self.windows:
-                has_operator = _has_unquoted_operator(command) or any(is_shell_operator(t) for t in argv)
-            else:
-                lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
-                lexer.whitespace_split = True
-                has_operator = any(is_shell_operator(t) for t in lexer)
+            # Only operators a shell would act on count: allowlist mode runs no shell, so a quoted "|" or
+            # ";" is a literal argument (rg "|" src), not a pipe.
+            has_operator = (
+                _windows_unquoted_operator(command) if self.windows else _posix_unquoted_operator(command)
+            )
         except ValueError as exc:
             raise PolicyViolation(f"Could not parse command: {exc}") from None
         if has_operator:
@@ -414,6 +455,7 @@ class ComputerPolicy:
             "max_timeout_seconds": self.max_timeout_seconds,
             "max_sessions": self.max_sessions,
             "list_processes": self.list_processes,
+            "process_command_lines": self.process_command_lines,
             "allow_kill": self.allow_kill,
             "delete": self.delete_mode if self.can_write else "disabled",
             "max_document_bytes": self.max_document_bytes,
@@ -536,6 +578,7 @@ def load_policy(
         max_session_seconds=_positive(cmds, "max_session_seconds", 3600.0, kind=float),
         env_strip=_str_list(cmds, "env_strip", DEFAULT_ENV_STRIP),
         list_processes=bool(procs.get("list", True)),
+        process_command_lines=procs.get("command_lines", False) is True,
         allow_kill=bool(procs.get("allow_kill", False)),
         delete_mode=delete_mode,
         max_delete_entries=_positive(fs, "max_delete_entries", 10_000),

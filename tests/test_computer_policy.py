@@ -197,7 +197,8 @@ def test_allowlist_rejects_unlisted_programs(policy, command):
 
 @posix_only  # Windows operators are covered in test_oscompat.py
 @pytest.mark.parametrize(
-    "command", ["ls | sh", "echo a; rm x", "echo a && echo b", "echo a > f", "cat < f", "echo $(id) &"]
+    "command",
+    ["ls | sh", "echo a; rm x", "echo a && echo b", "echo a > f", "cat < f", "echo $(id) &", "echo a|b", "echo a;b"],
 )
 def test_allowlist_rejects_shell_operators(policy, command):
     with pytest.raises(PolicyViolation, match="Shell operators"):
@@ -321,3 +322,18 @@ def test_allowlist_accepts_names_and_absolute_paths(workspace):
     for allow, windows in ((["ls", "/usr/bin/env"], False), (["git", r"C:\Tools\tool.exe"], True)):
         cfg = {"filesystem": {"roots": [str(workspace)]}, "commands": {"mode": "allowlist", "allow": allow}}
         assert load_policy(cfg, windows=windows).command_allow == frozenset(allow)
+
+
+@posix_only
+@pytest.mark.parametrize(
+    "command, argv_tail",
+    [
+        ('echo "|" src', ["|", "src"]),
+        ("echo ';' file.txt", [";", "file.txt"]),
+        (r"echo a\;b", ["a;b"]),
+        ('echo "a && b"', ["a && b"]),
+    ],
+)
+def test_allowlist_accepts_quoted_operator_characters_as_arguments(policy, command, argv_tail):
+    # No shell runs in allowlist mode, so a quoted or escaped operator is just a literal argument.
+    assert policy.command_argv(command)[1:] == argv_tail
