@@ -356,6 +356,29 @@ copy configs\agent.windows.yaml configs\agent.yaml     # then set name, gateway.
 
 CI runs the whole suite on `windows-latest` as well as Ubuntu. That includes the gateway-and-agent tests and the CLI end-to-end test, plus Windows-only tests for job objects, alternate data streams, `.bat` refusal, ACLs, and the PowerShell and cmd shells.
 
+### When a device is not working: `contextbridge-doctor`
+
+Run it on the device itself, as the user the agent runs as. It needs no gateway connection, so it still works when the device is offline.
+
+```bash
+contextbridge-doctor            # finds the agent's scheduled task or systemd unit, and the config it uses
+contextbridge-doctor --json     # the same findings, machine-readable
+```
+
+Each finding is `ok`, `info`, `WARN` or `FAIL`, and every problem comes with the command or step that fixes it. It checks:
+
+- **Install:** Python and the installed package.
+- **Startup:** the Windows task or systemd unit:
+  - it is enabled, and the Python it starts exists;
+  - it starts at sign-in or boot, and restarts an agent that exits (the every-minute trigger, or `Restart=`);
+  - it allows only one copy, has no run-time limit, keeps running on battery, and has lingering on for a user unit.
+- **Config and identity:** the config loads, the device is enrolled, and the identity matches the configured name.
+- **Process:** an agent is running. If it isn't, the last error from its log file.
+- **Connection:** what the agent's audit log says about the last 24 hours: connected now or not, and how often it reconnected.
+- **Network:** DNS, TCP and TLS to the gateway, the certificate's expiry, and the clock against the gateway's.
+
+It changes nothing. Its only side effect is that it briefly tries the agent's single-instance lock to see whether an agent holds it. It never connects to the gateway as the device, so the running agent's session is not disturbed. Exit status is 1 when a check fails, 0 otherwise.
+
 ## Remote MCP clients (ChatGPT, Claude)
 
 ChatGPT and Claude reach MCP servers from their own clouds, so they need a public HTTPS URL and OAuth. ContextBridge provides both without a third-party identity provider (no Authentik, no hosted relay). The `remote` section of the gateway config adds a second MCP endpoint on its own loopback port. It accepts only OAuth access tokens, and a TLS tunnel publishes it.

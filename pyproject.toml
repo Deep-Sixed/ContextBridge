@@ -36,6 +36,7 @@ contextbridge-agent = "contextbridge.remote.agent:main"
 contextbridge-admin = "contextbridge.remote.admin:main"
 contextbridge-failover = "contextbridge.failover:main"
 contextbridge-update-fleet = "contextbridge.fleet:main"
+contextbridge-doctor = "contextbridge.doctor:main"
 
 [tool.setuptools.dynamic]
 version = { attr = "contextbridge.__version__" }

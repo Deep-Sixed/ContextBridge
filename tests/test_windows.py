@@ -374,3 +374,32 @@ def test_permanently_deleting_a_junction_removes_the_link_not_its_target(make_po
     assert result["type"] == "symlink" and result["entries"] == 0
     assert not os.path.lexists(junction)
     assert (target / "f.txt").read_text(encoding="utf-8") == "x"
+
+
+def test_doctor_finds_and_reads_a_real_agent_task(tmp_path):
+    # The doctor's PowerShell query against Task Scheduler, on a task registered the way install-agent.ps1 does.
+    from contextbridge import doctor
+
+    name = f"ContextBridge doctor test {os.getpid()}"
+    config = tmp_path / "my agent.yaml"
+    script = (
+        "$u = [Security.Principal.WindowsIdentity]::GetCurrent().Name; "
+        "$a = New-ScheduledTaskAction -Execute $env:CB_EXE -Argument ('-m contextbridge.remote.agent run --config \"' + $env:CB_CONFIG + '\"'); "
+        "$t1 = New-ScheduledTaskTrigger -AtLogOn -User $u; "
+        "$t2 = New-ScheduledTaskTrigger -Once -At (Get-Date).AddYears(1) -RepetitionInterval (New-TimeSpan -Minutes 1); "
+        "$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew "
+        "-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; "
+        "Register-ScheduledTask -TaskName $env:CB_TASK -Force -Action $a -Trigger $t1, $t2 -Settings $s "
+        "-Principal (New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive) | Out-Null"
+    )
+    env = {**os.environ, "CB_TASK": name, "CB_EXE": sys.executable, "CB_CONFIG": str(config)}
+    subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], env=env, check=True, capture_output=True, timeout=120)
+    try:
+        (task,) = [t for t in doctor.windows_tasks() if t.name == name]
+        assert Path(task.config) == config  # the quoted path with a space survives
+        assert task.details["multiple"] == "IgnoreNew" and task.details["limit"] == "PT0S"
+        (finding,) = doctor.task_findings(task, config)
+        assert finding.status == "ok", finding
+    finally:
+        subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                        "Unregister-ScheduledTask -TaskName $env:CB_TASK -Confirm:$false"], env=env, capture_output=True, timeout=120)
