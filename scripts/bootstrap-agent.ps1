@@ -12,7 +12,10 @@
       1. installs Python 3.11+ and Git with winget if they are missing (skip with -SkipPrerequisites);
       2. clones ContextBridge into -InstallDir (or fetches, if it is already there) and checks out -Revision;
       3. creates .venv and installs ContextBridge into it;
-      4. writes configs\agent.yaml from the -Policy preset, unless one already exists (replace it with -ForceConfig);
+      4. writes configs\agent.local.yaml from the -Policy preset, unless one already exists (replace it with
+         -ForceConfig). The repository ships configs\agent.yaml as an example, so the machine's own config lives
+         beside it under a name git ignores, and upgrades never collide with it. An older install's
+         configs\agent.yaml, written before this change, is moved there and the example restored;
       5. enrolls the device with -Code, unless it is already enrolled;
       6. registers and starts the scheduled task with install-agent.ps1 (-AtLogOn and -Elevated pass through);
       7. waits for the agent to report that it connected to the gateway.
@@ -24,7 +27,7 @@
 
     The device name defaults to this computer's name in lower case. It must match the name given to `pair`.
 
-    Policy presets (edit configs\agent.yaml afterwards for anything in between):
+    Policy presets (edit configs\agent.local.yaml afterwards for anything in between):
       ReadOnly  read your user folder, write nothing, run a few diagnostic programs (default)
       Full      read and write C:\, run any PowerShell command, end processes, list windows and media apps
 
@@ -130,6 +133,19 @@ function Read-ExistingConfig([string]$Path) {
     return $result
 }
 
+function Test-UserConfigAt([string]$RepoDir, [string]$Relative) {
+    # True when $Relative (inside $RepoDir) holds this machine's own config rather than the repository's unmodified
+    # example. In a git checkout that means it differs from the committed file; anywhere else, any file there counts.
+    $path = Join-Path $RepoDir $Relative
+    if (-not (Test-Path -LiteralPath $path)) { return $false }
+    if (-not ((Test-Path -LiteralPath (Join-Path $RepoDir '.git')) -and (Get-Command git.exe -ErrorAction SilentlyContinue))) {
+        return $true
+    }
+    $ErrorActionPreference = 'Continue'
+    git.exe -C $RepoDir diff --quiet HEAD -- $Relative 2>$null
+    return ($LASTEXITCODE -ne 0)
+}
+
 function ConvertTo-DeviceName([string]$Raw) {
     $n = ($Raw.ToLowerInvariant() -replace '[^a-z0-9-]', '-').Trim('-')
     if ($n.Length -gt 63) { $n = $n.Substring(0, 63).TrimEnd('-') }
@@ -202,15 +218,20 @@ if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
     throw 'bootstrap-agent.ps1 installs the agent on Windows. On Linux and macOS, follow "Remote devices" in the README.'
 }
 
-$configPath = Join-Path $InstallDir 'configs\agent.yaml'
+$configPath = Join-Path $InstallDir 'configs\agent.local.yaml'
+$legacyConfigPath = Join-Path $InstallDir 'configs\agent.yaml'
 $identityPath = Join-Path $InstallDir 'state\agent-identity.json'
 $auditPath = Join-Path $InstallDir 'audit\agent.audit.jsonl'
 $venvPython = Join-Path $InstallDir '.venv\Scripts\python.exe'
-$configExists = Test-Path -LiteralPath $configPath
+# Installs made before configs\agent.local.yaml existed keep their config in the tracked example file. Move it,
+# unless the new file is already there.
+$migrateConfig = (-not (Test-Path -LiteralPath $configPath)) -and (Test-UserConfigAt $InstallDir 'configs/agent.yaml')
+$sourceConfig = if ($migrateConfig) { $legacyConfigPath } else { $configPath }
+$configExists = Test-Path -LiteralPath $sourceConfig
 $enrolled = Test-Path -LiteralPath $identityPath
 $writeConfig = $ForceConfig -or -not $configExists
 
-$existing = Read-ExistingConfig $configPath
+$existing = Read-ExistingConfig $sourceConfig
 
 # Only a new config needs a name and a gateway URL; an existing one already has both, and a rewrite keeps them.
 if ($writeConfig) {
@@ -249,13 +270,14 @@ if ($DryRun) {
         InstallDir    = $InstallDir
         Revision      = $Revision
         RepoUrl       = $RepoUrl
+        Migrate       = if ($migrateConfig) { "move $legacyConfigPath to $configPath and restore the example" } else { 'none' }
         Config        = if ($writeConfig) { "write $configPath ($Policy preset)" } else { "keep $configPath" }
         Enroll        = if ($enrolled) { "already enrolled ($identityPath)" } else { "enroll as '$Name'" }
         TaskName      = $TaskName
         Trigger       = if ($AtLogOn) { 'AtLogOn' } else { 'AtStartup' }
         RunLevel      = if ($Elevated) { 'Highest' } else { 'Limited' }
         Prerequisites = if ($SkipPrerequisites) { 'skip' } else { 'install Python and Git with winget if missing' }
-    } | Format-List | Out-String | Write-Output
+    } | Format-List | Out-String -Width 4096 | Write-Output  # wide, so long paths stay on one line
     if ($writeConfig) {
         Write-Output '--- agent.yaml ---'
         Write-Output (New-AgentConfig $Name $GatewayUrl $Policy)
@@ -298,7 +320,22 @@ if ($existingTask) {
 }
 
 $taskReregistered = $false
+$migrated = $false
 try {
+    # 1b. Config location. Do this before the checkout moves, which would refuse while the tracked file is modified.
+    if ($migrateConfig) {
+        Write-Step "Moving the config to $configPath"
+        Move-Item -LiteralPath $legacyConfigPath -Destination $configPath
+        $migrated = $true
+        $legacyBackup = "$legacyConfigPath.bak"
+        if ((Test-Path -LiteralPath $legacyBackup) -and -not (Test-Path -LiteralPath "$configPath.bak")) {
+            Move-Item -LiteralPath $legacyBackup -Destination "$configPath.bak"
+        }
+        if (Test-Path -LiteralPath (Join-Path $InstallDir '.git')) {
+            Invoke-Native 'restore configs/agent.yaml' { git.exe -C $InstallDir checkout --quiet HEAD -- configs/agent.yaml }
+        }
+    }
+
     # 2. Code
     if (Test-Path -LiteralPath (Join-Path $InstallDir '.git')) {
         Write-Step "Fetching ContextBridge into $InstallDir"
@@ -354,6 +391,10 @@ try {
     & (Join-Path $InstallDir 'scripts\install-agent.ps1') @installArgs
     $taskReregistered = $true
 } catch {
+    if ($migrated -and -not $taskReregistered) {
+        # The old task still points at configs\agent.yaml; put the machine's config back there before it restarts.
+        Copy-Item -LiteralPath $configPath -Destination $legacyConfigPath -Force
+    }
     if ($existingTask -and -not $taskReregistered) {
         Enable-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Out-Null
         Write-Warning "Setup failed; re-enabled the existing '$TaskName' task so the previous agent keeps running."
