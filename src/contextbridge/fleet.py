@@ -13,8 +13,10 @@ the change needs:
 - no change under ``src/`` or to ``pyproject.toml``: nothing else; the running code is already identical;
 - a code change: reinstall the package (skipped for editable installs, which run from the checkout), then restart
   the agent or gateway and wait until it is back;
-- a ``pyproject.toml`` change on a Windows agent: stop and say so, because new dependencies cannot be installed
-  under a running agent there; upgrade that machine by hand (``scripts/bootstrap-agent.ps1``).
+- a dependency change (``requires-python``, ``dependencies``, ``optional-dependencies`` or the build requirements
+  in ``pyproject.toml``; other edits there, such as a new command, are ordinary code changes) on a Windows agent:
+  stop and say so, because new dependencies cannot be installed under a running agent there; upgrade that
+  machine by hand (``scripts/bootstrap-agent.ps1``).
 
 A remote agent cannot restart itself from a command it is running, because its commands die with it. On Linux the
 restart is handed to the user's systemd (``systemd-run``); on Windows the agent's scheduled task is stopped and its
@@ -49,6 +51,7 @@ import shlex
 import subprocess
 import sys
 import time
+import tomllib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -159,20 +162,26 @@ def read_token(env_file: str | None) -> str:
 @dataclass
 class Change:
     files: list[str]
+    # Whether the dependencies themselves changed; None means "assume they did if pyproject.toml changed".
+    dependencies_changed: bool | None = None
 
     @property
     def code(self) -> bool:
-        return any(f.startswith("src/") for f in self.files) or self.deps
+        return any(f.startswith("src/") for f in self.files) or "pyproject.toml" in self.files
 
     @property
     def deps(self) -> bool:
-        return "pyproject.toml" in self.files
+        if "pyproject.toml" not in self.files:
+            return False
+        return True if self.dependencies_changed is None else self.dependencies_changed
 
     def describe(self) -> str:
         if not self.files:
             return "no changes"
         if self.deps:
-            return f"{len(self.files)} file(s), including pyproject.toml"
+            return f"{len(self.files)} file(s), including dependency changes in pyproject.toml"
+        if "pyproject.toml" in self.files:
+            return f"{len(self.files)} file(s), including pyproject.toml (dependencies unchanged)"
         if self.code:
             return f"{len(self.files)} file(s), including the package code"
         return f"{len(self.files)} file(s), none of them package code (no restart needed)"
@@ -216,7 +225,39 @@ def diff_files(gw: Gateway, old: str, new: str) -> Change:
     if ancestor.returncode != 0:
         raise FleetError(f"{old[:7]} is not an ancestor of {new[:7]}: that checkout has diverged; update it by hand")
     out = _run(["git", "-C", gw.checkout, "diff", "--name-only", old, new], user=gw.user)
-    return Change([line for line in out.splitlines() if line])
+    files = [line for line in out.splitlines() if line]
+    deps = None
+    if "pyproject.toml" in files:
+        deps = dependency_spec(_show(gw, old, "pyproject.toml")) != dependency_spec(_show(gw, new, "pyproject.toml"))
+    return Change(files, deps)
+
+
+def _show(gw: Gateway, commit: str, path: str) -> str | None:
+    proc = subprocess.run(
+        ["runuser", "-u", gw.user, "--", "git", "-C", gw.checkout, "show", f"{commit}:{path}"],
+        capture_output=True, text=True, check=False,
+    )
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def dependency_spec(pyproject: str | None) -> object:
+    """The parts of pyproject.toml that decide what pip installs besides this package itself.
+
+    A file that is missing or does not parse gets a value equal to nothing, so it counts as a dependency change.
+    """
+    if pyproject is None:
+        return object()
+    try:
+        data = tomllib.loads(pyproject)
+    except tomllib.TOMLDecodeError:
+        return object()
+    project = data.get("project", {})
+    return (
+        project.get("requires-python"),
+        project.get("dependencies"),
+        project.get("optional-dependencies"),
+        data.get("build-system", {}).get("requires"),
+    )
 
 
 def update_gateway(gw: Gateway, target: str, *, dry_run: bool) -> bool:
@@ -301,7 +342,7 @@ class DeviceUpdate:
         say(f"==> {d.name}: {head[:7]} -> {self.target[:7]}: {change.describe()}")
         if change.deps and self.windows:
             raise FleetError(
-                f"{d.name}: pyproject.toml changed, and new dependencies cannot be installed under a running Windows "
+                f"{d.name}: the dependencies in pyproject.toml changed, and they cannot be installed under a running Windows "
                 "agent; upgrade it by hand with scripts/bootstrap-agent.ps1"
             )
         if self.dry_run or not change.files:

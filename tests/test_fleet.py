@@ -9,7 +9,17 @@ import anyio
 import pytest
 
 from contextbridge import fleet
-from contextbridge.fleet import Change, Device, DeviceUpdate, FleetError, Gateway, device_command, load_fleet, read_token
+from contextbridge.fleet import (
+    Change,
+    Device,
+    DeviceUpdate,
+    FleetError,
+    Gateway,
+    dependency_spec,
+    device_command,
+    load_fleet,
+    read_token,
+)
 
 GW = Gateway("/opt/contextbridge/app", "/opt/contextbridge/venv", "contextbridge", "contextbridge")
 OLD, NEW = "a" * 40, "b" * 40
@@ -60,7 +70,36 @@ def test_change_classification():
     assert not Change(["README.md", "scripts/bootstrap-agent.ps1", "tests/test_x.py"]).code
     assert Change(["src/contextbridge/remote/agent.py"]).code
     deps = Change(["pyproject.toml"])
-    assert deps.code and deps.deps
+    assert deps.code and deps.deps  # not compared: assume the worst
+    scripts_only = Change(["pyproject.toml"], dependencies_changed=False)
+    assert scripts_only.code and not scripts_only.deps
+    assert "dependencies unchanged" in scripts_only.describe()
+
+
+PYPROJECT = """[build-system]
+requires = ["setuptools>=68"]
+
+[project]
+name = "contextbridge"
+requires-python = ">=3.11"
+dependencies = ["fastmcp>=3,<4", "pyyaml"]
+
+[project.scripts]
+contextbridge = "contextbridge.cli:main"
+"""
+
+
+def test_dependency_spec_ignores_everything_but_what_pip_installs():
+    base = dependency_spec(PYPROJECT)
+    new_command = PYPROJECT + 'contextbridge-update-fleet = "contextbridge.fleet:main"\n'
+    assert dependency_spec(new_command) == base
+    assert dependency_spec(PYPROJECT + "\n# a comment\n") == base
+    assert dependency_spec(PYPROJECT.replace('"pyyaml"', '"pyyaml", "httpx"')) != base
+    assert dependency_spec(PYPROJECT.replace(">=3.11", ">=3.12")) != base
+    assert dependency_spec(PYPROJECT.replace("setuptools>=68", "setuptools>=70")) != base
+    assert dependency_spec(PYPROJECT + "[project.optional-dependencies]\ndev = [\"pytest\"]\n") != base
+    assert dependency_spec(None) != dependency_spec(None)  # missing on one side: a change
+    assert dependency_spec("not = [toml") != base
 
 
 def test_device_command_quotes_for_each_shell():
@@ -113,8 +152,8 @@ def fast(monkeypatch):
     monkeypatch.setattr(fleet, "POLL_SECONDS", 0)
 
 
-def run_update(fake: FakeGateway, files: list[str], monkeypatch, dry_run: bool = False) -> None:
-    monkeypatch.setattr(fleet, "diff_files", lambda gw, old, new: Change(files if old != new else []))
+def run_update(fake: FakeGateway, files: list[str], monkeypatch, dry_run: bool = False, deps: bool | None = None) -> None:
+    monkeypatch.setattr(fleet, "diff_files", lambda gw, old, new: Change(files if old != new else [], deps))
 
     async def go() -> None:
         await DeviceUpdate(fake, fake.device, fake.row(), GW, NEW, dry_run=dry_run).run()
@@ -163,6 +202,14 @@ def test_dependency_change_on_windows_stops_before_touching_the_device(monkeypat
     with pytest.raises(FleetError, match="upgrade it by hand"):
         run_update(fake, ["pyproject.toml"], monkeypatch)
     assert fake.head == OLD and not any("merge" in c for c in fake.commands)
+
+
+def test_pyproject_change_without_new_dependencies_updates_windows_like_code(monkeypatch):
+    fake = FakeGateway(THANATOS, windows=True, location="C:\\cb\\.venv-std\\Lib\\site-packages\\contextbridge\\__init__.py")
+    run_update(fake, ["pyproject.toml", "src/contextbridge/fleet.py"], monkeypatch, deps=False)
+    assert fake.head == NEW
+    assert any("'pip' 'install'" in c and "'--no-deps'" in c for c in fake.commands)
+    assert any(c.startswith("Stop-ScheduledTask") for c in fake.commands)
 
 
 def test_dry_run_changes_nothing(monkeypatch):
