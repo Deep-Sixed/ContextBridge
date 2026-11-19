@@ -289,6 +289,20 @@ def test_request_reauthorization_marks_the_grant_and_stops_its_refresh(dash):
     stored = dash.store.state["grants"][gid]
     assert stored["reauth_requested_at"] and stored["history"][0]["text"] == "Requested re-authorization for write"
     assert dash.store.reauth_request("chatgpt-1")[0] == gid
+    assert "Cancel request" in done.text and "loses access" in done.text
+
+    async def cancel():
+        async with dash.client() as http:
+            await sign_in(http, dash.store)
+            token = csrf((await http.get("/devices/endpoints")).text)
+            return await http.post("/devices/cancel-reauth", data={"csrf": token, "grant": gid})
+
+    cancelled = asyncio.run(cancel())
+    assert cancelled.status_code == 200 and "keeps its current access" in cancelled.text
+    stored = dash.store.state["grants"][gid]
+    assert "reauth_requested_at" not in stored and dash.store.reauth_request("chatgpt-1") is None
+    assert stored["history"][0]["text"] == "Cancelled the re-authorization request"
+    assert "Request re-authorization" in cancelled.text  # still beyond the token, so it can be asked again
 
 
 def test_usage_page_counts_tool_calls_from_the_audit_log(dash):

@@ -159,6 +159,7 @@ class OwnerDashboard:
             Route("/devices/revoke-grant", self._revoke_grant, methods=["POST"]),
             Route("/devices/grant-access", self._grant_access, methods=["POST"]),
             Route("/devices/reauth", self._reauth, methods=["POST"]),
+            Route("/devices/cancel-reauth", self._cancel_reauth, methods=["POST"]),
             Route("/devices/passphrase", self._passphrase, methods=["POST"]),
             Route("/devices/theme", self._theme, methods=["POST"]),
         ]
@@ -557,16 +558,20 @@ cd C:\\ContextBridge; py -3 -m venv .venv
         reauth = ""
         if beyond:
             where = "; ".join(f"{SCOPE_LABELS[s][0]} on {', '.join(d for d in granted if s in current[d])}" for s in beyond)
+            gid_field = self._csrf(session) + hidden("grant", grant["grant_id"])
             action = (
-                '<span class="tag tag-accent">Requested · consent page on next connection</span>' if grant["reauth"] else
-                f'<form method="post" action="/devices/reauth">{self._csrf(session)}{hidden("grant", grant["grant_id"])}'
+                '<div class="row wrap" style="gap:var(--space-2)"><span class="tag tag-accent">Requested · consent page '
+                f'on next connection</span><form method="post" action="/devices/cancel-reauth">{gid_field}'
+                '<button class="btn btn-secondary btn-sm">Cancel request</button></form></div>' if grant["reauth"] else
+                f'<form method="post" action="/devices/reauth">{gid_field}'
                 '<button class="btn btn-primary btn-sm">Request re-authorization</button></form>'
             )
             reauth = f"""<div class="note note-ok row wrap"><div class="grow stack" style="gap:2px;min-width:220px">
 <span class="sm strong">{esc(where)} isn't covered by {esc(name)}'s token</span>
 <span class="small muted">Until {esc(name)} re-authorizes, the gateway enforces only what its token allows. Requesting it
 lets the current token run until it expires (at most an hour); the assistant then reconnects through the consent page,
-where you approve with your passphrase and a code.</span></div>{action}</div>"""
+where you approve with your passphrase and a code. Until then it cannot refresh, so if you deny that page or it never
+reconnects, it loses access: cancel the request to keep its current access instead.</span></div>{action}</div>"""
         history = "".join(
             f'<span class="at">{esc(_stamp(h.get("at")))}</span><span class="what">'
             f'{esc(("Owner " if h.get("by") == "owner" else "") + str(h.get("text", "")))}</span>'
@@ -754,6 +759,24 @@ policies and audit log.</p></div></header>
         return self._endpoints_page(
             request, session, open_grant=grant_id,
             notice=f"Requested re-authorization. {found['client_name']} sees the consent page when its current token expires.",
+        )
+
+    async def _cancel_reauth(self, request: Request) -> Response:
+        session, form = await self._authorized_form(request)
+        if session is None:
+            return self._signed_out()
+        grant_id = str(form.get("grant", ""))
+        found = self._found_grant(grant_id)
+        if found is None:
+            return self._endpoints_page(request, session, error="That access was already revoked.", status=404)
+        try:
+            self.store.cancel_reauth(grant_id)
+        except OAuthStateError as exc:
+            return self._endpoints_page(request, session, error=str(exc), status=409)
+        self._log("oauth_reauth_cancelled", client=found["client_id"], grant=grant_id, by="owner_dashboard")
+        return self._endpoints_page(
+            request, session, open_grant=grant_id,
+            notice=f"Cancelled. {found['client_name']} keeps its current access and refreshes normally.",
         )
 
     async def _revoke_grant(self, request: Request) -> Response:

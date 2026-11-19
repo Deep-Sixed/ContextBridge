@@ -423,6 +423,19 @@ class OAuthStore:
             )
             del grant["history"][MAX_HISTORY:]
 
+    def cancel_reauth(self, grant_id: str) -> None:
+        """Withdraw a re-authorization request: the grant refreshes normally again, as it was."""
+        now = time.time()
+        with self.update() as state:
+            grant = state["grants"].get(grant_id)
+            if grant is None or grant["revoked_at"] is not None:
+                raise OAuthStateError("that access was already revoked")
+            if grant.pop("reauth_requested_at", None) is None:
+                return
+            grant.pop("reauth_wanted", None)
+            grant.setdefault("history", []).insert(0, {"at": now, "by": "owner", "text": "Cancelled the re-authorization request"})
+            del grant["history"][MAX_HISTORY:]
+
     def reauth_request(self, client_id: str) -> tuple[str, dict[str, Any]] | None:
         """The newest active grant of ``client_id`` that awaits re-authorization, if any."""
         found = [

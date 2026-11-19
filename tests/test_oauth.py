@@ -1191,3 +1191,41 @@ def test_requested_reauthorization_ends_refresh_and_reopens_consent_with_the_own
     assert new["device_scopes"] == {"local": [SCOPE_READ, SCOPE_WRITE]}
     texts = [h["text"] for h in new["history"]]
     assert texts[0] == "Re-authorized · read, write on local" and "allowed write on local" in texts
+
+
+def test_per_device_permissions_survive_a_gateway_restart(tmp_path, monkeypatch):
+    """Owner changes live in the state file: a new process enforces them for tokens issued before it started."""
+    from contextbridge.oauth.provider import ContextBridgeOAuthProvider
+    from contextbridge.oauth.remote import remote_devices
+
+    path = tmp_path / "oauth.json"
+    before = OAuthStore(path)
+    before.set_owner(PASSPHRASE, totp.new_secret())
+    before.save_client({"client_id": "c1", "client_name": "Claude", "redirect_uris": [REDIRECT]})
+    code = new_token()
+    before.save_code(code, {"client_id": "c1", "expires_at": time.time() + 60})
+    gid, access, refresh = before.create_grant(
+        client_id="c1", scopes=[SCOPE_READ, SCOPE_WRITE], devices=["friday", "hermes"], resource=PUBLIC + "/mcp",
+        code=code, access_seconds=3600, refresh_seconds=86400,
+    )
+    before.set_device_scopes(gid, {"friday": [SCOPE_READ, SCOPE_WRITE]}, changes=["removed hermes", "kept friday"])
+    before.request_reauth(gid, ["process"])
+
+    # A fresh store and provider, as after a restart.
+    settings = RemoteSettings(
+        public_url=PUBLIC, allow_scopes=(SCOPE_READ, SCOPE_WRITE), allow_devices=("*",),
+        allowed_redirect_hosts=("claude.ai",),
+    )
+    after = OAuthStore(path)
+    provider = ContextBridgeOAuthProvider(
+        settings, after, ComputerAuditLog(tmp_path / "audit.jsonl", echo=False), offered_devices=lambda: [],
+    )
+    token = anyio.run(provider.load_access_token, access)
+    import fastmcp.server.dependencies as deps
+
+    monkeypatch.setattr(deps, "get_access_token", lambda: token)
+    devices = remote_devices(settings)
+    assert devices() == {"friday"} and devices(SCOPE_WRITE) == {"friday"}
+    assert after.state["grants"][gid]["history"][0]["text"] == "Requested re-authorization for process"
+    with pytest.raises(OAuthStateError):  # the re-authorization request also outlives the restart
+        after.rotate(gid, refresh, scopes=[SCOPE_READ], access_seconds=60, refresh_seconds=60)
