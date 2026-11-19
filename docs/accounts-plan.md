@@ -120,7 +120,7 @@ Sign-in failures for user accounts are counted separately from the admin's locko
 
 ## Decisions still open
 
-1. **Name.** ContextBridge, OmniLink or OmniPoint; affects the invite domain and the installers, not the design.
+1. **Name.** Decided for now: **ContextBridge** stays the engineering name (repository, package, `contextbridge-*` commands) and `contextbridge.app` the operational domain. The commercial name is chosen before public onboarding (PR 3), not before PR 1. Candidate: OmniLink, possibly with "UEM", subject to a trademark and domain check. The name affects the invite domain, installers and page titles, not this design.
 2. **Admin session limits.** Default length, the longest allowed, and whether the user must approve each session in advance or is only told afterwards.
 3. **Usage detail for the admin.** Counts per endpoint only, or each call (tool, device, time)? Each call reveals what users do; counts are usually enough.
 4. **Invite lifetime and who may invite.** Admin only at first; later perhaps users may invite to share a device.
