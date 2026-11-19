@@ -25,6 +25,7 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from . import totp
 
@@ -59,6 +60,29 @@ def _describe_access(device_scopes: dict[str, list[str]]) -> str:
     for device, scopes in sorted(device_scopes.items()):
         groups.setdefault(tuple(s.split(":", 1)[-1] for s in scopes), []).append(device)
     return "; ".join(f"{', '.join(k) or 'nothing'} on {', '.join(v)}" for k, v in groups.items()) or "no devices"
+
+
+def assistant_key(client: dict[str, Any]) -> tuple[str, tuple[str, ...]]:
+    """Which assistant a registered client is: its name and the hosts it is sent back to.
+
+    ChatGPT and Claude register a new client each time a connector is added again, so the client id
+    alone does not identify the assistant; its name and redirect hosts do.
+    """
+    hosts = sorted({urlsplit(u).netloc.lower() for u in client.get("redirect_uris", []) if "://" in str(u)})
+    return (str(client.get("client_name") or "").strip().lower(), tuple(hosts))
+
+
+MAX_LABEL = 60
+
+
+def clean_label(label: Any) -> str:
+    """An owner-chosen connection name: one line, at most MAX_LABEL characters."""
+    return " ".join(str(label or "").split())[:MAX_LABEL]
+
+
+def grant_label(grant: dict[str, Any], client: dict[str, Any] | None) -> str:
+    """What the owner calls this connection: its label, else the client's name."""
+    return clean_label(grant.get("label")) or clean_label((client or {}).get("client_name")) or "Unnamed client"
 
 
 def new_token() -> str:
@@ -333,12 +357,19 @@ class OAuthStore:
         self, *, client_id: str, scopes: list[str], devices: list[str], resource: str | None,
         code: str, access_seconds: int, refresh_seconds: int,
         device_scopes: dict[str, list[str]] | None = None, supersedes: str | None = None,
+        label: str | None = None, approved_from: str | None = None,
     ) -> tuple[str, str, str]:
         """Consume ``code`` and create a grant. Returns (grant_id, access_token, refresh_token).
 
         ``device_scopes`` narrows the scopes per device (each within ``scopes``); by default every
         device gets all of ``scopes``. ``supersedes`` names the grant this re-authorization replaces:
         it is revoked, and its change history carries over.
+
+        ``label`` is what the owner calls the connection (for example "ChatGPT (Chris)"); the consent page
+        asks, because an assistant does not say which of its accounts is connecting. Any other active grant
+        of the same assistant (see :func:`assistant_key`) with the same label is revoked: when a connection
+        authorizes again, the access it held before ends at once rather than lingering until its refresh
+        token expires. Connections with other labels, such as a second account, are left alone.
         """
         access, refresh = new_token(), new_token()
         now = time.time()
@@ -358,7 +389,13 @@ class OAuthStore:
                 event = "Re-authorized"
             else:
                 event = "Paired"
-            history.insert(0, {"at": now, "by": "consent", "text": f"{event} · {_describe_access(per_device)}"})
+            client = state["clients"].get(client_id)
+            name = clean_label(label) or (grant_label(old, client) if old is not None else grant_label({}, client))
+            replaced = self._replace_earlier(state, client_id, name, now)
+            if replaced and not history:
+                history = list(replaced[0].get("history", []))
+            note = f" · replaced {len(replaced)} earlier connection{'s' if len(replaced) != 1 else ''}" if replaced else ""
+            history.insert(0, {"at": now, "by": "consent", "text": f"{event} · {_describe_access(per_device)}{note}"})
             state["grants"][grant_id] = {
                 "client_id": client_id,
                 "scopes": scopes,
@@ -366,14 +403,34 @@ class OAuthStore:
                 "device_scopes": per_device,
                 "resource": resource,
                 "created_at": now,
+                "last_issued_at": now,
                 "refresh_hash": token_hash(refresh),
                 "refresh_expires_at": now + refresh_seconds,
                 "used_refresh": [],
                 "access": {token_hash(access): now + access_seconds},
                 "revoked_at": None,
                 "history": history[:MAX_HISTORY],
+                "label": name,
+                **({"approved_from": clean_label(approved_from)} if approved_from else {}),
             }
         return grant_id, access, refresh
+
+    @staticmethod
+    def _replace_earlier(state: dict[str, Any], client_id: str, label: str, now: float) -> list[dict[str, Any]]:
+        """Revoke the active grants of the same assistant and connection name; newest first."""
+        client = state["clients"].get(client_id)
+        key = assistant_key(client) if client else None
+        replaced = []
+        for grant in state["grants"].values():
+            if grant["revoked_at"] is not None:
+                continue
+            other = state["clients"].get(grant["client_id"])
+            same = grant["client_id"] == client_id or (key is not None and other is not None and assistant_key(other) == key)
+            if same and grant_label(grant, other).lower() == label.lower():
+                grant["revoked_at"] = now
+                grant["replaced"] = True
+                replaced.append(grant)
+        return sorted(replaced, key=lambda g: g.get("last_issued_at") or g.get("created_at") or 0, reverse=True)
 
     @staticmethod
     def device_scopes(grant: dict[str, Any]) -> dict[str, list[str]]:
@@ -422,6 +479,45 @@ class OAuthStore:
                 0, {"at": now, "by": "owner", "text": "Requested re-authorization for " + ", ".join(scopes)}
             )
             del grant["history"][MAX_HISTORY:]
+
+    def connections(self, client_id: str) -> list[dict[str, Any]]:
+        """The named connections the assistant ``client_id`` belongs to already holds, most recently used first."""
+        state = self.state
+        client = state["clients"].get(client_id)
+        if client is None:
+            return []
+        key = assistant_key(client)
+        found: dict[str, dict[str, Any]] = {}
+        for grant in state["grants"].values():
+            other = state["clients"].get(grant["client_id"])
+            if grant["revoked_at"] is not None or other is None or assistant_key(other) != key:
+                continue
+            if grant["refresh_expires_at"] <= time.time():
+                continue
+            name = grant_label(grant, other)
+            used = grant.get("last_issued_at") or grant.get("created_at") or 0
+            entry = found.setdefault(name.lower(), {"label": name, "used": 0, "devices": set(), "count": 0})
+            entry["used"] = max(entry["used"], used)
+            entry["devices"] |= set(grant.get("devices", []))
+            entry["count"] += 1
+        return sorted(found.values(), key=lambda e: e["used"], reverse=True)
+
+    def set_label(self, grant_id: str, label: str) -> None:
+        """Name a connection, e.g. to tell two accounts of one assistant apart."""
+        name = clean_label(label)
+        if not name:
+            raise OAuthStateError("a connection needs a name")
+        with self.update() as state:
+            grant = state["grants"].get(grant_id)
+            if grant is None or grant["revoked_at"] is not None:
+                raise OAuthStateError("that access was already revoked")
+            before = grant_label(grant, state["clients"].get(grant["client_id"]))
+            grant["label"] = name
+            if before != name:
+                grant.setdefault("history", []).insert(
+                    0, {"at": time.time(), "by": "owner", "text": f"renamed this connection from {before} to {name}"}
+                )
+                del grant["history"][MAX_HISTORY:]
 
     def cancel_reauth(self, grant_id: str) -> None:
         """Withdraw a re-authorization request: the grant refreshes normally again, as it was."""
@@ -493,6 +589,7 @@ class OAuthStore:
             grant["refresh_hash"] = token_hash(refresh)
             grant["refresh_expires_at"] = now + refresh_seconds
             grant["access"][token_hash(access)] = now + access_seconds
+            grant["last_issued_at"] = now  # when the client last refreshed: shows which connection is in use
             narrowed = [s for s in grant["scopes"] if s in scopes]
             if narrowed != grant["scopes"]:
                 grant.setdefault("access_scopes", {})[token_hash(access)] = narrowed

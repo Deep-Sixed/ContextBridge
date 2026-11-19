@@ -56,7 +56,8 @@ from ..computer.server import (
     SCOPE_MEDIA_DISCOVER,
     SCOPE_WRITE,
 )
-from .store import OAuthStateError, OAuthStore, new_token
+from .logo import favicon
+from .store import OAuthStateError, OAuthStore, clean_label, grant_label, new_token
 
 CODE_SECONDS = 300
 PENDING_SECONDS = 600
@@ -103,6 +104,19 @@ class _Pending:
     redirect_origin: str = field(default="")
     # The client as registered, so an approval can reinstate it if the full table dropped it meanwhile.
     client: dict[str, Any] = field(default_factory=dict)
+
+
+def describe_browser(user_agent: str) -> str:
+    """'Windows · Edge', 'macOS · Safari', ...: where an approval came from, to tell connections apart."""
+    ua = user_agent or ""
+    system = next((name for marker, name in (
+        ("Windows", "Windows"), ("iPhone", "iPhone"), ("iPad", "iPad"), ("Android", "Android"),
+        ("CrOS", "ChromeOS"), ("Mac OS X", "macOS"), ("Linux", "Linux"),
+    ) if marker in ua), "")
+    browser = next((name for marker, name in (
+        ("Edg/", "Edge"), ("OPR/", "Opera"), ("Firefox/", "Firefox"), ("Chrome/", "Chrome"), ("Safari/", "Safari"),
+    ) if marker in ua), "")
+    return " · ".join(filter(None, [system, browser]))
 
 
 def _is_loopback(host: str) -> bool:
@@ -243,6 +257,8 @@ class ContextBridgeOAuthProvider(OAuthProvider):
     def get_routes(self, mcp_path: str | None = None) -> list[Route]:
         routes = super().get_routes(mcp_path)
         routes.append(Route("/consent", self._consent, methods=["GET", "POST"]))
+        routes.append(Route("/favicon.svg", favicon, methods=["GET"]))
+        routes.append(Route("/favicon.ico", favicon, methods=["GET"]))
         routes.extend(self.extra_routes)
         return routes
 
@@ -285,36 +301,91 @@ class ContextBridgeOAuthProvider(OAuthProvider):
         devices = [d for d in form.getlist("device") if d in self.offered_devices()]
         if not scopes or not devices:
             return self._form(request_id, pending, error="Choose at least one permission and one device.", status=400)
+        label = self._chosen_label(pending, form)
+        approved_from = describe_browser(request.headers.get("user-agent", ""))
+        if not label:
+            return self._form(
+                request_id, pending, status=400,
+                error="Choose which connection this is, or name a new one, so the other one is not replaced.",
+            )
 
         # A re-authorization the owner asked for from the dashboard: keep its per-device choices
         # (within what was just approved) and replace the grant it was asked for.
         supersedes, device_scopes = None, None
         wanted = self._reauth(pending)
         if wanted is not None:
-            supersedes, wanted_scopes = wanted
+            supersedes, wanted_scopes = wanted[0], wanted[1]
             device_scopes = {d: [s for s in scopes if s in wanted_scopes.get(d, scopes)] for d in devices}
         code = new_token()
         try:
-            self._save_code(code, pending, scopes, devices, device_scopes=device_scopes, supersedes=supersedes)
+            self._save_code(
+                code, pending, scopes, devices, device_scopes=device_scopes, supersedes=supersedes, label=label,
+                approved_from=approved_from,
+            )
         except OAuthStateError as exc:  # the client was dropped and every slot now holds an approved one
             return self._form(request_id, pending, error=f"Cannot approve: {exc}.", status=409)
         del self._pending[request_id]
-        self._log("oauth_consent_granted", client=pending.client_id, scopes=scopes, devices=devices)
+        self._log("oauth_consent_granted", client=pending.client_id, scopes=scopes, devices=devices, label=label)
         return RedirectResponse(
             construct_redirect_uri(str(pending.params.redirect_uri), code=code, state=state), status_code=302
         )
 
-    def _reauth(self, pending: _Pending) -> tuple[str, dict[str, list[str]]] | None:
-        """(grant id, wanted scopes per device) when the owner asked this client to authorize again."""
+    def _reauth(self, pending: _Pending) -> tuple[str, dict[str, list[str]], str] | None:
+        """(grant id, wanted scopes per device, its name) when the owner asked this client to authorize again."""
         found = self.store.reauth_request(pending.client_id)
         if found is None:
             return None
         grant_id, grant = found
-        return grant_id, self.store.device_scopes(grant) | dict(grant.get("reauth_wanted") or {})
+        name = grant_label(grant, self.store.get_client(pending.client_id))
+        return grant_id, self.store.device_scopes(grant) | dict(grant.get("reauth_wanted") or {}), name
+
+    def _chosen_label(self, pending: _Pending, form: Any) -> str:
+        """The connection the owner says this is: an existing one (replaced) or a new name. '' if unclear."""
+        choice = str(form.get("connection", ""))
+        if choice == "new":
+            return clean_label(form.get("new_label")) or ""
+        existing = {c["label"].lower(): c["label"] for c in self.store.connections(pending.client_id)}
+        if choice.lower() in existing:
+            return existing[choice.lower()]
+        if not existing:  # the first connection of this assistant: its own name unless the owner typed one
+            return clean_label(form.get("new_label")) or clean_label(pending.client_name)
+        return ""
+
+    def _connection_rows(self, pending: _Pending, reauth_label: str | None) -> str:
+        """Which connection this authorization is for, when the assistant already has one or more."""
+        existing = self.store.connections(pending.client_id)
+        if not existing:
+            return (
+                '<fieldset><legend>Name this connection</legend>'
+                f'<label>Name <input name="new_label" maxlength="60" value="{html.escape(pending.client_name)}"></label>'
+                '<p class="small">If more than one person connects the same assistant, give each a name, '
+                "for example ChatGPT (Chris).</p></fieldset>"
+            )
+        # Nothing is picked for the owner, even with a single existing connection: a second account of the
+        # same assistant (someone else's ChatGPT) must not replace it by default. A re-authorization the
+        # owner asked for is the exception: they already said which connection it is.
+        preselect = reauth_label
+        rows = "".join(
+            f'<label><input type="radio" name="connection" value="{html.escape(c["label"])}"'
+            f'{" checked" if preselect and c["label"].lower() == preselect.lower() else ""} required> '
+            f'<strong>{html.escape(c["label"])}</strong> — replaces its current access '
+            f'({len(c["devices"])} device{"s" if len(c["devices"]) != 1 else ""}, last used '
+            f'{html.escape(time.strftime("%b %d %H:%M", time.gmtime(c["used"])) if c["used"] else "unknown")} UTC)</label>'
+            for c in existing
+        )
+        return (
+            "<fieldset><legend>Which connection is this?</legend>"
+            f"<p class=small>{html.escape(pending.client_name)} does not say which account is connecting. The one you "
+            "pick loses its earlier access as soon as this one is approved; the others keep theirs.</p>"
+            f"{rows}"
+            '<label><input type="radio" name="connection" value="new" required> A new connection named '
+            '<input name="new_label" maxlength="60" placeholder="ChatGPT (Chris)"></label></fieldset>'
+        )
 
     def _save_code(
         self, code: str, pending: _Pending, scopes: list[str], devices: list[str], *,
-        device_scopes: dict[str, list[str]] | None = None, supersedes: str | None = None,
+        device_scopes: dict[str, list[str]] | None = None, supersedes: str | None = None, label: str = "",
+        approved_from: str = "",
     ) -> None:
         self.store.save_code(
             code,
@@ -324,6 +395,8 @@ class ContextBridgeOAuthProvider(OAuthProvider):
                 "devices": devices,
                 **({"device_scopes": device_scopes} if device_scopes is not None else {}),
                 **({"supersedes": supersedes} if supersedes else {}),
+                **({"label": label} if label else {}),
+                **({"approved_from": approved_from} if approved_from else {}),
                 "code_challenge": pending.params.code_challenge,
                 "redirect_uri": str(pending.params.redirect_uri),
                 "redirect_uri_provided_explicitly": pending.params.redirect_uri_provided_explicitly,
@@ -374,6 +447,7 @@ Only approve a request you started yourself.</p>
 <input type="hidden" name="form_token" value="{html.escape(pending.form_token)}">
 <fieldset><legend>Permissions</legend>{scope_rows}</fieldset>
 <fieldset><legend>Devices</legend>{device_rows}</fieldset>
+{self._connection_rows(pending, wanted[2] if wanted else None)}
 <fieldset><legend>Confirm it is you</legend>
 <label>Passphrase <input type="password" name="passphrase" autocomplete="current-password" required></label>
 <label>Authenticator code <input name="totp" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]*" required></label>
@@ -420,6 +494,8 @@ Only approve a request you started yourself.</p>
                 refresh_seconds=self.settings.refresh_seconds,
                 device_scopes=record.get("device_scopes"),
                 supersedes=record.get("supersedes"),
+                label=record.get("label"),
+                approved_from=record.get("approved_from"),
             )
         except OAuthStateError as exc:
             raise TokenError("invalid_grant", str(exc)) from None
@@ -536,6 +612,7 @@ def _page(
     document = (
         f"<!doctype html><html lang=en{(' ' + html_attrs) if html_attrs else ''}><head><meta charset=utf-8>"
         '<meta name=viewport content="width=device-width, initial-scale=1">'
+        '<link rel=icon type="image/svg+xml" href="/favicon.svg">'
         f"<title>{title}</title><style>{style}</style></head><body>{content}</body></html>"
     )
     # The form posts to this page, which redirects to the client; browsers apply form-action to that redirect.
@@ -545,7 +622,7 @@ def _page(
     # redirect to the client, still carry no Referer, so the consent URL and its request id stay private.
     headers = {
         "Content-Security-Policy": (
-            "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; "
+            "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; "
             f"form-action {form_sources}"
         ),
         "X-Frame-Options": "DENY",

@@ -389,3 +389,29 @@ def test_theme_is_remembered_in_a_cookie(dash):
     switched, page = asyncio.run(scenario())
     assert switched.status_code == 303 and "cb_theme=light" in switched.headers["set-cookie"]
     assert 'data-theme="light"' in page.text and 'value="light" aria-pressed="true"' in page.text
+
+
+def test_connections_group_by_name_and_renaming_splits_a_second_account(dash):
+    old = grant(dash.store, client_id="gpt-1", devices=("hermes",))
+    dash.store.set_label(old, "for now")  # so the next grant does not replace it
+    new = grant(dash.store, client_id="gpt-2", devices=("hermes", "raven"))
+    # What grants from before named connections look like: several active "ChatGPT" grants from chatgpt.com.
+    with dash.store.update() as state:
+        for g in state["grants"].values():
+            g.pop("label", None)
+
+    async def scenario():
+        async with dash.client() as http:
+            await sign_in(http, dash.store)
+            page = await http.get("/devices/endpoints")
+            token = csrf(page.text)
+            renamed = await http.post("/devices/label", data={"csrf": token, "grant": old, "label": "ChatGPT (Dana)"})
+            ask = await http.post("/devices/revoke-older", data={"csrf": token, "grant": new})
+            return page, renamed, ask
+
+    page, renamed, ask = asyncio.run(scenario())
+    assert page.text.count('class="grant"') == 1 and "2 connections" in page.text and page.text.count("tag-accent\">In use") == 2
+    assert renamed.status_code == 200 and renamed.text.count('class="grant"') == 2
+    assert ">ChatGPT (Dana)</span>" in renamed.text
+    assert dash.store.state["grants"][old]["label"] == "ChatGPT (Dana)"
+    assert "has no idle connections" in ask.text  # after the split each connection has one grant
