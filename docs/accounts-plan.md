@@ -71,9 +71,10 @@ The order matters for safety. Today, anyone who passes the approval check can ap
 
 ### PR 1: accounts and sign-in, no change to device access
 
-- Account records in the OAuth state file: id, kind (`admin` / `user`), email, Google `sub` or password hash, created, last sign-in, suspended.
+- Account records in the OAuth state file: id, kind (`admin` / `user`), email, email verified or not, Google `sub` or password hash, created, last sign-in, suspended, and the version of the privacy notice the user accepted with the time they accepted it. When the notice changes, users accept the new version at their next sign-in.
 - `owner-init` creates the admin account. Existing installs: the current owner becomes the admin on first start.
-- Invites, Google sign-in, email-and-password sign-in, and the Accounts page (list only).
+- Invites, Google sign-in, email-and-password sign-in, the privacy notice with its recorded acceptance, and the Accounts page (list only).
+- Audit log retention: `audit.retention_days`, with old entries pruned on rotation.
 - **User accounts can sign in but approve nothing yet.** Consent, `/activate` and the device dashboard still require the admin. A signed-in user sees "Your account is ready; devices come in the next release."
 - Acceptance tests:
   - migration of a real single-owner state file, and of a file with several clients and grants, is idempotent and leaves a backup;
@@ -89,13 +90,13 @@ The order matters for safety. Today, anyone who passes the approval check can ap
 - Consent, `/activate` and the dashboard work for user accounts, each limited to the signed-in account's devices.
 - Every tool call checks that the grant's account owns the device. Admin-session calls are checked against the session's devices and expiry instead. Calls to a quarantined or suspended device are refused.
 - The admin's **Open as admin** session, quarantine, and **Transfer device** (moving `raven` to Raven's account is the first real use).
-- **A transfer never carries permissions across, and happens as one step.** In a single state change under the registry lock, the gateway:
+- **A transfer never carries permissions across, and the device stays blocked until it is complete.** The registry lock makes the gateway's own state change atomic, but it cannot stop a process on the agent; that needs the agent's confirmation. The gateway:
   1. marks the device *in transfer*, so every new call to it is refused;
-  2. cancels calls waiting on it and ends sessions (`start_process`) the old owner's clients started on it, killing their processes;
+  2. cancels calls waiting on it, and sends the agent a new `release` message asking it to kill every command and session (`start_process`) it is running for that device's current owner. The agent replies `released` once those processes have ended. Today's protocol has no such message (the gateway can stop waiting for a call but cannot stop the agent running it), so PR 2 adds it as a feature the agent announces, like `tool_updates`;
   3. removes the device from every grant that names it (access and refresh tokens stay valid for the client's other devices, but no longer reach this one) and ends any admin session on it;
   4. sets the new owner and clears *in transfer*.
 
-  If any step fails, the device stays *in transfer*, refusing every call, until the admin retries or the startup check reconciles it. The device starts with no assistant access under its new owner, who approves their own assistants. Only the device's identity (its key, name and registry scopes) moves. A command already running on the device when step 2 runs is killed, not allowed to finish.
+  The transfer completes only after `released` arrives. If the agent is offline, too old to support `release`, or does not answer, the transfer stays *pending*: the device refuses every call, the console shows why, and the transfer finishes when the agent next connects and confirms, or when the admin cancels it or deletes the device. It is never reported as done without that confirmation. If any gateway step fails, the device likewise stays *in transfer* until the admin retries or the startup check reconciles it. The device starts with no assistant access under its new owner, who approves their own assistants. Only the device's identity (its key, name and registry scopes) moves. A command already running on the device when step 2 runs is killed, not allowed to finish.
 - **Device names become unique per account**, not per gateway: two people may each have a `laptop`. Tools address a device by name within the caller's account; the admin addresses `account/name`.
 - **The local static token** (`CONTEXTBRIDGE_COMPUTER_TOKEN` on 127.0.0.1:8791) reaches every device today. On a hosted gateway it is limited to the admin's own devices; it never reaches a user's device, and suspension or quarantine applies to it like any other caller.
 - Acceptance tests:
@@ -123,7 +124,8 @@ On first start of PR 1, and again on PR 2, the gateway upgrades its state files 
 
 **How the migration protects the state:**
 - Before changing anything it copies `oauth.json` and `devices.json` to timestamped backups, mode 0600, in the same `state` folder.
-- Each file is rewritten to a temporary file and renamed into place, so a crash leaves either the old or the new version, never half of one. A version number in each file records which migrations have run, so a second run changes nothing.
+- Each file is rewritten to a temporary file and renamed into place, so a crash leaves either the old or the new version of that file, never half of one. A version number in each file records which migrations have run, so a second run changes nothing.
+- The two files are not replaced together, so a crash between them could leave one migrated and one not. Before writing either, the migration writes a marker file (`state/migration.json`) naming the migration, the target versions and the backups. It removes the marker only after both files are in place. On start, a gateway that finds the marker finishes the migration if both backups are intact and each file is at either its old or its new version, and otherwise refuses to start and says which backups to restore. Tests crash the migration after the first file and after the second, and check both recover.
 - If the migration fails, the gateway refuses to start and names the backups to restore. Restoring them and starting the previous release must work; the tests cover that rollback.
 - Today the state files are locked only during each write; a second gateway process on the same `state` folder is not stopped, and the dashboard merely warns about it. PR 1 adds a single-instance lock on the folder, held for the gateway's lifetime, so a second process refuses to start, and the migration takes it before running. Copied state is a different risk: two servers started from copies of the same files share a gateway id and would both accept the same devices and tokens. The VPS guide's rule stands: stop the old gateway before starting the new one, and never run both.
 
@@ -154,6 +156,6 @@ Sign-in failures for user accounts are counted separately from the admin's locko
 4. **Who may invite.** The site admin only, while ownership enforcement (PR 2) is new. Invites are single use and expire after 7 days. Users inviting others to share a device can be considered later.
 5. **Privacy notice.** Shown on the invite page and accepted before an account is created. It states:
    - that on a hosted gateway the user's commands and file contents pass through the operator's server and Cloudflare;
-   - what the gateway stores about them: account details, device names and system information, assistant approvals, and an audit log of every call (tool, device, time, and paths or commands as sent, but file contents only as a size and hash), kept for a stated period (to be set; 90 days suggested);
+   - what the gateway stores about them: account details, device names and system information, assistant approvals, and an audit log of every call (tool, device, time, and paths or commands as sent, but file contents only as a size and hash), kept for 90 days by default (`audit.retention_days` in the config, which hosted setup requires to be set before the first invite, and which the notice quotes);
    - that the site admin sees call counts, and can open an audited admin session on their devices that they see on their dashboard, or must approve if they choose;
    - that whoever has root access to the server itself is not bound by the application's controls and could read or alter its data and logs.
