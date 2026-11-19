@@ -1229,3 +1229,43 @@ def test_per_device_permissions_survive_a_gateway_restart(tmp_path, monkeypatch)
     assert after.state["grants"][gid]["history"][0]["text"] == "Requested re-authorization for process"
     with pytest.raises(OAuthStateError):  # the re-authorization request also outlives the restart
         after.rotate(gid, refresh, scopes=[SCOPE_READ], access_seconds=60, refresh_seconds=60)
+
+
+def test_cancelling_reauthorization_restores_refresh_but_not_removed_permissions(tmp_path, monkeypatch):
+    import fastmcp.server.dependencies as deps
+
+    from contextbridge.oauth.provider import ContextBridgeOAuthProvider
+    from contextbridge.oauth.remote import remote_devices
+
+    store = OAuthStore(tmp_path / "oauth.json")
+    store.set_owner(PASSPHRASE, totp.new_secret())
+    store.save_client({"client_id": "c1", "client_name": "Claude", "redirect_uris": [REDIRECT]})
+    code = new_token()
+    store.save_code(code, {"client_id": "c1", "expires_at": time.time() + 60})
+    gid, _, refresh = store.create_grant(
+        client_id="c1", scopes=[SCOPE_READ, SCOPE_WRITE], devices=["friday", "hermes"], resource=PUBLIC + "/mcp",
+        code=code, access_seconds=3600, refresh_seconds=86400,
+    )
+    # The owner removes hermes and write on friday, ticks execute (beyond the token), and asks to re-authorize.
+    store.set_device_scopes(gid, {"friday": [SCOPE_READ, SCOPE_EXECUTE]}, changes=["narrowed"])
+    store.request_reauth(gid, ["execute"])
+    with pytest.raises(OAuthStateError):
+        store.rotate(gid, refresh, scopes=[SCOPE_READ, SCOPE_WRITE], access_seconds=60, refresh_seconds=60)
+
+    store.cancel_reauth(gid)
+    access, _ = store.rotate(gid, refresh, scopes=[SCOPE_READ, SCOPE_WRITE], access_seconds=60, refresh_seconds=60)
+
+    settings = RemoteSettings(
+        public_url=PUBLIC, allow_scopes=(SCOPE_READ, SCOPE_WRITE, SCOPE_EXECUTE), allow_devices=("*",),
+        allowed_redirect_hosts=("claude.ai",),
+    )
+    provider = ContextBridgeOAuthProvider(
+        settings, store, ComputerAuditLog(tmp_path / "audit.jsonl", echo=False), offered_devices=lambda: [],
+    )
+    token = anyio.run(provider.load_access_token, access)
+    monkeypatch.setattr(deps, "get_access_token", lambda: token)
+    devices = remote_devices(settings)
+    assert devices() == {"friday"}  # hermes stays removed
+    assert devices(SCOPE_READ) == {"friday"} and devices(SCOPE_WRITE) == frozenset()  # write stays removed
+    assert SCOPE_EXECUTE not in token.scopes  # execute is still beyond the token: not enforced
+    assert store.state["grants"][gid]["device_scopes"] == {"friday": [SCOPE_READ, SCOPE_EXECUTE]}
