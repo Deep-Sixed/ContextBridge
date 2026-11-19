@@ -153,11 +153,12 @@ Authorizer = Callable[..., str]
 federated one (whose scope comes from the device). Returns the caller's client id or raises
 :class:`AuthorizationError`."""
 
-DeviceGrant = Callable[[], frozenset[str] | None]
-"""The devices the current caller may reach, or None for every device."""
+DeviceGrant = Callable[..., frozenset[str] | None]
+"""Called as ``devices()`` for the devices the current caller may reach at all, or as
+``devices(scope)`` for those where it holds ``scope``. None means every device."""
 
 
-def all_devices() -> frozenset[str] | None:
+def all_devices(scope: str | None = None) -> frozenset[str] | None:
     """The static-token grant: the owner's token reaches every device."""
     return None
 
@@ -419,11 +420,20 @@ class ComputerPolicyMiddleware(Middleware):
         client = self._authorize(name)
         if name != LIST_DEVICES_TOOL:
             target = device or LOCAL_DEVICE
-            granted = self._devices()
-            if granted is not None and target not in granted:
-                raise AuthorizationError(f"This client is not authorized for device '{target}'.")
+            self._check_grant(target, name, TOOL_SCOPES[name])
             self._router.check(target, name)
         return client
+
+    def _check_grant(self, device: str, tool: str, scope: str) -> None:
+        """Raise unless the caller's grant reaches ``device`` and holds ``scope`` there."""
+        granted = self._devices()
+        if granted is not None and device not in granted:
+            raise AuthorizationError(f"This client is not authorized for device '{device}'.")
+        scoped = self._devices(scope)
+        if scoped is not None and device not in scoped:
+            raise AuthorizationError(
+                f"This client is not authorized for '{tool}' on device '{device}' (needs {scope} there)."
+            )
 
     def _offers(self, name: str | None = None) -> dict[str, list[tuple[str, FederatedTool]]]:
         """Federated tools the caller may use, by name, with the devices offering each (``local`` first)."""
@@ -434,6 +444,9 @@ class ComputerPolicyMiddleware(Middleware):
                 if tool.name in SERVER_TOOLS or (name is not None and tool.name != name):
                     continue
                 if not self._router.device_allows(device, tool.scope):
+                    continue
+                scoped = self._devices(tool.scope)
+                if scoped is not None and device not in scoped:
                     continue
                 try:
                     self._authorize(tool.name, tool.scope)
@@ -470,6 +483,7 @@ class ComputerPolicyMiddleware(Middleware):
                 raise DeviceUnavailable(f"Device '{device}' is offline.")
             raise AuthorizationError(f"Tool '{name}' is not offered by device '{device}'.")
         client = self._authorize(name, tool.scope)
+        self._check_grant(device, name, tool.scope)
         self._router.check(device, name, tool.scope)
         return client, tool
 
@@ -478,11 +492,18 @@ class ComputerPolicyMiddleware(Middleware):
             with contextlib.suppress(RuntimeError):  # no session (direct, in-process listing)
                 self._router.notifier.watch(context.fastmcp_context.session)
         tools = await call_next(context)
-        offered = self._router.available_tools(self._devices()) | {LIST_DEVICES_TOOL}
+        # A tool is listed when some device the caller holds its scope on offers it.
+        offered_by_scope: dict[str, frozenset[str]] = {}
         visible = []
         for tool in tools:
-            if tool.name not in offered:
-                continue
+            if tool.name != LIST_DEVICES_TOOL:
+                scope = TOOL_SCOPES.get(tool.name)
+                if scope is None:
+                    continue
+                if scope not in offered_by_scope:
+                    offered_by_scope[scope] = self._router.available_tools(self._devices(scope))
+                if tool.name not in offered_by_scope[scope]:
+                    continue
             try:
                 self._authorize(tool.name)
             except AuthorizationError:

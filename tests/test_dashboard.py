@@ -103,22 +103,30 @@ def test_dashboard_lists_devices_by_name_then_last_seen_and_each_grant(dash):
     async def scenario():
         async with dash.client() as http:
             signed_in = await sign_in(http, dash.store)
-            return signed_in, await http.get("/devices"), await http.get("/devices/add")
+            return (
+                signed_in, await http.get("/devices"), await http.get("/devices/add"),
+                await http.get("/devices/endpoints"), await http.get("/devices/add?os=linux"),
+            )
 
-    signed_in, page, add = asyncio.run(scenario())
+    signed_in, page, add, endpoints, linux = asyncio.run(scenario())
     cookie = signed_in.headers["set-cookie"]
     assert signed_in.status_code == 303 and "httponly" in cookie.lower() and "samesite=strict" in cookie.lower()
     text = page.text
     # Each device: its name, then when it was last seen.
-    assert re.search(r'class="name">hermes</div>\s*<div class="seen">Last seen 10 hours ago</div>', text)
-    assert re.search(r'class="name">raven</div>\s*<div class="seen">Not seen since the gateway started</div>', text)
+    assert re.search(r'class="name">hermes</span>\s*<span class="seen[^"]*">Last seen 10 hours ago</span>', text)
+    assert re.search(r'class="name">raven</span>\s*<span class="seen[^"]*">Not seen since the gateway started</span>', text)
     assert 'class="name">local<' not in text
-    assert "Devices: hermes, raven" in text and "ChatGPT" in text and "chatgpt.com" in text
-    assert PUBLIC + "/mcp" in text
-    assert f"curl -fsSL {PUBLIC}/install/remote-linux.sh | sh" in add.text and 'href="/activate"' in add.text
+    assert 'aria-current=page><svg' in text and "Endpoints" in text and "Usage" in text and "Settings" in text
+    assert "ChatGPT" in endpoints.text and "chatgpt.com · 2 devices" in endpoints.text
+    assert PUBLIC + "/mcp" in endpoints.text
+    assert f"irm -ErrorAction Stop '{PUBLIC}/install/remote-windows.ps1' | iex" in add.text
+    assert f"curl -fsSL {PUBLIC}/install/remote-linux.sh | sh" in linux.text and 'href="/activate"' in add.text
     assert "eight-character activation code" in add.text and "No pairing code" not in add.text
     assert "remote.public_url</code>" in text  # PUBLIC is a loopback test URL, so the dashboard flags it
-    assert page.headers["cache-control"] == "no-store" and "frame-ancestors 'none'" in page.headers["content-security-policy"]
+    for response in (page, add, endpoints):
+        csp = response.headers["content-security-policy"]
+        assert response.headers["cache-control"] == "no-store" and "frame-ancestors 'none'" in csp
+        assert "script-src" not in csp and "<script" not in response.text  # default-src 'none': no scripts at all
 
 
 def test_remove_asks_first_then_revokes_the_device(dash):
@@ -155,7 +163,7 @@ def test_revoke_asks_first_then_ends_only_that_grant(dash):
 
     ask, done, again = asyncio.run(scenario())
     assert "Revoke ChatGPT" in ask.text and "hermes, raven" in ask.text
-    assert "Revoked ChatGPT" in done.text and "Devices: hermes, raven" not in done.text and "Claude" in done.text
+    assert "Revoked ChatGPT" in done.text and "chatgpt.com · 2 devices" not in done.text and "Claude" in done.text
     assert again.status_code == 404
     grants = dash.store.state["grants"]
     assert grants[first]["revoked_at"] is not None and grants[second]["revoked_at"] is None
@@ -224,3 +232,146 @@ def test_loopback_public_url_is_flagged_not_silently_advertised():
     assert "only this" in make("http://127.0.0.1:8799")._loopback_warning()
     assert "remote.public_url" in make("http://localhost:8799")._loopback_warning()
     assert make("https://mcp.contextbridge.app")._loopback_warning() == ""
+
+
+# ------------------------------------------------- per-device assistant access
+
+
+def test_saving_the_grid_narrows_and_widens_per_device_and_records_who_and_what(dash):
+    gid = grant(dash.store, devices=("hermes", "raven"))  # token scopes: read only
+
+    async def scenario():
+        async with dash.client() as http:
+            await sign_in(http, dash.store)
+            page = await http.get("/devices/endpoints")
+            token = csrf(page.text)
+            saved = await http.post("/devices/grant-access", data={
+                "csrf": token, "grant": gid,
+                # raven: read + write (write is beyond the token); hermes dropped; forged entries ignored.
+                "perm": ["raven|computer:read", "raven|computer:write", "hermes|computer:write",
+                         "thanatos|computer:read", "raven|computer:execute"],
+            })
+            forged = await http.post("/devices/grant-access", data={"csrf": "x", "grant": gid, "perm": []})
+            return page, saved, forged
+
+    page, saved, forged = asyncio.run(scenario())
+    # hermes only allows read (its registry grant), so write is "—" and has no checkbox.
+    assert 'value="hermes|computer:read" checked' in page.text and 'value="hermes|computer:write"' not in page.text
+    assert 'value="raven|computer:write"' in page.text and 'class="beyond"' in page.text
+    assert saved.status_code == 200 and "Saved 2 changes for ChatGPT" in saved.text
+    assert "need re-authorization" in saved.text and "Needs re-authorization" in saved.text
+    assert forged.status_code == 303
+    stored = dash.store.state["grants"][gid]
+    assert stored["devices"] == ["raven"]
+    assert stored["device_scopes"] == {"raven": [SCOPE_READ, SCOPE_WRITE]}
+    assert stored["scopes"] == [SCOPE_READ]  # the token ceiling never moves from the dashboard
+    assert [(h["by"], h["text"]) for h in stored["history"]] == [
+        ("owner", "removed hermes"), ("owner", "allowed write on raven"),
+        ("consent", "Paired · read on hermes, raven"),
+    ]
+    log = dash.audit_path.read_text(encoding="utf-8")
+    assert '"event":"oauth_grant_changed"' in log and '"by":"owner_dashboard"' in log
+
+
+def test_request_reauthorization_marks_the_grant_and_stops_its_refresh(dash):
+    gid = grant(dash.store, devices=("raven",))
+    dash.store.set_device_scopes(gid, {"raven": [SCOPE_READ, SCOPE_WRITE]}, changes=["allowed write on raven"])
+
+    async def scenario():
+        async with dash.client() as http:
+            await sign_in(http, dash.store)
+            token = csrf((await http.get("/devices/endpoints")).text)
+            return await http.post("/devices/reauth", data={"csrf": token, "grant": gid})
+
+    done = asyncio.run(scenario())
+    assert done.status_code == 200 and "Requested re-authorization" in done.text
+    assert "consent page on next connection" in done.text
+    stored = dash.store.state["grants"][gid]
+    assert stored["reauth_requested_at"] and stored["history"][0]["text"] == "Requested re-authorization for write"
+    assert dash.store.reauth_request("chatgpt-1")[0] == gid
+
+
+def test_usage_page_counts_tool_calls_from_the_audit_log(dash):
+    import json
+
+    now = datetime.now(timezone.utc)
+    lines = [{"ts": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "event": "requested", "tool": "read_file"}] * 7
+    lines += [{"ts": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "event": "completed"}]
+    with open(dash.audit_path, "a", encoding="utf-8") as fh:
+        fh.write("".join(json.dumps(line) + "\n" for line in lines))
+
+    async def scenario():
+        async with dash.client() as http:
+            await sign_in(http, dash.store)
+            return await http.get("/devices/usage")
+
+    page = asyncio.run(scenario())
+    assert page.status_code == 200 and '<span class="big">7</span>' in page.text
+    assert "7 tool calls this month" in page.text and f"{now:%b}: 7 calls" in page.text
+
+
+def test_usage_counter_reads_only_what_was_appended(tmp_path):
+    from datetime import date
+
+    from contextbridge.oauth.usage import UsageCounter
+
+    log = tmp_path / "audit.jsonl"
+    log.write_text('{"ts":"2026-11-02T10:00:00Z","event":"requested"}\n{"ts":"2026-10-30T10:00:00Z","event":"requested"}\n')
+    counter = UsageCounter(log)
+    first = counter.summary(today=date(2026, 11, 19))
+    with open(log, "a") as fh:
+        fh.write('{"ts":"2026-11-19T10:00:00Z","event":"requested"}\n{"ts":"2026-11-19T10:00:01Z","event":"denied"}\n'
+                 '{"ts":"2026-11-19T10:00:02Z","event":"requ')  # half-written line waits
+    second = counter.summary(today=date(2026, 11, 19))
+    assert first["this_month"] == 1 and second["this_month"] == 2 and second["daily_average"] == 0
+    assert second["months"][-2:] == [("Oct", 1), ("Nov", 2)] and len(second["months"]) == 6
+    assert UsageCounter(None).summary()["this_month"] == 0
+
+
+def test_change_passphrase_needs_the_current_one_and_a_code(dash, monkeypatch):
+    from contextbridge.oauth import totp as totp_module
+
+    new = "a much longer passphrase"
+    # Each code works once; step the clock so the test can mint as many as it needs.
+    clock = [time.time()]
+
+    def tick():
+        clock[0] += 30
+        return clock[0]
+
+    monkeypatch.setattr(totp_module.time, "time", lambda: clock[0])
+
+    async def scenario():
+        async with dash.client() as http, dash.client() as other:
+            await sign_in(http, dash.store)
+            await sign_in(other, dash.store)
+            token = csrf((await http.get("/devices/settings")).text)
+            short = await http.post("/devices/passphrase", data={"csrf": token, "current": PASSPHRASE,
+                                    "totp": "000000", "new": "short", "repeat": "short"})
+            wrong = await http.post("/devices/passphrase", data={"csrf": token, "current": "nope",
+                                    "totp": "000000", "new": new, "repeat": new})
+            tick()
+            done = await http.post("/devices/passphrase", data={"csrf": token, "current": PASSPHRASE,
+                                   "totp": next_code(dash.store), "new": new, "repeat": new})
+            return short, wrong, done, await other.get("/devices"), await http.get("/devices")
+
+    short, wrong, done, other, mine = asyncio.run(scenario())
+    assert short.status_code == 400 and wrong.status_code == 401
+    assert done.status_code == 200 and "Passphrase changed" in done.text
+    assert "Sign in" in other.text and "Your devices" in mine.text  # other sessions end, this one stays
+    tick()
+    assert dash.store.verify_owner(new, next_code(dash.store)) is None
+    assert "owner_passphrase_changed" in dash.audit_path.read_text(encoding="utf-8")
+
+
+def test_theme_is_remembered_in_a_cookie(dash):
+    async def scenario():
+        async with dash.client() as http:
+            await sign_in(http, dash.store)
+            token = csrf((await http.get("/devices/settings")).text)
+            switched = await http.post("/devices/theme", data={"csrf": token, "theme": "light"})
+            return switched, await http.get("/devices/settings")
+
+    switched, page = asyncio.run(scenario())
+    assert switched.status_code == 303 and "cb_theme=light" in switched.headers["set-cookie"]
+    assert 'data-theme="light"' in page.text and 'value="light" aria-pressed="true"' in page.text
