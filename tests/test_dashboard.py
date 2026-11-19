@@ -116,6 +116,8 @@ def test_dashboard_lists_devices_by_name_then_last_seen_and_each_grant(dash):
     assert "Devices: hermes, raven" in text and "ChatGPT" in text and "chatgpt.com" in text
     assert PUBLIC + "/mcp" in text
     assert f"curl -fsSL {PUBLIC}/install/remote-linux.sh | sh" in add.text and 'href="/activate"' in add.text
+    assert "eight-character activation code" in add.text and "No pairing code" not in add.text
+    assert "remote.public_url</code>" in text  # PUBLIC is a loopback test URL, so the dashboard flags it
     assert page.headers["cache-control"] == "no-store" and "frame-ancestors 'none'" in page.headers["content-security-policy"]
 
 
@@ -197,3 +199,28 @@ def test_last_seen_reads_naturally():
     assert ago(now - timedelta(hours=10), now) == "10 hours ago"
     assert ago(now - timedelta(days=7, hours=3), now) == "7 days ago"
     assert ago(None, now) == "not since the gateway started"
+
+
+def test_warns_when_no_device_is_connected_here_but_some_were_just_seen(dash):
+    # hermes heard from a minute ago (the state file a live hub in another process keeps), nothing connected here.
+    hub_rows = [
+        {"device": "hermes", "online": False, "last_seen": (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()},
+        {"device": "raven", "online": False},
+    ]
+    warning = OwnerDashboard._elsewhere_warning(hub_rows)
+    assert "hermes" in warning and "another ContextBridge" in warning and "raven" not in warning
+    assert OwnerDashboard._elsewhere_warning([{**hub_rows[0], "online": True}]) == ""
+    stale = [{"device": "hermes", "online": False, "last_seen": "2026-01-01T00:00:00Z"}]
+    assert OwnerDashboard._elsewhere_warning(stale) == ""
+
+
+def test_loopback_public_url_is_flagged_not_silently_advertised():
+    def make(url):
+        return OwnerDashboard(
+            public_url=url, registry=None, store=None, audit=None, describe=list,
+            client_address=lambda r: None, page=None,
+        )
+
+    assert "only this" in make("http://127.0.0.1:8799")._loopback_warning()
+    assert "remote.public_url" in make("http://localhost:8799")._loopback_warning()
+    assert make("https://mcp.contextbridge.app")._loopback_warning() == ""

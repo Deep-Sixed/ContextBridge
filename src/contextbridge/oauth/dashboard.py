@@ -19,6 +19,7 @@ for confirmation first. Sessions are bounded; signing in again replaces the olde
 from __future__ import annotations
 
 import html
+import ipaddress
 import secrets
 import time
 from collections.abc import Callable
@@ -36,6 +37,18 @@ from .store import OAuthStateError, OAuthStore
 
 SESSION_SECONDS = 15 * 60
 MAX_SESSIONS = 10
+# A device seen this recently but not connected here was most likely heard by another gateway process.
+RECENT_SECONDS = 3 * 60
+
+
+def _is_loopback_url(url: str) -> bool:
+    host = (urlsplit(url).hostname or "").lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def ago(when: datetime | None, now: datetime | None = None) -> str:
@@ -169,8 +182,10 @@ class OwnerDashboard:
         body = f"""
 <p><a href="/devices">&larr; Devices</a></p>
 <h1>Add a device</h1>
-<p>Run the installer on the new computer. It shows a code; enter it at
-<a href="/activate">{base}/activate</a> and approve the device. No pairing code or SSH is needed.</p>
+{self._loopback_warning()}
+<p>Run the installer on the new computer. It will display an eight-character activation code. Enter that code on
+the <a href="/activate">activation page</a> ({base}/activate) and approve the device. No SSH configuration or
+manually generated credentials are required.</p>
 <h2>Linux</h2>
 <p>As the user the agent should run as (not root):</p>
 <pre>curl -fsSL {base}/install/remote-linux.sh | sh</pre>
@@ -259,13 +274,44 @@ Its tokens stop working on the next request; to use it again, connect it from th
                 })
         return sorted(rows, key=lambda r: (r["client_name"].lower(), r["created"] or datetime.min.replace(tzinfo=timezone.utc)))
 
-    def _device_rows(self, csrf: str) -> str:
+    def _devices(self) -> list[dict[str, Any]]:
+        return [d for d in self._describe() if d.get("device", "") != "local"]
+
+    def _loopback_warning(self) -> str:
+        if not _is_loopback_url(self.public_url):
+            return ""
+        return f"""<p class="error">This gateway's public URL is {html.escape(self.public_url)}, which only this
+computer can reach. Assistants and new devices elsewhere cannot use the addresses below. Set
+<code>remote.public_url</code> to the https address clients reach (for example https://mcp.contextbridge.app) and
+restart the gateway.</p>"""
+
+    @staticmethod
+    def _elsewhere_warning(devices: list[dict[str, Any]]) -> str:
+        """Warn when no device is connected here although some were heard from moments ago.
+
+        Online means connected to *this* process's agent listener. "Last seen" also comes from a state
+        file the live hub rewrites every minute, so a second gateway sharing the state directory sees
+        recent times for devices it holds no connection to, and would otherwise call them all offline.
+        """
+        if any(d.get("online") for d in devices):
+            return ""
+        now = datetime.now(timezone.utc)
+        recent = [
+            d.get("device", "") for d in devices
+            if (seen := _parse(d.get("last_seen"))) is not None and (now - seen).total_seconds() <= RECENT_SECONDS
+        ]
+        if not recent:
+            return ""
+        return f"""<p class="error">No device is connected to this gateway, yet {html.escape(", ".join(recent))}
+{"was" if len(recent) == 1 else "were"} heard from in the last few minutes. If this persists, another ContextBridge
+gateway is probably running with the same state directory and the agents are connected to that one. Check which
+process listens on the agent port and serves the public URL.</p>"""
+
+    def _device_rows(self, csrf: str, devices: list[dict[str, Any]]) -> str:
         now = datetime.now(timezone.utc)
         rows = []
-        for device in self._describe():
+        for device in devices:
             name = device.get("device", "")
-            if name == "local":
-                continue
             online = bool(device.get("online"))
             info = device.get("info") or {}
             if online:
@@ -305,12 +351,15 @@ Its tokens stop working on the next request; to use it again, connect it from th
         csrf = html.escape(session["csrf"])
         endpoint = html.escape(self.public_url + "/mcp")
         minutes = max(1, round((session["expires_at"] - time.time()) / 60))
+        devices = self._devices()
         body = f"""
 <div class="head"><h1>Devices</h1><a class="button" href="/devices/add">+ Add a device</a></div>
 <p class="small">Computers your assistants can reach through ContextBridge. Signed in for about {minutes} more minutes.</p>
 {f'<p class="notice">{html.escape(notice)}</p>' if notice else ""}
 {f'<p class="error">{html.escape(error)}</p>' if error else ""}
-<ul class="list">{self._device_rows(csrf)}</ul>
+{self._loopback_warning()}
+{self._elsewhere_warning(devices)}
+<ul class="list">{self._device_rows(csrf, devices)}</ul>
 <h2>Assistants with access</h2>
 <p class="small">Each approval is separate: an assistant reaches only the devices ticked when it was approved.</p>
 <ul class="list">{self._grant_rows(csrf)}</ul>
