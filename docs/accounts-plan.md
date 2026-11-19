@@ -30,13 +30,15 @@ A standalone install is today's setup with accounts switched off: nothing in thi
   - First setup stays a command on the server, never a web page. A "first visitor becomes admin" web page can be claimed by a stranger if the site goes live before setup is done.
 - **Signs in with the passphrase and authenticator only**, never Google, so the admin account and recovery never depend on an outside provider. The passphrase is changed on the Settings page, as now.
 - **Sees the admin console:** **Settings** (as now) and a new **Accounts** page.
-- **Accounts page:** every user account (name, email, how it signs in, last seen, number of devices and assistants). Opening one shows that account's devices, endpoints and grants, and its usage per endpoint, read-only.
+- **Accounts page:** every user account (name, email, how it signs in, last seen, number of devices and assistants). Opening one shows that account's devices, endpoints and grants, and call counts per device and assistant, read-only. Individual calls (tool, device, time) are visible only inside an admin session (below).
 - **Being site admin grants no access to users' devices.** Signing in to the admin console lets the admin manage accounts and read metadata (device names, online status, usage counts). It does not let the admin, or the admin's assistants, list files, run commands or do anything else on a device the admin does not own.
 - **Root access is a separate, explicit step.** To troubleshoot a user's device, the admin chooses **Open as admin** on that account and:
   - enters the passphrase and a fresh authenticator code again, even if already signed in;
   - names the device or devices and gives a reason;
-  - gets a time-limited admin session (30 minutes by default, at most a few hours), usable only from the admin console, never by an assistant's OAuth token;
+  - gets a time-limited admin session (30 minutes by default, at most 4 hours), usable only from the admin console, never by an assistant's OAuth token;
   - every call in it is audited with the session id and reason, and the user sees it on their own dashboard ("The site admin accessed `raven` on Nov 19 for: …").
+
+  The user is told after the fact, not asked first, so the admin can troubleshoot a device whose owner is unavailable. A user may switch on **Require my approval for admin access** in their Settings; the admin's request then waits until they approve it.
 
   Root can still reach everything, but never silently and never as a side effect of being admin.
 - **Account lifecycle:** invite, suspend, remove.
@@ -45,7 +47,7 @@ A standalone install is today's setup with accounts switched off: nothing in thi
 
 ### User accounts (seats)
 
-- **Created only by invitation** at first. The admin issues an invite for an email address; the link (`https://invite.<your domain>/…`, single use, expires in 7 days) leads to account creation with either:
+- **Created only by invitation** at first. The admin issues an invite for an email address; the link (`https://invite.<your domain>/…`, single use, expires in 7 days) leads to account creation. Before the account is created, the page shows a short privacy notice that the user must accept (see Decisions). Sign-in is either:
   - **Continue with Google** (OpenID Connect: scopes `openid email` only, no offline access, so the gateway stores no Google tokens). The Google account's email must match the invite. The account is keyed on Google's permanent user id (`sub`), not the email, which can change.
   - **Email and password.** The invite link itself proves the email address, so no confirmation email is needed. Passwords are stored as scrypt hashes, as the owner passphrase is now. A forgotten password is reset by the admin issuing a new reset link, so the gateway needs no mail server at first.
 - **Sees the dashboard that exists today**, scoped to their account: Devices, Endpoints (assistant access), Usage and Settings, showing only their own devices, assistants and calls.
@@ -118,10 +120,10 @@ New events, in the computer audit log with the existing ones: `account_invited`,
 
 Sign-in failures for user accounts are counted separately from the admin's lockout, so a stranger failing Google or password sign-in cannot lock the admin out of recovery.
 
-## Decisions still open
+## Decisions
 
-1. **Name.** Decided: the product stays **ContextBridge** (`contextbridge.app`). A commercial brand, if ever needed, is a separate legal exercise and outside this plan.
-2. **Admin session limits.** Default length, the longest allowed, and whether the user must approve each session in advance or is only told afterwards.
-3. **Usage detail for the admin.** Counts per endpoint only, or each call (tool, device, time)? Each call reveals what users do; counts are usually enough.
-4. **Invite lifetime and who may invite.** Admin only at first; later perhaps users may invite to share a device.
-5. **Hosted privacy statement.** On a hosted gateway, users' commands and files pass through the operator's server and Cloudflare. Users should be told so before they sign up.
+1. **Name.** The product stays **ContextBridge** (`contextbridge.app`). A commercial brand, if ever needed, is a separate legal exercise and outside this plan.
+2. **Admin sessions.** 30 minutes by default, at most 4 hours. The user is told afterwards on their dashboard; a user can require approval in advance instead.
+3. **Usage the admin sees.** Call counts per account, device and assistant. Individual calls are visible only inside an audited admin session, like any other root access.
+4. **Who may invite.** The site admin only, while ownership enforcement (PR 2) is new. Invites are single use and expire after 7 days. Users inviting others to share a device can be considered later.
+5. **Privacy notice.** Shown on the invite page and accepted before an account is created. It states that on a hosted gateway the user's commands and files pass through the operator's server and Cloudflare, that the site admin can open an audited admin session on their devices, and that the user sees every such session on their dashboard.
