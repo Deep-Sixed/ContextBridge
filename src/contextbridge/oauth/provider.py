@@ -286,9 +286,16 @@ class ContextBridgeOAuthProvider(OAuthProvider):
         if not scopes or not devices:
             return self._form(request_id, pending, error="Choose at least one permission and one device.", status=400)
 
+        # A re-authorization the owner asked for from the dashboard: keep its per-device choices
+        # (within what was just approved) and replace the grant it was asked for.
+        supersedes, device_scopes = None, None
+        wanted = self._reauth(pending)
+        if wanted is not None:
+            supersedes, wanted_scopes = wanted
+            device_scopes = {d: [s for s in scopes if s in wanted_scopes.get(d, scopes)] for d in devices}
         code = new_token()
         try:
-            self._save_code(code, pending, scopes, devices)
+            self._save_code(code, pending, scopes, devices, device_scopes=device_scopes, supersedes=supersedes)
         except OAuthStateError as exc:  # the client was dropped and every slot now holds an approved one
             return self._form(request_id, pending, error=f"Cannot approve: {exc}.", status=409)
         del self._pending[request_id]
@@ -297,13 +304,26 @@ class ContextBridgeOAuthProvider(OAuthProvider):
             construct_redirect_uri(str(pending.params.redirect_uri), code=code, state=state), status_code=302
         )
 
-    def _save_code(self, code: str, pending: _Pending, scopes: list[str], devices: list[str]) -> None:
+    def _reauth(self, pending: _Pending) -> tuple[str, dict[str, list[str]]] | None:
+        """(grant id, wanted scopes per device) when the owner asked this client to authorize again."""
+        found = self.store.reauth_request(pending.client_id)
+        if found is None:
+            return None
+        grant_id, grant = found
+        return grant_id, self.store.device_scopes(grant) | dict(grant.get("reauth_wanted") or {})
+
+    def _save_code(
+        self, code: str, pending: _Pending, scopes: list[str], devices: list[str], *,
+        device_scopes: dict[str, list[str]] | None = None, supersedes: str | None = None,
+    ) -> None:
         self.store.save_code(
             code,
             {
                 "client_id": pending.client_id,
                 "scopes": scopes,
                 "devices": devices,
+                **({"device_scopes": device_scopes} if device_scopes is not None else {}),
+                **({"supersedes": supersedes} if supersedes else {}),
                 "code_challenge": pending.params.code_challenge,
                 "redirect_uri": str(pending.params.redirect_uri),
                 "redirect_uri_provided_explicitly": pending.params.redirect_uri_provided_explicitly,
@@ -319,24 +339,35 @@ class ContextBridgeOAuthProvider(OAuthProvider):
 
     def _form(self, request_id: str, pending: _Pending, *, error: str = "", status: int = 200) -> HTMLResponse:
         # Least privilege by default: only read starts checked; anything more is a deliberate tick.
+        # The exception is a re-authorization the owner asked for from the dashboard: what they asked
+        # for starts checked, and they still confirm it here with the passphrase and a code.
+        wanted = self._reauth(pending)
+        wanted_scopes = {s for v in wanted[1].values() for s in v} if wanted else {SCOPE_READ}
+        wanted_devices = set(wanted[1]) if wanted else set()
         scope_rows = "".join(
             f'<label><input type="checkbox" name="scope" value="{html.escape(s)}"'
-            f'{" checked" if s == SCOPE_READ else ""}> <code>{html.escape(s)}</code> — '
+            f'{" checked" if s in wanted_scopes else ""}> <code>{html.escape(s)}</code> — '
             f"{html.escape(SCOPE_DESCRIPTIONS[s])}</label>"
             for s in self._grantable(pending)
         ) or "<p>None of the permissions this client registered for are allowed remotely.</p>"
         # No device starts checked, not even when only one is offered: each device is a deliberate tick,
         # so a grant never reaches a computer the owner did not choose for this client.
         device_rows = "".join(
-            f'<label><input type="checkbox" name="device" value="{html.escape(d)}"> {html.escape(d)}</label>'
+            f'<label><input type="checkbox" name="device" value="{html.escape(d)}"'
+            f'{" checked" if d in wanted_devices else ""}> {html.escape(d)}</label>'
             for d in self.offered_devices()
         ) or "<p>No devices are available to remote clients.</p>"
+        reauth_note = (
+            "<p>You asked for this from the dashboard. Approving replaces the client's current access; "
+            "each device keeps the permissions you chose there.</p>" if wanted else ""
+        )
         redirect_host = urlsplit(str(pending.params.redirect_uri)).netloc
         body = f"""
 <h1>Allow access to your computers?</h1>
 <p><strong>{html.escape(pending.client_name)}</strong> wants to use ContextBridge.
 Approving sends an authorization code to <strong>{html.escape(redirect_host)}</strong>.
 Only approve a request you started yourself.</p>
+{reauth_note}
 {f'<p class="error">{html.escape(error)}</p>' if error else ""}
 <form method="post" action="/consent">
 <input type="hidden" name="request" value="{html.escape(request_id)}">
@@ -387,6 +418,8 @@ Only approve a request you started yourself.</p>
                 code=authorization_code.code,
                 access_seconds=self.settings.access_seconds,
                 refresh_seconds=self.settings.refresh_seconds,
+                device_scopes=record.get("device_scopes"),
+                supersedes=record.get("supersedes"),
             )
         except OAuthStateError as exc:
             raise TokenError("invalid_grant", str(exc)) from None
@@ -459,7 +492,7 @@ Only approve a request you started yourself.</p>
             scopes=self.store.access_scopes(grant, token),
             expires_at=int(expires_at),
             resource=grant.get("resource"),
-            claims={"devices": grant["devices"], "grant": grant_id},
+            claims={"devices": grant["devices"], "device_scopes": self.store.device_scopes(grant), "grant": grant_id},
         )
 
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
@@ -494,12 +527,16 @@ input[name=user_code]{display:block;width:100%;padding:.4rem;font-size:1.4rem;le
 """
 
 
-def _page(body: str, *, status: int = 200, raw: bool = False, form_action: str = "") -> HTMLResponse:
+def _page(
+    body: str, *, status: int = 200, raw: bool = False, form_action: str = "", style: str = _STYLE,
+    title: str = "ContextBridge authorization", html_attrs: str = "",
+) -> HTMLResponse:
+    """A hardened page: no scripts, no framing, not cached. ``body``, ``title`` and ``html_attrs`` are trusted HTML."""
     content = body if raw else f"<h1>ContextBridge</h1><p>{html.escape(body)}</p>"
     document = (
-        "<!doctype html><html lang=en><head><meta charset=utf-8>"
+        f"<!doctype html><html lang=en{(' ' + html_attrs) if html_attrs else ''}><head><meta charset=utf-8>"
         '<meta name=viewport content="width=device-width, initial-scale=1">'
-        f"<title>ContextBridge authorization</title><style>{_STYLE}</style></head><body>{content}</body></html>"
+        f"<title>{title}</title><style>{style}</style></head><body>{content}</body></html>"
     )
     # The form posts to this page, which redirects to the client; browsers apply form-action to that redirect.
     form_sources = " ".join(filter(None, ["'self'", form_action]))

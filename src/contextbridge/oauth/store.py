@@ -41,6 +41,7 @@ MIN_PASSPHRASE_LENGTH = 12
 UNUSED_CLIENT_SECONDS = 24 * 3600
 MAX_LOCKOUT_ADDRESSES = 1000
 MAX_CLIENTS = 50
+MAX_HISTORY = 50  # change-history entries kept per grant
 _SCRYPT = {"n": 2**14, "r": 8, "p": 1}
 
 
@@ -50,6 +51,14 @@ class OAuthStateError(ValueError):
 
 def token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _describe_access(device_scopes: dict[str, list[str]]) -> str:
+    """'read, write on friday; read on hermes' -- scopes shown without their 'computer:' prefix."""
+    groups: dict[tuple[str, ...], list[str]] = {}
+    for device, scopes in sorted(device_scopes.items()):
+        groups.setdefault(tuple(s.split(":", 1)[-1] for s in scopes), []).append(device)
+    return "; ".join(f"{', '.join(k) or 'nothing'} on {', '.join(v)}" for k, v in groups.items()) or "no devices"
 
 
 def new_token() -> str:
@@ -201,6 +210,15 @@ class OAuthStore:
         owner = self.state.get("owner")
         return bool(owner and owner.get("passphrase") and owner.get("totp_secret"))
 
+    def change_passphrase(self, passphrase: str) -> None:
+        """Replace the owner passphrase, keeping the authenticator. Verify the old one first."""
+        hashed = hash_passphrase(passphrase)
+        with self.update() as state:
+            owner = state.get("owner")
+            if not owner:
+                raise OAuthStateError("no owner credentials exist")
+            owner["passphrase"] = hashed
+
     def set_owner(self, passphrase: str, totp_secret: str) -> None:
         hashed = hash_passphrase(passphrase)
         with self.update() as state:
@@ -314,18 +332,38 @@ class OAuthStore:
     def create_grant(
         self, *, client_id: str, scopes: list[str], devices: list[str], resource: str | None,
         code: str, access_seconds: int, refresh_seconds: int,
+        device_scopes: dict[str, list[str]] | None = None, supersedes: str | None = None,
     ) -> tuple[str, str, str]:
-        """Consume ``code`` and create a grant. Returns (grant_id, access_token, refresh_token)."""
+        """Consume ``code`` and create a grant. Returns (grant_id, access_token, refresh_token).
+
+        ``device_scopes`` narrows the scopes per device (each within ``scopes``); by default every
+        device gets all of ``scopes``. ``supersedes`` names the grant this re-authorization replaces:
+        it is revoked, and its change history carries over.
+        """
         access, refresh = new_token(), new_token()
         now = time.time()
+        per_device = {
+            d: [s for s in scopes if s in (device_scopes.get(d, scopes) if device_scopes else scopes)]
+            for d in devices
+        }
         with self.update() as state:
             if state["codes"].pop(token_hash(code), None) is None:
                 raise OAuthStateError("authorization code already used or expired")
             grant_id = "grant_" + secrets.token_hex(8)
+            history: list[dict[str, Any]] = []
+            old = state["grants"].get(supersedes) if supersedes else None
+            if old is not None and old["client_id"] == client_id and old["revoked_at"] is None:
+                old["revoked_at"] = now
+                history = list(old.get("history", []))
+                event = "Re-authorized"
+            else:
+                event = "Paired"
+            history.insert(0, {"at": now, "by": "consent", "text": f"{event} · {_describe_access(per_device)}"})
             state["grants"][grant_id] = {
                 "client_id": client_id,
                 "scopes": scopes,
                 "devices": devices,
+                "device_scopes": per_device,
                 "resource": resource,
                 "created_at": now,
                 "refresh_hash": token_hash(refresh),
@@ -333,8 +371,78 @@ class OAuthStore:
                 "used_refresh": [],
                 "access": {token_hash(access): now + access_seconds},
                 "revoked_at": None,
+                "history": history[:MAX_HISTORY],
             }
         return grant_id, access, refresh
+
+    @staticmethod
+    def device_scopes(grant: dict[str, Any]) -> dict[str, list[str]]:
+        """Scopes per device for ``grant``. Grants from before per-device scopes get all their scopes everywhere."""
+        stored = grant.get("device_scopes")
+        if isinstance(stored, dict):
+            return {d: list(stored.get(d, [])) for d in grant["devices"]}
+        return {d: list(grant["scopes"]) for d in grant["devices"]}
+
+    def set_device_scopes(
+        self, grant_id: str, device_scopes: dict[str, list[str]], *, changes: list[str], by: str = "owner"
+    ) -> None:
+        """Replace a grant's per-device scopes, recording ``changes`` in its history.
+
+        A device with no scopes leaves the grant. Scopes beyond the grant's token scopes may be stored
+        (the owner asked for them) but are never enforced: the token scopes stay the ceiling.
+        """
+        now = time.time()
+        with self.update() as state:
+            grant = state["grants"].get(grant_id)
+            if grant is None or grant["revoked_at"] is not None:
+                raise OAuthStateError("that access was already revoked")
+            kept = {d: list(s) for d, s in device_scopes.items() if s}
+            grant["device_scopes"] = kept
+            grant["devices"] = sorted(kept)
+            history = grant.setdefault("history", [])
+            for text in reversed(changes):
+                history.insert(0, {"at": now, "by": by, "text": text})
+            del history[MAX_HISTORY:]
+
+    def request_reauth(self, grant_id: str, scopes: list[str], wanted: dict[str, list[str]] | None = None) -> None:
+        """Ask the client to authorize again for ``scopes``.
+
+        The grant keeps working until its current access token expires; then refreshing it fails, so the
+        client starts a new authorization and the consent page offers what the owner asked for.
+        """
+        now = time.time()
+        with self.update() as state:
+            grant = state["grants"].get(grant_id)
+            if grant is None or grant["revoked_at"] is not None:
+                raise OAuthStateError("that access was already revoked")
+            grant["reauth_requested_at"] = now
+            if wanted is not None:
+                grant["reauth_wanted"] = {d: list(v) for d, v in wanted.items() if v}
+            grant.setdefault("history", []).insert(
+                0, {"at": now, "by": "owner", "text": "Requested re-authorization for " + ", ".join(scopes)}
+            )
+            del grant["history"][MAX_HISTORY:]
+
+    def cancel_reauth(self, grant_id: str) -> None:
+        """Withdraw a re-authorization request: the grant refreshes normally again, as it was."""
+        now = time.time()
+        with self.update() as state:
+            grant = state["grants"].get(grant_id)
+            if grant is None or grant["revoked_at"] is not None:
+                raise OAuthStateError("that access was already revoked")
+            if grant.pop("reauth_requested_at", None) is None:
+                return
+            grant.pop("reauth_wanted", None)
+            grant.setdefault("history", []).insert(0, {"at": now, "by": "owner", "text": "Cancelled the re-authorization request"})
+            del grant["history"][MAX_HISTORY:]
+
+    def reauth_request(self, client_id: str) -> tuple[str, dict[str, Any]] | None:
+        """The newest active grant of ``client_id`` that awaits re-authorization, if any."""
+        found = [
+            (gid, g) for gid, g in self.state["grants"].items()
+            if g["client_id"] == client_id and g["revoked_at"] is None and g.get("reauth_requested_at")
+        ]
+        return max(found, key=lambda item: item[1]["reauth_requested_at"]) if found else None
 
     def find_access(self, token: str) -> tuple[str, dict[str, Any], float] | None:
         digest = token_hash(token)
@@ -379,6 +487,8 @@ class OAuthStore:
                 raise OAuthStateError("grant revoked")
             if not hmac.compare_digest(grant["refresh_hash"], token_hash(old_refresh)):
                 raise OAuthStateError("refresh token already used")
+            if grant.get("reauth_requested_at"):
+                raise OAuthStateError("the owner asked this client to authorize again")
             grant["used_refresh"] = (grant["used_refresh"] + [grant["refresh_hash"]])[-20:]
             grant["refresh_hash"] = token_hash(refresh)
             grant["refresh_expires_at"] = now + refresh_seconds

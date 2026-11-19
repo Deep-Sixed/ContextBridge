@@ -41,19 +41,30 @@ def remote_authorizer(settings: RemoteSettings) -> Authorizer:
 
 
 def remote_devices(settings: RemoteSettings) -> DeviceGrant:
-    """The devices named in the caller's grant that the config still allows. No grant, no devices."""
+    """The devices named in the caller's grant that the config still allows. No grant, no devices.
 
-    def devices() -> frozenset[str]:
+    With a scope, only the devices where the grant holds that scope. The claims are read from the
+    grant on every request, so the owner narrowing a grant applies to tokens already issued.
+    """
+
+    def devices(scope: str | None = None) -> frozenset[str]:
         try:
             from fastmcp.server.dependencies import get_access_token
 
             token = get_access_token()
         except Exception:  # noqa: BLE001 -- no request context at all: no devices
             token = None
-        granted = (token.claims or {}).get("devices") if token is not None else None
+        claims = (token.claims or {}) if token is not None else {}
+        granted = claims.get("devices")
         if not isinstance(granted, list):
             return frozenset()
-        return frozenset(d for d in granted if isinstance(d, str) and settings.device_allowed(d))
+        reachable = frozenset(d for d in granted if isinstance(d, str) and settings.device_allowed(d))
+        if scope is None:
+            return reachable
+        per_device = claims.get("device_scopes")
+        if not isinstance(per_device, dict):
+            return frozenset()  # fail closed: a token without per-device scopes reaches no device for a scope
+        return frozenset(d for d in reachable if scope in (per_device.get(d) or ()))
 
     return devices
 
@@ -105,6 +116,9 @@ def create_remote_server(
             describe=router.describe,
             client_address=provider._client_address,
             page=_page,
+            allow_scopes=settings.allow_scopes,
+            device_allowed=settings.device_allowed,
+            tool_scopes=TOOL_SCOPES,
         )
         provider.extra_routes.extend(dashboard.routes())
     server.auth = provider

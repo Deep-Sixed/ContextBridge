@@ -326,14 +326,22 @@ macOS is not supported by the installers yet.
 
 ### Owner dashboard
 
-`https://<public url>/devices` is the owner's page. After you sign in with the passphrase and an authenticator code (the same check and lockout as the approval pages) it shows:
+`https://<public url>/devices` is the owner's dashboard. After you sign in with the passphrase and an authenticator code (the same check and lockout as the approval pages) it has four pages:
 
-- **Devices:** each device by name, then when it was last seen (or "Online now"), with its system and agent version, and **Remove**, which revokes the device and drops its connection.
-- **Add a device:** the Linux, PowerShell and `.cmd` installer commands, and a link to `/activate`.
-- **Assistants with access:** every active grant (client, devices, permissions, when it was approved), with **Revoke**.
-- **Where you use it:** the MCP endpoint and where to add it in ChatGPT, Claude, Gemini/Antigravity and other MCP clients.
+- **Devices:** each device by name, then when it was last seen (or "Online now"), with its system and agent version, and **Remove**, which revokes the device and drops its connection. **Add a device** shows the Windows (`.cmd`, PowerShell, manual) and Linux installers and leads to `/activate`.
+- **Endpoints** (`/devices/endpoints`): the MCP endpoint, how to add it to ChatGPT, Claude, Gemini/Antigravity and other MCP clients, and **Assistant access**: for each assistant, a grid of devices and permissions (read, write, execute, process, and any other scope `remote.allow_scopes` allows).
+- **Usage** (`/devices/usage`): tool calls this month, the daily average, and six months of totals, counted from the audit log's `requested` events.
+- **Settings** (`/devices/settings`): sign out, change the owner passphrase (needs the current one and an authenticator code; other dashboard sessions end), and a light or dark theme.
 
-Signing in starts a 15-minute session held in gateway memory (a gateway restart ends it). Its cookie is `HttpOnly`, `SameSite=Strict`, and on https `Secure` and `__Host-` prefixed. Every change is a POST carrying the session's CSRF token, and Remove and Revoke ask for confirmation first. Events: `dashboard_signed_in`, `dashboard_sign_in_failed`, `device_revoked_by_owner`, and `oauth_grant_revoked` with `by: owner_dashboard`.
+**Permissions per assistant and per device.** Approving a client creates a grant that starts with what the consent page approved (only read is ticked by default) on the devices chosen there. On Endpoints you can then give it different permissions on each device, add devices or remove them. A tool call needs the scope in the client's token, in its grant for that device, and in the device's own registry grant and policy, so:
+
+- **Narrowing applies on the next request**, for access tokens already issued too, because the gateway reads the grant on every request.
+- **The token is the ceiling.** You can tick a permission the token does not carry (it shows with a dashed outline), but the gateway does not enforce it until the client authorizes again. **Request re-authorization** lets the current access token run until it expires (at most `remote.access_token_minutes`); refreshing it then fails, the client starts a new authorization, and the consent page opens with your per-device choices ticked. Approving with the passphrase and a code replaces the old grant and keeps its history. Until then the old grant cannot refresh, so if you deny that page or the client never reconnects it loses access when its token expires; **Cancel request** withdraws the request and it refreshes normally again.
+- **A device's own limits always win.** A permission the device cannot use (its registry grant lacks it, or its agent offers no tool for it) shows as "—". The dashboard never changes how an agent runs: elevation is chosen when it is installed (`-Elevated` on Windows).
+
+Each grant keeps its change history (who, what, when), and every change is also an `oauth_grant_changed` audit event. The pages run no scripts and load nothing from elsewhere. Signing in starts a 15-minute session held in gateway memory (a gateway restart ends it). Its cookie is `HttpOnly`, `SameSite=Strict`, and on https `Secure` and `__Host-` prefixed. Every change is a POST carrying the session's CSRF token, and Remove and Revoke ask for confirmation first. Events: `dashboard_signed_in`, `dashboard_sign_in_failed`, `device_revoked_by_owner`, `oauth_grant_changed`, `oauth_reauth_requested`, `owner_passphrase_changed`, and `oauth_grant_revoked` with `by: owner_dashboard`.
+
+If the dashboard warns that no device is connected although some were just seen, another gateway process is using the same state directory and holds the agents' connections. If it warns about a loopback public URL, set `remote.public_url` to the https address clients reach.
 
 ### How the channel is secured
 

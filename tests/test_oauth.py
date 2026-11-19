@@ -44,6 +44,7 @@ from contextbridge.oauth.store import (
     MAX_CLIENTS,
     OAuthStateError,
     OAuthStore,
+    new_token,
     token_hash,
 )
 
@@ -267,7 +268,7 @@ def test_device_grant_limits_tools_and_listing(policy, tmp_path):
         return "remote-client"
 
     async def scenario(granted):
-        server = create_computer_server(policy, audit=audit, authorize=authorize, devices=lambda: granted)
+        server = create_computer_server(policy, audit=audit, authorize=authorize, devices=lambda scope=None: granted)
         async with Client(server) as client:
             tools = {t.name for t in await client.list_tools()}
             devices = (await client.call_tool(LIST_DEVICES_TOOL, {})).structured_content["devices"]
@@ -1096,3 +1097,175 @@ def _wait_for_port(port: int, config: Path) -> None:
                 log = config.with_name(f"{config.stem}.contextbridge.computer.stderr.log")
                 raise AssertionError(f"remote listener never opened:\n{read_log(log)}") from None
             time.sleep(0.1)
+
+
+# ------------------------------------------------ per-device access, owner-managed
+
+
+def test_owner_narrowing_a_grant_applies_to_a_token_already_issued(policy, tmp_path, store, monkeypatch):
+    import fastmcp.server.dependencies as deps
+
+    from contextbridge.oauth.provider import ContextBridgeOAuthProvider
+    from contextbridge.oauth.remote import remote_authorizer, remote_devices
+
+    settings = RemoteSettings(
+        public_url=PUBLIC, allow_scopes=(SCOPE_READ, SCOPE_WRITE), allow_devices=("local",),
+        allowed_redirect_hosts=("claude.ai",),
+    )
+    audit = ComputerAuditLog(tmp_path / "audit.jsonl", echo=False)
+    provider = ContextBridgeOAuthProvider(settings, store, audit, offered_devices=lambda: ["local"])
+    store.save_client({"client_id": "c1", "client_name": "Claude", "redirect_uris": [REDIRECT]})
+    code = new_token()
+    store.save_code(code, {"client_id": "c1", "expires_at": time.time() + 60})
+    gid, access, _ = store.create_grant(
+        client_id="c1", scopes=[SCOPE_READ, SCOPE_WRITE], devices=["local"], resource=PUBLIC + "/mcp", code=code,
+        access_seconds=3600, refresh_seconds=86400,
+    )
+    current = {}
+
+    async def load():
+        current["token"] = await provider.load_access_token(access)
+
+    monkeypatch.setattr(deps, "get_access_token", lambda: current["token"])
+    server = create_computer_server(
+        policy, audit=audit, authorize=remote_authorizer(settings), devices=remote_devices(settings)
+    )
+
+    async def attempt():
+        await load()
+        async with Client(server) as client:
+            tools = {t.name for t in await client.list_tools()}
+            try:
+                await client.call_tool("write_file", {"path": "docs/new.md", "content": "x"})
+                wrote = "ok"
+            except ToolError as exc:
+                wrote = str(exc)
+            read = (await client.call_tool("read_file", {"path": "docs/notes.md"})).structured_content
+            return tools, wrote, read
+
+    tools, wrote, read = anyio.run(attempt)
+    assert "write_file" in tools and "not authorized" not in wrote and read  # past the grant; the policy may still refuse
+
+    # The owner takes write away on the dashboard; the same access token loses it on its next request.
+    store.set_device_scopes(gid, {"local": [SCOPE_READ]}, changes=["removed write on local"])
+    tools, wrote, read = anyio.run(attempt)
+    assert "write_file" not in tools and "read_file" in tools and read
+    assert "not authorized for 'write_file' on device 'local'" in wrote
+
+    # Ticking a scope outside the token is stored but never enforced: the token stays the ceiling.
+    store.set_device_scopes(gid, {"local": [SCOPE_READ, SCOPE_WRITE]}, changes=[])
+    current["token"] = None
+    narrowed = store.state["grants"][gid]
+    assert store.device_scopes(narrowed) == {"local": [SCOPE_READ, SCOPE_WRITE]}
+
+
+def test_requested_reauthorization_ends_refresh_and_reopens_consent_with_the_owners_choice(remote):
+    async def scenario():
+        async with await remote.client() as http:
+            client_id = (await register(http)).json()["client_id"]
+            verifier, page = await start_authorization(http, client_id, scope=f"{SCOPE_READ} {SCOPE_WRITE}")
+            code = parse_qs(urlsplit((await approve(http, page, remote.store)).headers["location"]).query)["code"][0]
+            first = (await exchange(http, client_id, verifier, code)).json()
+            (old_id,) = remote.store.state["grants"]
+            remote.store.set_device_scopes(old_id, {"local": [SCOPE_READ, SCOPE_WRITE]}, changes=["allowed write on local"])
+            remote.store.request_reauth(old_id, ["write"])
+            still_works = remote.store.find_access(first["access_token"]) is not None
+            refused = await http.post(
+                "/token", data={"grant_type": "refresh_token", "refresh_token": first["refresh_token"], "client_id": client_id}
+            )
+            verifier, page = await start_authorization(http, client_id, scope=f"{SCOPE_READ} {SCOPE_WRITE}")
+            approved = await approve(http, page, remote.store, scopes=(SCOPE_READ, SCOPE_WRITE))
+            code = parse_qs(urlsplit(approved.headers["location"]).query)["code"][0]
+            second = await exchange(http, client_id, verifier, code)
+            return old_id, still_works, refused, page, second
+
+    old_id, still_works, refused, page, second = anyio.run(scenario)
+    assert still_works  # the current token runs until it expires
+    assert refused.json()["error"] == "invalid_grant"
+    assert "You asked for this from the dashboard" in page.text
+    assert re.search(r'value="computer:write" checked', page.text) and re.search(r'value="local" checked', page.text)
+    assert second.status_code == 200 and second.json()["scope"] == f"{SCOPE_READ} {SCOPE_WRITE}"
+    grants = remote.store.state["grants"]
+    assert grants[old_id]["revoked_at"] is not None  # replaced
+    (new,) = [g for g in grants.values() if g["revoked_at"] is None]
+    assert new["device_scopes"] == {"local": [SCOPE_READ, SCOPE_WRITE]}
+    texts = [h["text"] for h in new["history"]]
+    assert texts[0] == "Re-authorized · read, write on local" and "allowed write on local" in texts
+
+
+def test_per_device_permissions_survive_a_gateway_restart(tmp_path, monkeypatch):
+    """Owner changes live in the state file: a new process enforces them for tokens issued before it started."""
+    from contextbridge.oauth.provider import ContextBridgeOAuthProvider
+    from contextbridge.oauth.remote import remote_devices
+
+    path = tmp_path / "oauth.json"
+    before = OAuthStore(path)
+    before.set_owner(PASSPHRASE, totp.new_secret())
+    before.save_client({"client_id": "c1", "client_name": "Claude", "redirect_uris": [REDIRECT]})
+    code = new_token()
+    before.save_code(code, {"client_id": "c1", "expires_at": time.time() + 60})
+    gid, access, refresh = before.create_grant(
+        client_id="c1", scopes=[SCOPE_READ, SCOPE_WRITE], devices=["friday", "hermes"], resource=PUBLIC + "/mcp",
+        code=code, access_seconds=3600, refresh_seconds=86400,
+    )
+    before.set_device_scopes(gid, {"friday": [SCOPE_READ, SCOPE_WRITE]}, changes=["removed hermes", "kept friday"])
+    before.request_reauth(gid, ["process"])
+
+    # A fresh store and provider, as after a restart.
+    settings = RemoteSettings(
+        public_url=PUBLIC, allow_scopes=(SCOPE_READ, SCOPE_WRITE), allow_devices=("*",),
+        allowed_redirect_hosts=("claude.ai",),
+    )
+    after = OAuthStore(path)
+    provider = ContextBridgeOAuthProvider(
+        settings, after, ComputerAuditLog(tmp_path / "audit.jsonl", echo=False), offered_devices=lambda: [],
+    )
+    token = anyio.run(provider.load_access_token, access)
+    import fastmcp.server.dependencies as deps
+
+    monkeypatch.setattr(deps, "get_access_token", lambda: token)
+    devices = remote_devices(settings)
+    assert devices() == {"friday"} and devices(SCOPE_WRITE) == {"friday"}
+    assert after.state["grants"][gid]["history"][0]["text"] == "Requested re-authorization for process"
+    with pytest.raises(OAuthStateError):  # the re-authorization request also outlives the restart
+        after.rotate(gid, refresh, scopes=[SCOPE_READ], access_seconds=60, refresh_seconds=60)
+
+
+def test_cancelling_reauthorization_restores_refresh_but_not_removed_permissions(tmp_path, monkeypatch):
+    import fastmcp.server.dependencies as deps
+
+    from contextbridge.oauth.provider import ContextBridgeOAuthProvider
+    from contextbridge.oauth.remote import remote_devices
+
+    store = OAuthStore(tmp_path / "oauth.json")
+    store.set_owner(PASSPHRASE, totp.new_secret())
+    store.save_client({"client_id": "c1", "client_name": "Claude", "redirect_uris": [REDIRECT]})
+    code = new_token()
+    store.save_code(code, {"client_id": "c1", "expires_at": time.time() + 60})
+    gid, _, refresh = store.create_grant(
+        client_id="c1", scopes=[SCOPE_READ, SCOPE_WRITE], devices=["friday", "hermes"], resource=PUBLIC + "/mcp",
+        code=code, access_seconds=3600, refresh_seconds=86400,
+    )
+    # The owner removes hermes and write on friday, ticks execute (beyond the token), and asks to re-authorize.
+    store.set_device_scopes(gid, {"friday": [SCOPE_READ, SCOPE_EXECUTE]}, changes=["narrowed"])
+    store.request_reauth(gid, ["execute"])
+    with pytest.raises(OAuthStateError):
+        store.rotate(gid, refresh, scopes=[SCOPE_READ, SCOPE_WRITE], access_seconds=60, refresh_seconds=60)
+
+    store.cancel_reauth(gid)
+    access, _ = store.rotate(gid, refresh, scopes=[SCOPE_READ, SCOPE_WRITE], access_seconds=60, refresh_seconds=60)
+
+    settings = RemoteSettings(
+        public_url=PUBLIC, allow_scopes=(SCOPE_READ, SCOPE_WRITE, SCOPE_EXECUTE), allow_devices=("*",),
+        allowed_redirect_hosts=("claude.ai",),
+    )
+    provider = ContextBridgeOAuthProvider(
+        settings, store, ComputerAuditLog(tmp_path / "audit.jsonl", echo=False), offered_devices=lambda: [],
+    )
+    token = anyio.run(provider.load_access_token, access)
+    monkeypatch.setattr(deps, "get_access_token", lambda: token)
+    devices = remote_devices(settings)
+    assert devices() == {"friday"}  # hermes stays removed
+    assert devices(SCOPE_READ) == {"friday"} and devices(SCOPE_WRITE) == frozenset()  # write stays removed
+    assert SCOPE_EXECUTE not in token.scopes  # execute is still beyond the token: not enforced
+    assert store.state["grants"][gid]["device_scopes"] == {"friday": [SCOPE_READ, SCOPE_EXECUTE]}
