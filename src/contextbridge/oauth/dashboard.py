@@ -38,8 +38,9 @@ from starlette.routing import Route
 from ..computer.audit import AuditError, ComputerAuditLog
 from ..computer.scopes import ALL_SCOPES, SCOPE_READ
 from ..remote.registry import DeviceRegistry, RegistryError
+from .logo import logo
 from .dashboard_view import STYLE, centered, esc, hidden, icon, shell
-from .store import MIN_PASSPHRASE_LENGTH, OAuthStateError, OAuthStore
+from .store import MIN_PASSPHRASE_LENGTH, OAuthStateError, OAuthStore, assistant_key, grant_label
 from .usage import UsageCounter
 
 SESSION_SECONDS = 15 * 60
@@ -157,6 +158,9 @@ class OwnerDashboard:
             Route("/devices/logout", self._logout, methods=["POST"]),
             Route("/devices/remove", self._remove, methods=["POST"]),
             Route("/devices/revoke-grant", self._revoke_grant, methods=["POST"]),
+            Route("/devices/revoke-older", self._revoke_older, methods=["POST"]),
+            Route("/devices/label", self._label, methods=["POST"]),
+            Route("/devices/revoke-assistant", self._revoke_assistant, methods=["POST"]),
             Route("/devices/grant-access", self._grant_access, methods=["POST"]),
             Route("/devices/reauth", self._reauth, methods=["POST"]),
             Route("/devices/cancel-reauth", self._cancel_reauth, methods=["POST"]),
@@ -253,7 +257,7 @@ class OwnerDashboard:
 
     def _login_form(self, request: Request, *, error: str = "", status: int = 200) -> Response:
         body = centered(f"""
-<div class="brand" style="padding:0"><div class="brand-mark">{icon("bridge")}</div>
+<div class="brand" style="padding:0">{logo(30)}
 <div><b>ContextBridge</b><span>Remote MCP</span></div></div>
 <div><h5>Sign in</h5><p class="sm muted">Manage your devices and the assistants that can reach them.</p></div>
 {f'<div class="note note-warn" role="alert">{esc(error)}</div>' if error else ""}
@@ -457,10 +461,14 @@ cd C:\\ContextBridge; py -3 -m venv .venv
                 if grant.get("revoked_at") is not None or grant.get("refresh_expires_at", 0) <= time.time():
                     continue
                 created = _parse(grant.get("created_at"))
+                used = _parse(grant.get("last_issued_at")) or created
                 rows.append({
                     "grant_id": grant["grant_id"],
                     "client_id": client["client_id"],
-                    "client_name": client.get("client_name") or "Unnamed client",
+                    "client_name": grant_label(grant, client),
+                    "assistant": client.get("client_name") or "Unnamed client",
+                    "key": assistant_key(client),
+                    "approved_from": grant.get("approved_from") or "",
                     "hosts": hosts,
                     "origin": "Local PKCE" if loopback else ", ".join(hosts) or "unknown origin",
                     "devices": list(grant.get("devices", [])),
@@ -471,10 +479,32 @@ cd C:\\ContextBridge; py -3 -m venv .venv
                     "created": created,
                     "since": created.strftime("%b %d, %Y %H:%M UTC") if created else "unknown",
                     "approved": f"{created:%b} {created.day}" if created else "unknown",
+                    "used": used,
+                    # Holds an access token that has not expired: the assistant used it within the last hour or so.
+                    "live": any(exp > time.time() for exp in grant.get("access", {}).values()),
                 })
         return sorted(
             rows, key=lambda r: (r["client_name"].lower(), r["created"] or datetime.min.replace(tzinfo=timezone.utc))
         )
+
+    def _assistants(self) -> list[list[dict[str, Any]]]:
+        """Grants grouped into named connections (assistant + the owner's name for it), newest token first.
+
+        A new authorization replaces the earlier grants of its connection, but grants from before that,
+        or from before connections had names, can still be several per connection. The first in each
+        group is the one in use; the dashboard manages that one and lists the rest so they can be revoked
+        or renamed into a connection of their own (a second account of the same assistant, for example).
+        """
+        oldest = datetime.min.replace(tzinfo=timezone.utc)
+        groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+        for grant in self._grants():
+            groups.setdefault((grant["client_name"].lower(), grant["key"]), []).append(grant)
+        for members in groups.values():
+            members.sort(key=lambda g: (g["used"] or oldest, g["created"] or oldest), reverse=True)
+        return [groups[key] for key in sorted(groups)]
+
+    def _assistant_of(self, grant_id: str) -> list[dict[str, Any]] | None:
+        return next((group for group in self._assistants() if any(g["grant_id"] == grant_id for g in group)), None)
 
     def _capabilities(self) -> dict[str, dict[str, Any]]:
         """Each device an assistant may be given: what it can do at all, and a short description.
@@ -505,9 +535,60 @@ cd C:\\ContextBridge; py -3 -m venv .venv
             }
         return caps
 
+    def _rename_form(self, session: dict[str, Any], grant: dict[str, Any], verb: str) -> str:
+        """A small 'name this connection' form: tells two accounts of one assistant apart."""
+        return (
+            f'<details class="rename"><summary class="btn btn-quiet">{esc(verb)}</summary>'
+            f'<form method="post" action="/devices/label" class="row" style="gap:var(--space-2);margin-top:var(--space-2)">'
+            f'{self._csrf(session)}{hidden("grant", grant["grant_id"])}'
+            f'<input class="input" name="label" maxlength="60" value="{esc(grant["client_name"])}" '
+            f'aria-label="Connection name" style="min-height:30px;font-size:13px">'
+            '<button class="btn btn-secondary btn-sm">Save</button></form></details>'
+        )
+
+    def _connections(self, session: dict[str, Any], group: list[dict[str, Any]]) -> str:
+        """Every connection an assistant holds: the one in use, then older ones, each revocable."""
+        if len(group) < 2:
+            return ""
+        now = datetime.now(timezone.utc)
+        rows = []
+        for index, grant in enumerate(group):
+            devices = grant["devices"]
+            what = (
+                f'{"Token issued" if index == 0 else "Last token"} {ago(grant["used"], now)} · approved {grant["approved"]}'
+                f'{" from " + grant["approved_from"] if grant["approved_from"] else ""} · '
+                f'{len(devices)} device{"s" if len(devices) != 1 else ""}'
+                f'{": " + ", ".join(devices) if devices else ""}'
+            )
+            label = (
+                '<span class="tag tag-accent">In use</span>' if index == 0 or grant["live"]
+                else '<span class="tag tag-neutral">Idle</span>'
+            )
+            rows.append(
+                f'<div class="row" style="gap:var(--space-3);padding:var(--space-2) 0;border-top:1px solid var(--color-neutral-900)">'
+                f'{label}<span class="grow small muted">{esc(what)}</span>'
+                f'{self._rename_form(session, grant, "Name it")}'
+                f'<form method="post" action="/devices/revoke-grant">{self._csrf(session)}{hidden("grant", grant["grant_id"])}'
+                f'<button class="btn btn-quiet">Revoke</button></form></div>'
+            )
+        idle = len(self._idle(group))
+        bulk = (
+            f'<form method="post" action="/devices/revoke-older">{self._csrf(session)}{hidden("grant", group[0]["grant_id"])}'
+            f'<button class="btn btn-secondary btn-sm">Revoke {idle} idle connection{"s" if idle != 1 else ""}</button></form>'
+            if idle else ""
+        )
+        return f"""<div class="stack gap2">
+ <div class="row wrap" style="gap:var(--space-2)"><span class="small faint grow">Connections · {len(group)}. These are
+ from before connections had names. More than one <em>In use</em> usually means two accounts (two people's
+ {esc(group[0]["assistant"])}): name the other one to give it its own panel, then revoke the idle ones. The permissions
+ above are for the newest.</span>{bulk}</div>
+ <div>{"".join(rows)}</div>
+</div>"""
+
     def _grant_panel(
-        self, session: dict[str, Any], grant: dict[str, Any], caps: dict[str, dict[str, Any]], open_: bool
+        self, session: dict[str, Any], group: list[dict[str, Any]], caps: dict[str, dict[str, Any]], open_: bool
     ) -> str:
+        grant = group[0]
         scopes = self.allow_scopes
         token = set(grant["scopes"])
         current = grant["device_scopes"]
@@ -578,6 +659,9 @@ reconnects, it loses access: cancel the request to keep its current access inste
             for h in grant["history"][:4]
         ) or '<span class="at"></span><span class="what fainter">No changes recorded yet.</span>'
         count = len(granted)
+        connections = f" · {len(group)} connections" if len(group) > 1 else ""
+        assistant = f"{grant['assistant']} · " if grant["assistant"].lower() != name.lower() else ""
+        approved_from = f" · approved from {grant['approved_from']}" if grant["approved_from"] else ""
         tags = (
             '<span class="tag tag-accent">Re-authorization requested</span>' if grant["reauth"] else
             '<span class="tag tag-outline">Needs re-authorization</span>' if beyond else ""
@@ -587,7 +671,7 @@ reconnects, it loses access: cancel the request to keep its current access inste
 <details class="grant" id="{esc(grant["grant_id"])}"{" open" if open_ else ""}>
 <summary class="row" style="padding:var(--space-4) var(--space-6)"><div class="grow stack" style="gap:2px">
 <span class="strong" style="font-size:14px">{esc(name)}</span>
-<span class="small faint">{esc(grant["origin"])} · {count} device{"s" if count != 1 else ""}</span></div>
+<span class="small faint">{esc(assistant)}{esc(grant["origin"])} · {count} device{"s" if count != 1 else ""}{esc(approved_from)}{connections}</span></div>
 {tags}<span class="chev">{icon("caret")}</span></summary>
 <div class="grant-body">
  <div class="row wrap small muted" style="gap:var(--space-2)"><span>Token scopes</span>{chips}
@@ -604,8 +688,10 @@ reconnects, it loses access: cancel the request to keep its current access inste
  </form>
  {reauth}
  <div class="stack gap2"><span class="small faint">Recent changes</span><div class="log">{history}</div></div>
- <form method="post" action="/devices/revoke-grant" class="row" style="justify-content:flex-end">{self._csrf(session)}
- {hidden("grant", grant["grant_id"])}<button class="btn btn-secondary btn-sm muted">Revoke access</button></form>
+ {self._connections(session, group)}
+ <div class="row wrap" style="justify-content:flex-end;gap:var(--space-2)">{self._rename_form(session, grant, "Rename")}
+ <form method="post" action="/devices/revoke-assistant">{self._csrf(session)}
+ {hidden("grant", grant["grant_id"])}<button class="btn btn-secondary btn-sm muted">Revoke access</button></form></div>
 </div>
 </details>"""
 
@@ -614,10 +700,12 @@ reconnects, it loses access: cancel the request to keep its current access inste
         status: int = 200,
     ) -> Response:
         endpoint = self.public_url + "/mcp"
-        grants = self._grants()
+        assistants = self._assistants()
         caps = self._capabilities()
-        first = open_grant or (grants[0]["grant_id"] if grants else "")
-        panels = "".join(self._grant_panel(session, g, caps, g["grant_id"] == first) for g in grants) or (
+        wanted = open_grant or (assistants[0][0]["grant_id"] if assistants else "")
+        panels = "".join(
+            self._grant_panel(session, group, caps, any(g["grant_id"] == wanted for g in group)) for group in assistants
+        ) or (
             '<div class="panel pad sm muted">No assistant has access. Connect one below.</div>'
         )
         clients = (
@@ -778,6 +866,75 @@ policies and audit log.</p></div></header>
             request, session, open_grant=grant_id,
             notice=f"Cancelled. {found['client_name']} keeps its current access and refreshes normally.",
         )
+
+    @staticmethod
+    def _idle(group: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Connections other than the newest that hold no unexpired access token."""
+        return [g for g in group[1:] if not g["live"]]
+
+    async def _revoke_many(
+        self, request: Request, *, older_only: bool,
+    ) -> Response:
+        session, form = await self._authorized_form(request)
+        if session is None:
+            return self._signed_out()
+        grant_id = str(form.get("grant", ""))
+        group = self._assistant_of(grant_id)
+        if group is None:
+            return self._endpoints_page(request, session, error="That access was already revoked.", status=404)
+        name = group[0]["client_name"]
+        targets = self._idle(group) if older_only else group
+        if not targets:
+            return self._endpoints_page(request, session, open_grant=grant_id, notice=f"{name} has no idle connections.")
+        action = "/devices/revoke-older" if older_only else "/devices/revoke-assistant"
+        if form.get("confirm") != "yes":
+            if older_only:
+                title = f"Revoke {name}'s {len(targets)} idle connection{'s' if len(targets) != 1 else ''}?"
+                text = (f"The newest connection (token issued {ago(group[0]['used'])}) and any in use keep working. The "
+                        "idle ones stop at once. If one belongs to someone else, name it first so it gets its own panel.")
+            else:
+                title = f"Revoke all of {name}'s access?"
+                text = (f"All {len(targets)} of its connections stop working on the next request. To use it again, "
+                        "connect it from the assistant and approve it.")
+            return self._confirm(
+                request, session, title=title, text=text, action=action, fields={"grant": grant_id},
+                verb="Revoke", back="/devices/endpoints",
+            )
+        for grant in targets:
+            try:
+                self.store.revoke_grant(grant["grant_id"])
+            except OAuthStateError as exc:
+                return self._endpoints_page(request, session, error=str(exc), status=409)
+            self._log("oauth_grant_revoked", client=grant["client_id"], grant=grant["grant_id"], by="owner_dashboard")
+        count = f"{len(targets)} connection{'s' if len(targets) != 1 else ''}"
+        notice = f"Revoked {count} of {name}." + (" The one in use keeps working." if older_only else "")
+        return self._endpoints_page(request, session, open_grant=group[0]["grant_id"] if older_only else "", notice=notice)
+
+    async def _label(self, request: Request) -> Response:
+        session, form = await self._authorized_form(request)
+        if session is None:
+            return self._signed_out()
+        grant_id = str(form.get("grant", ""))
+        found = self._found_grant(grant_id)
+        if found is None:
+            return self._endpoints_page(request, session, error="That access was already revoked.", status=404)
+        try:
+            self.store.set_label(grant_id, str(form.get("label", "")))
+        except OAuthStateError as exc:
+            return self._endpoints_page(request, session, open_grant=grant_id, error=str(exc), status=400)
+        renamed = self._found_grant(grant_id)
+        self._log("oauth_grant_renamed", client=found["client_id"], grant=grant_id, label=renamed["client_name"] if renamed else None)
+        return self._endpoints_page(
+            request, session, open_grant=grant_id,
+            notice=f"Renamed to {renamed['client_name'] if renamed else ''}. Approving it again on the consent page "
+                   "replaces only this connection.",
+        )
+
+    async def _revoke_older(self, request: Request) -> Response:
+        return await self._revoke_many(request, older_only=True)
+
+    async def _revoke_assistant(self, request: Request) -> Response:
+        return await self._revoke_many(request, older_only=False)
 
     async def _revoke_grant(self, request: Request) -> Response:
         session, form = await self._authorized_form(request)

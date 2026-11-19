@@ -69,7 +69,10 @@ def pkce() -> tuple[str, str]:
 
 
 def form_fields(html: str) -> dict[str, str]:
-    return dict(re.findall(r'name="(request|form_token)" value="([^"]+)"', html))
+    """The fields a browser would submit without the owner touching them: hidden ones and checked radios."""
+    fields = dict(re.findall(r'name="(request|form_token)" value="([^"]+)"', html))
+    fields.update(re.findall(r'type="radio" name="(connection)" value="([^"]+)" checked', html))
+    return fields
 
 
 # ------------------------------------------------------------------ TOTP
@@ -1269,3 +1272,74 @@ def test_cancelling_reauthorization_restores_refresh_but_not_removed_permissions
     assert devices(SCOPE_READ) == {"friday"} and devices(SCOPE_WRITE) == frozenset()  # write stays removed
     assert SCOPE_EXECUTE not in token.scopes  # execute is still beyond the token: not enforced
     assert store.state["grants"][gid]["device_scopes"] == {"friday": [SCOPE_READ, SCOPE_EXECUTE]}
+
+
+# ---------------------------------------------- named connections replace only themselves
+
+
+def test_reconnecting_replaces_only_the_named_connection_and_leaves_a_second_account_alone(remote, monkeypatch):
+    clock = [time.time()]
+    monkeypatch.setattr(totp.time, "time", lambda: clock[0])
+
+    async def connect(http, *, choice=None, new_label=None):
+        clock[0] += 30  # each approval needs a fresh authenticator code
+        client_id = (await register(http)).json()["client_id"]  # every reconnect registers a new client
+        verifier, page = await start_authorization(http, client_id)
+        extra = {}
+        if choice is not None:
+            extra["connection"] = choice
+        if new_label is not None:
+            extra["new_label"] = new_label
+        data = {**form_fields(page.text), "scope": [SCOPE_READ], "device": ["local"], "passphrase": PASSPHRASE,
+                "totp": next_code(remote.store), "action": "approve", **extra}
+        approved = await http.post("/consent", data=data, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0) Chrome/130.0 Edg/130.0"})
+        if approved.status_code != 302:
+            return page, approved, None
+        code = parse_qs(urlsplit(approved.headers["location"]).query)["code"][0]
+        return page, approved, (await exchange(http, client_id, verifier, code)).json()
+
+    async def scenario():
+        async with await remote.client() as http:
+            first = await connect(http, new_label="Claude (Chris)")
+            unclear = await connect(http)  # Claude already has a connection: the owner must say which this is
+            wife = await connect(http, choice="new", new_label="Claude (Dana)")
+            return first, unclear, wife
+
+    first, unclear, wife = anyio.run(scenario)
+    assert first[2]["access_token"] and 'name="new_label"' in first[0].text
+    page, refused, _ = unclear
+    assert refused.status_code == 400 and "Choose which connection this is" in refused.text
+    assert 'value="Claude (Chris)"' in page.text and "replaces its current access" in page.text
+    assert wife[2]["access_token"]
+
+    # Chris reconnects (a new client again) and picks his connection: only his earlier grant ends, at once.
+    async def chris_again():
+        async with await remote.client() as http:
+            return await connect(http, choice="Claude (Chris)")
+
+    _, _, again = anyio.run(chris_again)
+    active = {g["label"]: g for g in remote.store.state["grants"].values() if g["revoked_at"] is None}
+    assert set(active) == {"Claude (Chris)", "Claude (Dana)"}
+    assert remote.store.find_access(first[2]["access_token"]) is None  # the previous token is discarded
+    assert remote.store.find_access(wife[2]["access_token"]) is not None  # the other account is untouched
+    assert remote.store.find_access(again["access_token"]) is not None
+    chris = active["Claude (Chris)"]
+    assert chris["history"][0]["text"].endswith("replaced 1 earlier connection")
+    assert chris["approved_from"] == "Windows · Edge"
+
+
+def test_favicon_is_served_and_pages_link_it(remote):
+    async def scenario():
+        async with await remote.client() as http:
+            return await http.get("/favicon.svg"), await http.get("/favicon.ico")
+
+    svg, ico = anyio.run(scenario)
+    assert svg.status_code == ico.status_code == 200
+    assert svg.headers["content-type"].startswith("image/svg+xml") and svg.text.startswith("<svg")
+    from contextbridge.oauth.provider import _page, describe_browser
+
+    page = _page("hello")
+    assert 'rel=icon type="image/svg+xml" href="/favicon.svg"' in page.body.decode()
+    assert "img-src 'self'" in page.headers["content-security-policy"]
+    assert describe_browser("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit Safari/605") == "macOS · Safari"
+    assert describe_browser("") == ""

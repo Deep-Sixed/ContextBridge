@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import html
 
+from .logo import logo
+
 # Nocturne tokens. Dark is the design's own theme; light reverses each tonal ramp so every
 # "muted text" or "tinted fill" step keeps its role on a light ground.
 _DARK = """
@@ -87,8 +89,6 @@ form{margin:0}
 .side{display:flex;flex-direction:column;gap:var(--space-6);padding:var(--space-6) var(--space-4);
  border-right:1px solid var(--color-neutral-900);position:sticky;top:0;height:100vh}
 .brand{display:flex;align-items:center;gap:var(--space-3);padding:0 var(--space-2)}
-.brand-mark{width:30px;height:30px;border-radius:var(--radius-md);border:1px solid var(--color-accent);display:grid;
- place-items:center;color:var(--color-accent);font-size:16px}
 .brand b{display:block;font-weight:500;font-size:14px;line-height:1.2}.brand span{font-size:12px;color:var(--color-neutral-500)}
 .nav{display:flex;flex-direction:column;gap:2px}
 .nav a{display:flex;align-items:center;gap:var(--space-3);padding:7px var(--space-3);border-radius:var(--radius-md);
@@ -133,7 +133,8 @@ pre.cmd{margin:0;padding:10px 12px;border-radius:var(--radius-md);background:var
 pre.cmd .prompt{color:var(--color-accent);user-select:none}
 
 details>summary{list-style:none;cursor:pointer}details>summary::-webkit-details-marker{display:none}
-.chev{color:var(--color-neutral-500);transition:transform .15s}details[open]>summary .chev{transform:rotate(180deg)}
+.chev{color:var(--color-neutral-500);transition:transform .15s}
+.rename>summary{display:inline-flex}.rename[open]>summary{color:var(--color-text)}details[open]>summary .chev{transform:rotate(180deg)}
 .disclosure>summary{display:flex;align-items:center;gap:var(--space-4);padding:var(--space-4) var(--space-6)}
 .disclosure>summary:hover{background:color-mix(in srgb,var(--color-text) 3%,transparent)}
 .grant{border-radius:var(--radius-lg);background:var(--color-surface);box-shadow:var(--shadow-sm);overflow:hidden}
@@ -257,7 +258,7 @@ def shell(content: str, *, current: str, device_count: int, gateway: str, calls_
     calls = f"{calls_this_month:,} tool call{'s' if calls_this_month != 1 else ''} this month"
     return f"""<div class="app">
 <aside class="side">
- <div class="brand"><div class="brand-mark">{icon("bridge")}</div><div><b>ContextBridge</b><span>Remote MCP</span></div></div>
+ <div class="brand">{logo(30)}<div><b>ContextBridge</b><span>Remote MCP</span></div></div>
  <nav class="nav" aria-label="Dashboard">{nav}
   <a href="https://github.com/Deep-Sixed/ContextBridge#readme" target="_blank" rel="noopener noreferrer">{icon("question")}
   <span class="label">Help center</span><span class="ext">{icon("external")}</span></a>
