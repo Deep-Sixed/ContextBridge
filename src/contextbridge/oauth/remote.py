@@ -22,6 +22,7 @@ from ..computer.server import (
 )
 from ..remote.registry import DeviceRegistry
 from .activation import ActivationBroker
+from .dashboard import OwnerDashboard
 from .provider import SCOPE_DESCRIPTIONS, ContextBridgeOAuthProvider, RemoteSettings, _page
 from .store import OAuthStore
 
@@ -95,5 +96,16 @@ def create_remote_server(
             scope_descriptions=SCOPE_DESCRIPTIONS,
         )
         provider.extra_routes.extend(broker.routes())
+        # The owner's view of devices and grants, behind the same passphrase and authenticator check.
+        dashboard = OwnerDashboard(
+            public_url=settings.public_url,
+            registry=registry,
+            store=store,
+            audit=audit,
+            describe=router.describe,
+            client_address=provider._client_address,
+            page=_page,
+        )
+        provider.extra_routes.extend(dashboard.routes())
     server.auth = provider
     return server

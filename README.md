@@ -324,6 +324,17 @@ or download `https://mcp.example.com/install/ContextBridgeSetup.cmd` and double-
 
 macOS is not supported by the installers yet.
 
+### Owner dashboard
+
+`https://<public url>/devices` is the owner's page. After you sign in with the passphrase and an authenticator code (the same check and lockout as the approval pages) it shows:
+
+- **Devices:** each device by name, then when it was last seen (or "Online now"), with its system and agent version, and **Remove**, which revokes the device and drops its connection.
+- **Add a device:** the Linux, PowerShell and `.cmd` installer commands, and a link to `/activate`.
+- **Assistants with access:** every active grant (client, devices, permissions, when it was approved), with **Revoke**.
+- **Where you use it:** the MCP endpoint and where to add it in ChatGPT, Claude, Gemini/Antigravity and other MCP clients.
+
+Signing in starts a 15-minute session held in gateway memory (a gateway restart ends it). Its cookie is `HttpOnly`, `SameSite=Strict`, and on https `Secure` and `__Host-` prefixed. Every change is a POST carrying the session's CSRF token, and Remove and Revoke ask for confirmation first. Events: `dashboard_signed_in`, `dashboard_sign_in_failed`, `device_revoked_by_owner`, and `oauth_grant_revoked` with `by: owner_dashboard`.
+
 ### How the channel is secured
 
 - **Tailnet admission.** Unless the listener is on loopback, every connection is checked against the gateway's own `tailscale status --json` before anything else: the peer must be online and its Tailscale IP must belong to exactly one node in `agents.tailnet_node_ids`. A machine reaching the listener over a plain LAN address is refused, as is everything when `tailscale` can't be queried.

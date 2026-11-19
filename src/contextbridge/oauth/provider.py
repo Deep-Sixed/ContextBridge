@@ -480,6 +480,16 @@ input[type=password],input[name=totp]{display:block;width:100%;padding:.4rem;fon
 button{font-size:1rem;padding:.5rem 1.2rem;margin-right:.5rem}
 .error{color:#b00020;font-weight:600}.small{color:#666;font-size:.85rem}
 table{border-collapse:collapse;margin:1rem 0}th,td{text-align:left;padding:.2rem .8rem .2rem 0;vertical-align:top}
+pre{background:#eee;padding:.6rem .8rem;border-radius:6px;overflow-x:auto;white-space:pre-wrap;word-break:break-all}
+.head{display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap}
+a.button{background:#1a73e8;color:#fff;padding:.5rem 1rem;border-radius:8px;text-decoration:none;font-weight:600}
+.list{list-style:none;padding:0;margin:1rem 0;border:1px solid #ddd;border-radius:10px;background:#fff}
+.row{display:flex;align-items:center;gap:.8rem;padding:.8rem 1rem;border-top:1px solid #eee}.row:first-child{border-top:0}
+.row .main{flex:1;min-width:0}.name{font-weight:600;font-family:ui-monospace,monospace}.seen{color:#555;font-size:.9rem}
+.dot{width:.6rem;height:.6rem;border-radius:50%;flex:none}.dot.on{background:#1e8e3e}.dot.off{background:#999}
+.pill{font-size:.8rem;padding:.15rem .5rem;border-radius:6px}.pill.on{background:#e6f4ea;color:#1e8e3e}.pill.off{background:#eee;color:#666}
+.row form{margin:0}button.link{background:none;border:0;padding:0;margin:0;color:#1a73e8;cursor:pointer;font-size:.95rem}
+button.danger,button.link.danger{color:#b00020}.notice{color:#1e8e3e;font-weight:600}
 input[name=user_code]{display:block;width:100%;padding:.4rem;font-size:1.4rem;letter-spacing:.15em;text-transform:uppercase}
 """
 
