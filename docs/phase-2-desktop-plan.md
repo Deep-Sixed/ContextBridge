@@ -18,4 +18,4 @@ ContextBridge remains a transport and enforcement layer. AI clients may request 
 4. Input interaction (`desktop:act`) separately authorized for cursor/keyboard and window controls, requiring an interactive session.
 5. Per-request approval, sensitive-window redaction, human interruption, auditable operations, and cross-host acceptance tests.
 
-Do not interpret the presence of a callable Python module as production desktop control. The Phase 1 Tailscale remote enrollment and stable node-to-agent-key binding are still pending.
+Do not interpret the presence of a callable Python module as production desktop control. The remote enrollment this plan builds on is in place: devices enroll with a one-time code or browser activation, authenticate with an Ed25519 device key, and on a tailnet listener must also come from a node listed in `agents.tailnet_node_ids` (see the README's [Remote devices](../README.md#remote-devices)). This plan's phase numbers are its own and don't match the README's roadmap.

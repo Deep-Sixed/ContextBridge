@@ -171,7 +171,7 @@ Copying the old gateway's state keeps every enrolled device (same `gateway_id`, 
 4. **Copy settings** from the old config's `remote` section (`allow_scopes`, `allow_devices`, token lifetimes) into the new one. Keep `public_url` identical.
 5. **Start the gateway** (section 4) and add the `mcp.example.com` route to the new tunnel (section 5).
 6. **Repoint each agent.** In its agent config, set `gateway.url: wss://agents.example.com` and delete the `gateway.fingerprint` line (the agent then trusts the certificate Cloudflare presents through the system's CA store). Restart the agent. `cb-admin devices` and `list_devices` should show it online.
-7. **Turn the old gateway machine into an agent.** Its files were the `local` device; on the VPS there is no `local`. Pair it as a normal device (`cb-admin pair <name>`), give it an agent config with the policy its old `filesystem`/`commands`/`processes` sections had, and enroll it. `pair` prints the `agents.public_url` address to use.
+7. **Turn the old gateway machine into an agent.** Its files were the `local` device; on the VPS there is no `local`. Pair it as a normal device (`cb-admin pair <name> --scopes <list>`; without `--scopes` it gets all six), give it an agent config with the policy its old `filesystem`/`commands`/`processes` sections had, and enroll it. `pair` prints the `agents.public_url` address to use.
 8. **Re-approve clients for the new device.** Existing grants name `local`, which no longer exists. Revoke and reconnect each client (`cb-admin oauth-clients`, `cb-admin oauth-revoke <id>`) and tick the new device on the consent page.
 
 9. **Retire the old gateway** once the old machine works as an agent and has survived a reboot:
@@ -185,11 +185,25 @@ Copying the old gateway's state keeps every enrolled device (same `gateway_id`, 
 
 ## 7. Adding a new machine later
 
+**Recommended: the one-command installer.** This gateway has both `remote.public_url` and `agents.public_url` set, so it serves installers with those addresses filled in. On the new machine, run the installer for its system (see [One-command install](../README.md#one-command-install-linux-and-windows)):
+
+```bash
+curl -fsSL https://mcp.example.com/install/remote-linux.sh | sh              # Linux, as the agent's user: systemd user service
+```
+
+```powershell
+irm -ErrorAction Stop 'https://mcp.example.com/install/remote-windows.ps1' | iex   # Windows, as Administrator: scheduled task
+```
+
+It installs the agent, writes a config from a policy preset, and prints a code to enter at `https://mcp.example.com/activate`. There you sign in with the owner passphrase and an authenticator code, check the device's fingerprint, and choose its scopes (only `computer:read` starts ticked). No `cb-admin pair` and no SSH to the VPS are needed. The **Add a device** page of the owner dashboard (`https://mcp.example.com/devices`) shows the same commands. macOS has no installer yet.
+
+**Manual: a pairing code.** For macOS, or a machine you configure by hand, issue a code on the VPS:
+
 ```sh
 cb-admin pair laptop --scopes computer:read     # prints a one-time code (default 15 minutes)
 ```
 
-On a Windows machine, `scripts/bootstrap-agent.ps1 -GatewayUrl wss://agents.example.com -Code <code> -Name laptop` does the rest in one step (see [Windows devices](../README.md#windows-devices-thanatos)). Otherwise, on the new machine, copy `configs/agent.yaml`, set `name: laptop`, `gateway.url: wss://agents.example.com`, no fingerprint, and its own policy, then run `contextbridge-agent enroll --config <file> --code <code>` and start the agent. The machine needs nothing but outbound HTTPS.
+Always pass `--scopes`: without it the device is granted all six scopes. Then, on the new machine, copy `configs/agent.yaml`, set `name: laptop`, `gateway.url: wss://agents.example.com`, no fingerprint, and its own policy, run `contextbridge-agent enroll --config <file> --code <code>`, and start the agent. On Windows, `scripts/bootstrap-agent.ps1 -GatewayUrl wss://agents.example.com -Code <code> -Name laptop` does those steps with a code (see [Windows devices](../README.md#windows-devices-thanatos)). The machine needs nothing but outbound HTTPS.
 
 Existing ChatGPT and Claude approvals name their devices, so they can't see the new machine yet. Revoke and reconnect each client that should use it, ticking the new device on the consent page.
 
