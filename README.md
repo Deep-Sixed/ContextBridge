@@ -22,7 +22,7 @@ python3 -m pytest        # includes acceptance tests that launch the gateways an
 
 ContextBridge requires Python 3.11+ and FastMCP 3.x (`fastmcp>=3,<4`). It has no runtime dependency on Node or npx, and the acceptance tests run both gateways in an environment without them.
 
-`tests/test_fs.py` covers the filesystem operations and path rules, and `tests/test_fs_gateway.py` pins the filesystem route's MCP contract (tool set, annotations, schemas, reported version, default-deny for every other method) and starts its entrypoint. CI runs the whole suite on Ubuntu and Windows, on Python 3.11, 3.13, 3.14 and 3.15 against the newest FastMCP 3.x release, plus Python 3.11 against the oldest supported FastMCP (3.0.0).
+`tests/test_fs.py` covers the filesystem operations and path rules, and `tests/test_fs_gateway.py` pins the filesystem route's MCP contract (tool set, annotations, schemas, reported version, default-deny for every other method) and starts its entrypoint. CI runs the whole suite on Ubuntu and Windows, with Python 3.11 against the oldest supported FastMCP (3.0.0) and Python 3.13, 3.14 and 3.15 against the newest 3.x release.
 
 ## Filesystem route
 
