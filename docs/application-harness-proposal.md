@@ -28,25 +28,50 @@ were not re-verified here. No harness was installed or run.
 5. **`desktop.py` is only a window inventory.** Agent-Desktop is expected to arrive via federation (the README
    and `computer.yaml` examples use `agent-desktop mcp`), so it needs no new engine.
 
-## 2. Principles
+## 2. Ownership boundary (revised)
+
+ContextBridge makes computers accessible to agents. OmniLink connects, manages and orchestrates agents and their
+available capabilities. Applied to this proposal:
+
+| Concern | Owner |
+|---|---|
+| Harness execution, manifest validation, argument/path validation | ContextBridge (host side) |
+| Local discovery of installed harnesses and their health | ContextBridge (host side) |
+| Host-level security: path policy, deny list, hash pinning, credential-stripped env, audit | ContextBridge |
+| Centralised MCP federation, aggregation, cross-device capability routing | OmniLink |
+| Fleet-wide deployment, installation and orchestration | OmniLink |
+| Agent-Desktop and CLI-Anything | Independent integrations, maintained upstream; neither is forked nor vendored |
+
+ContextBridge's existing `mcp_servers` federation stays as is, for compatibility and standalone operation, until the
+transition to OmniLink is validated. It is in production, so nothing here removes or changes it. This split is an
+architectural recommendation from the discussion. It has not been checked against OmniLink's source, and the
+OmniLink-side items below are assumptions to confirm.
+
+Consequence for the design: the harness adapter must **not depend on any particular federator**. It is a plain stdio
+MCP server that ContextBridge's federation can start today and that OmniLink can consume later. Everything that
+makes it safe is enforced **inside the adapter and the host agent**, so a federator in front of it can route calls
+but is never the only control.
+
+## 3. Principles
 
 - Compatibility with CLI-Anything, no dependency on it or its registry client; no fork.
-- Reuse execution, federation, scopes, grants and audit. No new execution engine.
+- Reuse the host's existing execution, path policy, grants and audit. No new execution engine.
+- The adapter is federator-neutral. Host-side enforcement cannot be bypassed by whoever routes the call.
 - Installation is separate from execution permission. Installing never happens through an assistant.
 - Registry-neutral: CLI-Hub is one possible source among others.
-- Fleet-wide deployment and orchestration stay outside ContextBridge (OmniLink's boundary).
+- Fleet-wide deployment and orchestration are OmniLink's, not ContextBridge's.
 - Default-deny at operation level: an operation not in the manifest does not exist.
 
-## 3. Operation-level restriction: options
+## 4. Operation-level restriction: options
 
 | Option | How | Verdict |
 |---|---|---|
 | A. Allowlist the harness binary | Existing `commands.allow` | Rejected. All-or-nothing; fails finding 1. |
 | B. Argument-pattern allowlist in `commands.allow` | New matching rules on argv | Possible but fragile. Needs per-program option parsing (`git -c`, `--exec`); large new attack surface in the central policy code. |
-| C. Manifest-driven adapter exposed as an MCP server through federation | Each declared operation is one MCP tool with typed parameters and a fixed argv template; no shell | **Recommended.** Reuses finding 3; undeclared operations are unreachable by construction. |
+| C. Manifest-driven adapter exposed as a stdio MCP server | Each declared operation is one MCP tool with typed parameters and a fixed argv template; no shell. Consumed by ContextBridge's existing federation today, by OmniLink later. | **Recommended.** Undeclared operations are unreachable by construction, and enforcement does not depend on the consumer. |
 | D. Run upstream harness MCP/CLI directly | Federation `command:` pointing at a harness | Acceptable only if the harness exposes narrow tools and the `tools:` allowlist is used; otherwise same exposure as A. |
 
-## 4. Registry-neutral harness manifest (draft)
+## 5. Registry-neutral harness manifest (draft)
 
 One manifest per harness, written or reviewed by the operator, stored on the device (e.g. `harnesses/<id>.yaml`),
 never fetched at call time from a registry.
@@ -88,21 +113,27 @@ writable-root check); an operation whose upstream command can run scripts or arb
 declarable (`class: admin` requires an explicit operator opt-in and its own scope).
 
 Class → scope mapping with **no new scopes at first**: `read` → `computer:read`, `write` → `computer:write`,
-`destructive`, `remote-write`, `admin` → `computer:execute`. Per-operation scoping reuses `tool_scopes`.
+`destructive`, `remote-write`, `admin` → `computer:execute`. Today per-operation scoping reuses federation's
+`tool_scopes`. Because a different federator may route calls later, the adapter also publishes each tool's class
+and required scope in its own tool metadata, and the host agent re-checks the device grant for that scope on every
+call. Scope enforcement then no longer lives only in whichever layer routes the call.
 A later step could add per-application scopes (`app:<id>:<class>`), which needs the consent-UI changes in
 finding 4 and is worth doing only if one grant per application proves necessary.
 
-## 5. Per-device capability discovery
+## 6. Per-device capability discovery
 
-- The adapter (one federated server per device, or one per harness) reports its tools through the existing
-  federation tool list; `list_devices` then shows them as `mcp_tools`. Discovery of "which harnesses are
-  installed and healthy" is therefore the tool list itself, with no new protocol.
+Local discovery is ContextBridge's. Cross-device aggregation of what each device offers is OmniLink's.
+
+- The adapter (one server per device, or one per harness) reports its tools as a normal MCP tool list. Under
+  today's federation, `list_devices` shows them as `mcp_tools`; OmniLink can read the same list over the same MCP
+  interface. Discovery of "which harnesses are installed and healthy" is the tool list itself, with no new
+  protocol and no ContextBridge-specific wire format.
 - Add a read-only `harness_inventory` tool to the adapter: per manifest, id, pinned version, whether the
   entrypoint exists and its hash matches `artifact_sha256`, whether the backing app is present, and operation
   names by class. A mismatch makes the harness's tools disappear instead of failing at call time.
 - No auto-discovery from PATH, no registry queries from the device at runtime.
 
-## 6. Exposing SKILL.md safely
+## 7. Exposing SKILL.md safely
 
 SKILL.md is third-party text delivered to an assistant, so it is a prompt-injection channel. Proposed handling:
 
@@ -114,7 +145,7 @@ SKILL.md is third-party text delivered to an assistant, so it is a prompt-inject
 - The authoritative description of operations given to the assistant is generated from the manifest (names,
   parameter schemas, class), not from SKILL.md. SKILL.md is optional background.
 
-## 7. Installation, kept separate
+## 8. Installation, kept separate
 
 - Harnesses are installed by the operator, outside ContextBridge, into a dedicated location (venv per harness,
   pinned version and hash). No ContextBridge tool installs or updates software.
@@ -128,7 +159,7 @@ SKILL.md is third-party text delivered to an assistant, so it is a prompt-inject
   `--help`/SKILL.md as reference and runs installed binaries), which sidesteps it for now. Resolve before any
   vendoring.
 
-## 8. Minimal proof of concept
+## 9. Minimal proof of concept
 
 Goal: one read-only operation end to end, to test the seam rather than the catalog.
 
@@ -140,13 +171,13 @@ Goal: one read-only operation end to end, to test the seam rather than the catal
    tool per operation, validates params, resolves paths through `ComputerPolicy`, runs the argv with
    `child_env()`, timeout and bounded output (reuse `run_command` internals rather than a new runner), and fails
    closed on any unknown operation or non-JSON output.
-4. Register it in `mcp_servers` with `scope: computer:read` and a pinned command.
+4. Register it in the existing `mcp_servers` with `scope: computer:read` and a pinned command (standalone/compat path). Also confirm the same adapter can be consumed unchanged by an MCP client other than ContextBridge's federation, which stands in for OmniLink.
 5. Acceptance tests (pytest, matching the repo's style): undeclared operation unreachable; `-`-prefixed and
    `..`/symlink/deny-listed paths rejected; write path outside writable roots rejected; hash mismatch removes
    tools; output over cap truncated; call audited as `requested → started → completed`; token without
    `computer:read` refused.
 
-## 9. Required changes (not implemented)
+## 10. Required changes (not implemented)
 
 | Area | Change | Size |
 |---|---|---|
@@ -155,10 +186,13 @@ Goal: one read-only operation end to end, to test the seam rather than the catal
 | `commands.py` | Possibly factor the bounded-run core out of `run_command` for reuse | small |
 | `computer.yaml` / README | Document `harnesses:` location and the federation entry; warn against allowlisting harness binaries | small |
 | `scopes.py`, `oauth/provider.py` | None for the PoC; per-app scopes later | deferred |
-| Tests | As in section 8 | medium |
-| Out of scope | Installer, registry client, fleet rollout (OmniLink), Agent-Desktop (federation already covers it) | n/a |
+| Tests | As in section 9 | medium |
+| Out of scope | Installer, registry client, fleet rollout (OmniLink), Agent-Desktop (independent integration), centralised federation and cross-device routing (OmniLink); existing `mcp_servers` federation is left unchanged | n/a |
 
-## 10. Open questions
+## 11. Open questions
+
+0. OmniLink-side assumptions (not verified against its source): it consumes stdio/MCP tool lists and tool metadata, and
+   it will route calls to host agents that still enforce grants. Confirm both before the transition.
 
 1. Are per-class scopes enough, or do you want per-application consent (e.g. LibreOffice yes, Git no)?
 2. Should destructive and remote-write operations require a per-call approval step beyond scope? Today the
